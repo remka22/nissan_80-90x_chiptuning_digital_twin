@@ -1,0 +1,85 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+  background: #0e1116; color: #d7dde5; }
+header { padding: 16px 24px; background: #151a21; border-bottom: 1px solid #232a34; }
+header h1 { margin: 0; font-size: 19px; color: #e8edf3; }
+header .sub { margin: 6px 0 0; color: #8a94a2; font-size: 13px; }
+main { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px 24px; align-items: start; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.card { background: #151a21; border: 1px solid #232a34; border-radius: 10px; padding: 16px 18px; margin: 0 24px 16px; }
+main .card { margin: 0; }
+.card h2 { margin: 0 0 14px; font-size: 16px; color: #e8edf3; }
+.card h3 { margin: 18px 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: #7f8a99; }
+
+/* слайдеры */
+.slider { margin: 14px 0; }
+.slider .top { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }
+.slider .top .name { color: #aeb7c3; }
+.slider .top .val { font-family: ui-monospace, monospace; color: #6cc0ff; font-weight: 600; }
+.slider input[type=range] { width: 100%; accent-color: #2d6cdf; }
+.iter { display: block; font-size: 12px; color: #7f8a99; margin-top: 18px; }
+.iter input { width: 70px; margin-left: 8px; padding: 4px 6px; background: #0e1116; color: #e8edf3; border: 1px solid #2b333f; border-radius: 5px; }
+
+/* гейджи */
+.gauges { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.gauge { background: #0e1116; border: 1px solid #232a34; border-radius: 8px; padding: 12px; }
+.gauge .label { font-size: 11px; color: #7f8a99; text-transform: uppercase; letter-spacing: .05em; }
+.gauge .num { font-size: 26px; font-weight: 700; color: #e8edf3; font-family: ui-monospace, monospace; margin: 4px 0; }
+.gauge .bar { height: 6px; background: #232a34; border-radius: 3px; overflow: hidden; }
+.gauge .bar i { display: block; height: 100%; background: linear-gradient(90deg,#2d6cdf,#6cc0ff); width: 0; transition: width .15s; }
+
+/* флаги-лампочки */
+.flags { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.flag { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 7px 10px; background: #0e1116; border: 1px solid #232a34; border-radius: 7px; }
+.led { width: 12px; height: 12px; border-radius: 50%; background: #2a2f38; box-shadow: inset 0 0 2px #000; flex: none; }
+.led.on { background: #41d27e; box-shadow: 0 0 8px #41d27e88; }
+.flag .hex { margin-left: auto; font-family: ui-monospace, monospace; color: #5a6472; font-size: 11px; }
+
+/* таблица памяти */
+table.watch { width: 100%; border-collapse: collapse; }
+table.watch td { padding: 4px 8px; border-bottom: 1px solid #1c222b; font-size: 12px; }
+table.watch td:first-child { color: #8a94a2; }
+table.watch td:last-child { text-align: right; font-family: ui-monospace, monospace; color: #e8edf3; }
+
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
+.row label { font-size: 12px; color: #aeb7c3; display: flex; flex-direction: column; gap: 3px; }
+select, .row input[type=number] { padding: 6px 8px; background: #0e1116; color: #e8edf3; border: 1px solid #2b333f; border-radius: 6px; font-size: 13px; }
+.watch-pick { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 10px 0; }
+.watch-pick label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+button { padding: 8px 16px; background: #2d6cdf; color: #fff; border: 0; border-radius: 7px; font-size: 13px; cursor: pointer; }
+button:hover { background: #3a78ec; }
+.hint { font-size: 11px; color: #6f7a89; margin-top: 10px; }
+footer { padding: 10px 24px; color: #6f7a89; font-size: 12px; border-top: 1px solid #232a34; }
+.sweep-card h2 { margin-bottom: 12px; }
+
+/* живой мотор */
+.engine-card { border-color: #3a4a2a; background: linear-gradient(180deg,#171d18,#151a21); }
+.engine-card h2 { color: #8fdc6c; }
+.engine-grid { display: grid; grid-template-columns: 320px 1fr; gap: 24px; align-items: center; }
+@media (max-width: 900px){ .engine-grid { grid-template-columns: 1fr; } }
+.engine-controls .slider { margin: 18px 0; }
+.engine-controls .val { color: #8fdc6c; font-size: 15px; }
+.engine-controls input[type=range] { accent-color: #5fbf3f; height: 6px; }
+.thr-flags { display: flex; flex-direction: column; gap: 6px; margin: 8px 0 4px; }
+.led-flag { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #aeb7c3; }
+/* кнопки запуска: ключ + стартер */
+.start-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.ign-btn, .start-btn { padding: 8px 14px; border: 1px solid #2b333f; border-radius: 7px; font-size: 13px; cursor: pointer; background: #1a2129; color: #d7dde5; user-select: none; }
+.ign-btn.on { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+.start-btn { background: #3a2a18; border-color: #5a4020; }
+.start-btn:active { background: #c8801f; color: #1a1208; }
+.run-state { font-size: 12px; color: #8a94a2; }
+.run-state.live { color: #41d27e; font-weight: 600; }
+.engine-gauges { display: grid; grid-template-columns: repeat(5,1fr); gap: 12px; }
+@media (max-width: 1100px){ .engine-gauges { grid-template-columns: repeat(3,1fr); } }
+@media (max-width: 700px){ .engine-gauges { grid-template-columns: repeat(2,1fr); } }
+.egauge { background: #0d120d; border: 1px solid #2a3a22; border-radius: 10px; padding: 14px 16px; }
+.egauge .label { font-size: 11px; color: #7f8a99; text-transform: uppercase; letter-spacing: .05em; }
+.egauge .num { font-size: 34px; font-weight: 800; color: #d6f5c4; font-family: ui-monospace, monospace; margin: 4px 0 2px; }
+.egauge .unit { font-size: 12px; color: #6f7a89; }
+.egauge .bar { height: 7px; background: #232a34; border-radius: 4px; overflow: hidden; margin-top: 8px; }
+.egauge .bar i { display:block; height:100%; background: linear-gradient(90deg,#3f8f2f,#8fdc6c); width:0; transition: width .15s; }
+
+details.adv { margin: 0 24px 16px; }
+details.adv > summary { cursor: pointer; color: #8a94a2; font-size: 13px; padding: 10px 6px; user-select: none; }
+details.adv[open] > summary { color: #aeb7c3; }
