@@ -196,8 +196,9 @@ async function updateEngine() {
   const coolant = +document.getElementById('eng-cool').value;
   const airtemp = +document.getElementById('eng-air').value;
   const screw = +document.getElementById('eng-screw').value;
+  const load = +document.getElementById('eng-roadload').value;
   try {
-    const r = await api('/api/engine', { gas, coolant, airtemp, screw, ignition: ignitionOn, starter: starterHeld, ticks: 12 });
+    const r = await api('/api/engine', { gas, coolant, airtemp, screw, load, ignition: ignitionOn, starter: starterHeld, ticks: 12 });
     const s = r.state;
     const rs = document.getElementById('eng-run-state');
     if (s.starter) rs.textContent = 'стартер крутит…';
@@ -244,6 +245,8 @@ async function updateEngine() {
   ea.addEventListener('input', () => { document.getElementById('eng-air-val').textContent = ea.value + '°C'; });
   const es = document.getElementById('eng-screw');
   es.addEventListener('input', () => { document.getElementById('eng-screw-val').textContent = es.value; });
+  const erl = document.getElementById('eng-roadload');
+  erl.addEventListener('input', () => { document.getElementById('eng-roadload-val').textContent = erl.value + '%'; });
   // ключ зажигания (тумблер) + стартер (держать)
   const ignBtn = document.getElementById('eng-ignition');
   ignBtn.addEventListener('click', () => {

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>ЦН по дросселю — редактор (y30)</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+ body{font-family:system-ui,Arial;margin:0;background:#f5f6f8;color:#222}
+ header{background:#1e2a38;color:#fff;padding:10px 16px}
+ header h1{margin:0;font-size:18px}
+ header .sub{font-size:12px;opacity:.85}
+ .wrap{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
+ .card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.1);padding:10px;flex:1;min-width:500px}
+ .thr-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+ .thr-row button{border:1px solid #bcc;background:#eef;border-radius:5px;padding:5px 9px;cursor:pointer;font-size:13px}
+ .thr-row button.on{background:#1a7;color:#fff;border-color:#0a5;font-weight:bold}
+ .hint{font-size:12px;color:#666;margin-top:6px}
+</style></head>
+<body>
+<header><h1>&#128295; ЦН по дросселю — редактор (y30, скорр. по логу 020726)</h1>
+<div class="sub">Данные живьём из pcn_data.json (правлю файл — видишь сразу). Клик по точке графика — изменить ЦН в ячейке.</div></header>
+<div class="wrap">
+ <div class="card">
+   <div id="left" style="height:480px"></div>
+   <div class="thr-row" id="thrbtns"></div>
+   <div class="hint">Кнопки = положение дросселя, %. Внизу — число точек лога. <b style="color:#1a7">Зелёные</b> точки — с поправкой, <b style="color:#e33">красные</b> — без (нет данных лога). <b style="color:#25f">Синие</b> — предложенное сглаживание красных.</div>
+ </div>
+ <div class="card">
+   <div id="right" style="height:520px"></div>
+   <div class="hint">3D <b style="color:#25f">сглаженной</b> таблицы ЦН (zsmooth). Оси — узлы шкалы на равном расстоянии. Крути мышью.</div>
+ </div>
+</div>
+<script>
+let D=null, ti=7, bound=false, lastJson="";
+async function load(){
+  const t=await (await fetch('/api/pcn')).json();
+  const s=JSON.stringify(t);
+  if(s===lastJson) return;          // не поменялось — не перерисовываем (вид 3D не сбиваем)
+  lastJson=s; D=t; buildBtns(); draw();
+}
+function buildBtns(){
+  const box=document.getElementById('thrbtns'); box.innerHTML='';
+  D.thr.forEach((t,i)=>{
+    const b=document.createElement('button'); b.textContent=t;
+    if(i===ti) b.className='on';
+    b.onclick=()=>{ ti=i; buildBtns(); drawLeft(); };
+    box.appendChild(b);
+  });
+}
+function draw(){ drawLeft(); drawRight(); }
+function drawLeft(){
+  const x=D.rpm.map(String);        // категории -> равное расстояние, подписи = обороты из шкалы
+  const cols=D.z[ti].map((_,xi)=> D.corr[ti][xi] ? '#1a7' : '#e33');   // зелёный=поправлено, красный=без лога
+  const val={x,y:D.z[ti],mode:'lines+markers',type:'scatter',line:{color:'#8a9099',width:1.5},
+             marker:{size:9,color:cols,line:{color:'#333',width:1}},name:'ЦН'};
+  const bluey=D.zsmooth ? D.zsmooth[ti].map((v,xi)=> D.corr[ti][xi] ? null : v) : [];  // синие — только на красных
+  const prop={x,y:bluey,mode:'markers',type:'scatter',marker:{size:8,color:'#2255ff',line:{color:'#012',width:1}},name:'сглажено'};
+  const bar={x,y:D.count[ti],type:'bar',yaxis:'y2',marker:{color:'#c9ccd1'},name:'точек'};
+  const layout={margin:{t:34,l:50,r:12,b:64},showlegend:false,
+    title:'Дроссель '+D.thr[ti]+'% — цикловое наполнение по оборотам',
+    xaxis:{type:'category',title:'обороты',tickangle:-45},
+    yaxis:{title:'ЦН',range:[0,1.2],domain:[0.30,1],zeroline:false},
+    yaxis2:{title:'точек',domain:[0,0.20]}};
+  Plotly.react('left',[val,prop,bar],layout,{responsive:true});
+  if(!bound){ document.getElementById('left').on('plotly_click',onClick); bound=true; }
+}
+function onClick(ev){
+  const p=ev.points[0]; if(!p||p.data.type!=='scatter') return;   // правим только точки ЦН, не столбики
+  const xi=p.pointIndex, cur=D.z[ti][xi];
+  const nv=prompt('ЦН — обороты '+D.rpm[xi]+', дроссель '+D.thr[ti]+'%:', cur);
+  if(nv===null) return;
+  const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
+  D.z[ti][xi]=v;
+  fetch('/api/pcn',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ti,xi,val:v})});
+  drawLeft(); drawRight();
+}
+function drawRight(){
+  const ix=D.rpm.map((_,i)=>i), iy=D.thr.map((_,i)=>i);   // индексы -> равные шаги; подписи из шкалы
+  const rd=document.getElementById('right');
+  const cam=(rd&&rd.layout&&rd.layout.scene&&rd.layout.scene.camera)||{eye:{x:1.7,y:-1.5,z:1.0}};
+  const zz=D.zsmooth||D.z;   // синий график = сглаженное предложение
+  const s={type:'surface',x:ix,y:iy,z:zz,cmin:0.2,cmax:1.0,colorscale:'Blues',colorbar:{title:'ЦН',len:.7}};
+  const layout={margin:{t:26,l:0,r:0,b:0},title:'Сглаженная ЦН (синяя, вся таблица)',
+    scene:{xaxis:{title:'обороты',tickvals:ix,ticktext:D.rpm.map(String)},
+           yaxis:{title:'дроссель %',tickvals:iy,ticktext:D.thr.map(String)},
+           zaxis:{title:'ЦН',range:[0,1.2]}, camera:cam}};
+  Plotly.react('right',[s],layout,{responsive:true});
+}
+load(); setInterval(load,2500);
+</script>
+</body></html>

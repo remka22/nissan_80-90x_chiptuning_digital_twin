@@ -41,9 +41,14 @@
         <input type="range" id="eng-air" min="-20" max="60" step="1" value="20">
       </div>
       <div class="slider">
-        <div class="top"><span class="name">🔩 Винт ХХ (обвод воздуха)</span><span class="val" id="eng-screw-val">4000</span></div>
-        <input type="range" id="eng-screw" min="2000" max="10000" step="100" value="4000">
+        <div class="top"><span class="name">🔩 Винт ХХ (обвод воздуха)</span><span class="val" id="eng-screw-val">6800</span></div>
+        <input type="range" id="eng-screw" min="2000" max="10000" step="100" value="6800">
         <div class="hint">Крути вниз — ЭБУ сам ШИРЕ откроет РХХ, удерживая обороты.</div>
+      </div>
+      <div class="slider">
+        <div class="top"><span class="name">🛣️ Нагрузка (дорога)</span><span class="val" id="eng-roadload-val">0%</span></div>
+        <input type="range" id="eng-roadload" min="0" max="250" step="5" value="0">
+        <div class="hint">0 = нейтраль (мотор крутится свободно). Выше — дорога/подъём тормозят мотор: садится на КРУИЗ. Высоко (180+) при полном газе = тяга внатяг (низкие об + полная нагрузка) — тут включается клапан мощности.</div>
       </div>
       <div class="hint">Обороты — это <b>ВЫХОД</b> (тахометр), мотор крутит сам.</div>
       <div class="hint" id="eng-status">мотор крутится…</div>

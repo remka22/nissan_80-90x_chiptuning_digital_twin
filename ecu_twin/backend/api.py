@@ -9,6 +9,7 @@ REST:
 Статика фронта — из ../frontend.
 """
 import os
+import json
 import threading
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
@@ -21,6 +22,7 @@ from emulator import Machine, symbols
 ROM_PATH = os.environ.get("ECU_ROM", "/data/rom.bin")
 ROM_BASE = int(os.environ.get("ECU_ROM_BASE", "0x8000"), 0)
 FRONT_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+PCN_PATH = os.path.join(FRONT_DIR, "pcn_data.json")
 
 app = FastAPI(title="ЭБУ-двойник M30 (SIL)")
 
@@ -113,9 +115,10 @@ class EngineReq(BaseModel):
     gas: int = 0          # ГАЗ/педаль в % (0 = отпущен, ХХ). Обороты — ВЫХОД.
     coolant: int = 80     # темп. ОЖ в °C (ползунок, прогретый по умолчанию)
     airtemp: int = 20     # темп. воздуха в °C (ползунок)
-    screw: int = 4000     # ВИНТ ХХ: базовый воздух обвода (ползунок).
+    screw: int = 6800     # ВИНТ ХХ: базовый воздух обвода (ползунок).
     ignition: bool = False  # ЗАЖИГАНИЕ (ключ): OFF -> ЭБУ не льёт -> мотор глохнет.
     starter: bool = False   # СТАРТЕР: крутит мотор для запуска.
+    load: int = 0         # ДОРОЖНАЯ НАГРУЗКА в % (0 = нейтраль, 100 = тяжело/в гору)
     ticks: int = 12       # шагов физики за кадр (плавность)
 
 
@@ -125,11 +128,25 @@ def celsius_to_raw(c):
     return max(20, min(255, round(240 - c * 1.6)))
 
 
-# именованные соленоиды/выходы (бит -> человеческое имя)
+# именованные соленоиды/выходы (бит -> имя). Активность сверена опытом по режимам:
+# $A7.0x10/0x80/0x04 и $A8.0x01 вспыхивают на РЕЗКОМ газу (обогащение разгона);
+# $A9.0x10 (EGR) пока не срабатывает; $AB.0x10 постоянно; $AE/$59/$9B меняются вне ХХ.
 OUTPUTS = {
-    "EGR (A9.0x10)":         {"addr": 0x00A9, "mask": 0x10},
-    "Клапан мощности (A7.0x10)": {"addr": 0x00A7, "mask": 0x10},
+    # обогащение разгона (резкое открытие газа) — подтверждено: клапан мощности
+    "Клапан мощности (обогащ. разгона A7.0x10)": {"addr": 0x00A7, "mask": 0x10},
+    "Обогащ. разгона (A7.0x80)":  {"addr": 0x00A7, "mask": 0x80},
+    "Обогащ. разгона (A7.0x04)":  {"addr": 0x00A7, "mask": 0x04},
+    "Соленоид резк. газа (A8.0x01)": {"addr": 0x00A8, "mask": 0x01},
+    # EGR
+    "EGR (A9.0x10)":             {"addr": 0x00A9, "mask": 0x10},
+    # реле/режимы
     "Низкие об./ХХ-реле (AB.0x10)": {"addr": 0x00AB, "mask": 0x10},
+    # выходы/флаги, которые меняются по режимам — назначение ещё опознаём по поведению
+    "Выход AE.0x10 (опознать)":  {"addr": 0x00AE, "mask": 0x10},
+    "Выход AE.0x20 (опознать)":  {"addr": 0x00AE, "mask": 0x20},
+    "Флаг 59.0x08 (опознать)":   {"addr": 0x0059, "mask": 0x08},
+    "Флаг 9B.0x08 (опознать)":   {"addr": 0x009B, "mask": 0x08},
+    "Флаг D4.0x01 (опознать)":   {"addr": 0x00D4, "mask": 0x01},
 }
 
 
@@ -146,6 +163,7 @@ def engine(req: EngineReq):
                                         base_air=float(req.screw),
                                         ignition=req.ignition,
                                         starter=req.starter,
+                                        road_load=req.load / 100.0,
                                         ticks=max(1, req.ticks))
 
     with _engine_lock:                 # сериализуем доступ — без гонки потоков
@@ -228,6 +246,36 @@ def disasm(addr: int, n: int = 12):
 @app.get("/")
 def index():
     return FileResponse(os.path.join(FRONT_DIR, "index.html"))
+
+
+@app.get("/mixmap")
+def mixmap():
+    """Редактор таблицы ЦН y30: слайс по дросселю + 3D всей таблицы."""
+    return FileResponse(os.path.join(FRONT_DIR, "mixmap.html"))
+
+
+@app.get("/api/pcn")
+def get_pcn():
+    """Отдать таблицу ЦН из pcn_data.json — читаем с диска каждый раз, чтобы правки были видны сразу."""
+    with open(PCN_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class PcnEdit(BaseModel):
+    ti: int      # индекс дросселя (строка)
+    xi: int      # индекс оборотов (столбец)
+    val: float
+
+
+@app.post("/api/pcn")
+def set_pcn(e: PcnEdit):
+    """Записать одну ячейку обратно в pcn_data.json (правка из UI)."""
+    with open(PCN_PATH, encoding="utf-8") as f:
+        d = json.load(f)
+    d["z"][e.ti][e.xi] = e.val
+    with open(PCN_PATH, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=0)
+    return {"ok": True, "ti": e.ti, "xi": e.xi, "val": e.val}
 
 
 if os.path.isdir(FRONT_DIR):
