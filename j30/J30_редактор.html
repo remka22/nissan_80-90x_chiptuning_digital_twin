@@ -47,6 +47,7 @@
  <label class=filebtn style="padding:6px 12px;border-radius:4px">📂 Загрузить дамп<input type=file id=load accept=".bin" style=display:none></label>
  <button id=reset style=background:#845>↩ Сброс к оригиналу</button>
  <label><input type=checkbox id=cmp> Сравнить с оригиналом (<span style=color:#e55>красным</span>)</label>
+ <label><input type=checkbox id=rawm> Сырые байты (0-255)</label>
  <span id=status></span>
 </header>
 <div class=hint>Оригинал вшит в страницу (HN27C256G@DIP28.BIN). Правь значения → «Сохранить дамп» скачает .bin с именем выше + датой/временем. Контрольная сумма пересчитывается автоматически. Где смысл неизвестен — «ХЗ, у.е.», править можно.</div>
@@ -58,6 +59,7 @@ const ROM_ORIG=Uint8Array.from(atob("D91gllw93V2WYNZcPX8AXNNc3VyWYdZbPdNc3VyWW8Y
 let ROM=ROM_ORIG.slice();      // редактируемая копия
 const CHK=[0x7F7A,0x7F7B];
 const EXPANDED=new Set();       // адреса свёрнутых секций, которые раскрыли вручную
+let RAWMODE=false;              // показывать/править сырые байты 0..255 вместо интерпретации
 // секция однородна (все байты равны)? возвращает значение или null
 function allSame(it){
   if(it.kind=='map16'||it.conv=='vq16')return null;
@@ -83,7 +85,7 @@ function rawToPhys(conv,x){switch(conv){
 function physToRaw(conv,v){v=(''+v).trim();if(v==='')return null;
   switch(conv){
    case 'deg': return /^-?\d+$/.test(v)?clamp(+v):null;
-   case 'afr':{const val=+v;if(isNaN(val))return null;if(val>=14.55)return null;let Xo=Math.round(1881.6/val-128);if(Xo>=0&&Xo<=127)return Xo;return Math.max(128,Math.min(255,Math.round(64+1881.6/val)));}
+   case 'afr':{const val=+v;if(isNaN(val)||val<=0)return null;let Xo=Math.round(1881.6/val-128);if(Xo>=0&&Xo<=127)return Xo;return Math.max(128,Math.min(255,Math.round(64+1881.6/val)));}
    case 'rpm50': return clamp(Math.round(+v/50));
    case 'cutrpm': return clamp(Math.round(+v/25.6148));
    case 'idlref': return clamp(Math.round(+v/12.807));
@@ -112,9 +114,13 @@ function diffAK(a,k,conv){ // байт(ы) отличаются от ориги�
 }
 function cellHtml(it,k){
   const lk=it.locked?' locked':'';
-  const ev=cellVal(it,k,ROM), ov=cellVal(it,k,ROM_ORIG);
-  const dc=diffAK(it.a,k,it.conv)?' diff':'';
-  return `<div class="cell${lk}"><input class="${dc}" data-a=${it.a} data-k=${k} data-conv="${it.conv}" value="${ev}">`+
+  const raw = RAWMODE && it.conv!='vq16';        // сырой режим (кроме 16-бит пар)
+  const cv = raw ? 'raw' : it.conv;              // конверсия для правки
+  const ev = raw ? ROM[it.a+k] : cellVal(it,k,ROM);
+  const ov = raw ? ROM_ORIG[it.a+k] : cellVal(it,k,ROM_ORIG);
+  const dc = diffAK(it.a,k,it.conv)?' diff':'';
+  const ttl = raw ? ` title="= ${cellVal(it,k,ROM)} ${unitLabel(it)}"` : '';
+  return `<div class="cell${lk}"><input class="${dc}" data-a=${it.a} data-k=${k} data-conv="${cv}"${ttl} value="${ev}">`+
          `<div class="o">${ov}</div></div>`;
 }
 const AX={
@@ -212,6 +218,7 @@ function render(){
 let dirty=false;
 function mark(){dirty=true;document.getElementById('status').textContent='есть правки (не скачано)';}
 document.getElementById('cmp').addEventListener('change',e=>document.body.classList.toggle('cmp',e.target.checked));
+document.getElementById('rawm').addEventListener('change',e=>{RAWMODE=e.target.checked;render();});
 
 function recalcChecksum(){let s=0,x=0;for(let i=0;i<ROM.length;i++){if(i==0x7F7A||i==0x7F7B)continue;s=(s+ROM[i])&0xFF;x^=ROM[i];}ROM[0x7F7A]=s;ROM[0x7F7B]=x;}
 function ts(){const d=new Date();const p=n=>(''+n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes());}
