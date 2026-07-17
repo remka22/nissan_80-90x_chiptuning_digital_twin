@@ -5,13 +5,18 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # прошивка M30 монтируется внутрь как /data/rom.bin (только чтение)
-      - "../m30/infiniti90m30at (1).bin:/data/rom.bin:ro"
+      # ВСЕ прошивки монтируются в /data (только чтение). Какая активна — выбирает
+      # переменная ECU_ROM при запуске (см. ниже). Переключение = рестарт с другой ECU_ROM.
+      - "../m30/infiniti90m30at (1).bin:/data/m30.bin:ro"
+      - "../j30/HN27C256G@DIP28.BIN:/data/j30.bin:ro"
+      - "../j30/J30_гибрид_мощный_угол+топливо ИИ.bin:/data/j30_hybrid.bin:ro"
       # ЖИВЫЕ тома: код берётся прямо с диска, пересборка не нужна
       - "./backend:/app/backend"
       - "./frontend:/app/frontend"
     environment:
-      - ECU_ROM=/data/rom.bin
+      # По умолчанию M30. Переключить: ECU_ROM=/data/j30.bin docker compose up -d
+      #                    гибрид:     ECU_ROM=/data/j30_hybrid.bin docker compose up -d
+      - ECU_ROM=${ECU_ROM:-/data/m30.bin}
       - ECU_ROM_BASE=0x8000
     # --reload: бэкенд сам перечитывает изменения
     command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]

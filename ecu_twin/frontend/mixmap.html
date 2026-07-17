@@ -8,33 +8,73 @@
  header h1{margin:0;font-size:18px}
  header .sub{font-size:12px;opacity:.85}
  .wrap{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
- .card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.1);padding:10px;flex:1;min-width:500px}
+ .card{background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.1);padding:10px}
+ .layers{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:6px;font-size:13px}
+ .layers label{cursor:pointer;user-select:none}
  .thr-row{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
  .thr-row button{border:1px solid #bcc;background:#eef;border-radius:5px;padding:5px 9px;cursor:pointer;font-size:13px}
  .thr-row button.on{background:#1a7;color:#fff;border-color:#0a5;font-weight:bold}
  .hint{font-size:12px;color:#666;margin-top:6px}
+ #left svg .pt{cursor:pointer}
 </style></head>
 <body>
-<header><h1>&#128295; ЦН по дросселю — редактор (y30, скорр. по логу 020726)</h1>
-<div class="sub">Данные живьём из pcn_data.json (правлю файл — видишь сразу). Клик по точке графика — изменить ЦН в ячейке.</div></header>
+<header><h1>&#128295; ЦН по дросселю — редактор (y30)</h1>
+<div class="sub">Плоский график, без зума. Клик по точке — правка. Данные живьём из pcn_data.json.</div></header>
 <div class="wrap">
- <div class="card">
-   <div id="left" style="height:480px"></div>
+ <div class="card" style="flex:1.9;min-width:600px">
+   <div class="layers">
+     <label><input type="checkbox" id="cb-blue" checked> <b style="color:#2255ff">&#9679; исходник ПНЦ</b></label>
+     <label><input type="checkbox" id="cb-green" checked> <b style="color:#1a7">&#9679; поправка (изменённые)</b></label>
+     <label><input type="checkbox" id="cb-red" checked> <b style="color:#e33">&#9679; сглажено &lt;5к</b></label>
+     <label><input type="checkbox" id="cb-yellow" checked> <b style="color:#c8a000">&#9679; сглажено &gt;5к</b></label>
+   </div>
+   <div id="left"></div>
    <div class="thr-row" id="thrbtns"></div>
-   <div class="hint">Кнопки = положение дросселя, %. Внизу — число точек лога. <b style="color:#1a7">Зелёные</b> точки — с поправкой, <b style="color:#e33">красные</b> — без (нет данных лога). <b style="color:#25f">Синие</b> — предложенное сглаживание красных.</div>
+   <div class="hint">Кнопки = дроссель %. Клик по точке — правка. Наложились точки — кружок красится долями всех цветов.</div>
  </div>
- <div class="card">
-   <div id="right" style="height:520px"></div>
-   <div class="hint">3D <b style="color:#25f">сглаженной</b> таблицы ЦН (zsmooth). Оси — узлы шкалы на равном расстоянии. Крути мышью.</div>
+ <div class="card" style="flex:1;min-width:360px">
+   <div id="right" style="height:460px"></div>
+   <div class="hint">3D итоговой таблицы (поправка+сглаживание). Крути мышью.</div>
+ </div>
+</div>
+<div class="wrap">
+ <div class="card" style="flex:1.9;min-width:600px">
+   <div class="layers">
+     <label><input type="checkbox" id="cb-bblue" checked> <b style="color:#2255ff">&#9679; БЦН сток</b></label>
+     <label><input type="checkbox" id="cb-bgreen" checked> <b style="color:#1a7">&#9679; факт (из логов)</b></label>
+     <label><input type="checkbox" id="cb-bred" checked> <b style="color:#e33">&#9679; достроено</b></label>
+   </div>
+   <div id="bcn"></div>
+   <div class="thr-row" id="bthrbtns"></div>
+   <div class="hint">БЦН = базовое наполнение, мг/цикл. Синий — сток (чужой мотор), зелёный — намерено из логов, красный — интерполяция дыр. Кнопки = свой дроссель для БЦН.</div>
+ </div>
+ <div class="card" style="flex:1;min-width:360px">
+   <div id="bcn3d" style="height:460px"></div>
+   <div class="hint">3D БЦН (факт + достроено), мг/цикл. Крути мышью.</div>
  </div>
 </div>
 <script>
-let D=null, ti=7, bound=false, lastJson="";
+let D=null, ti=7, lastJson="", B=null, lastBcn="", tib=15;
+const CB='#2255ff', CG='#1a7', CR='#e33', CY='#f5c000';
+const PRIO={[CG]:3,[CY]:2,[CR]:1,[CB]:0}, ARR={[CG]:'z',[CY]:'z5k',[CR]:'zred',[CB]:'zbase'};
+function on(name){ const e=document.getElementById('cb-'+name); return e?e.checked:true; }
 async function load(){
   const t=await (await fetch('/api/pcn')).json();
   const s=JSON.stringify(t);
-  if(s===lastJson) return;          // не поменялось — не перерисовываем (вид 3D не сбиваем)
-  lastJson=s; D=t; buildBtns(); draw();
+  if(s!==lastJson){ lastJson=s; D=t; buildBtns(); draw(); }
+  try{ const b=await (await fetch('/api/bcn')).json();
+    const sb=JSON.stringify(b);
+    if(sb!==lastBcn){ lastBcn=sb; B=b; buildBtnsB(); drawBcn(); drawBcn3d(); }
+  }catch(e){}
+}
+function buildBtnsB(){
+  const box=document.getElementById('bthrbtns'); if(!box||!B) return; box.innerHTML='';
+  B.thr.forEach((t,i)=>{
+    const b=document.createElement('button'); b.textContent=t;
+    if(i===tib) b.className='on';
+    b.onclick=()=>{ tib=i; buildBtnsB(); drawBcn(); };
+    box.appendChild(b);
+  });
 }
 function buildBtns(){
   const box=document.getElementById('thrbtns'); box.innerHTML='';
@@ -45,45 +85,133 @@ function buildBtns(){
     box.appendChild(b);
   });
 }
+['blue','green','red','yellow'].forEach(n=>{
+  const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawLeft();
+});
+['bblue','bgreen','bred'].forEach(n=>{
+  const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawBcn();
+});
+function onB(name){ const e=document.getElementById('cb-b'+name); return e?e.checked:true; }
 function draw(){ drawLeft(); drawRight(); }
-function drawLeft(){
-  const x=D.rpm.map(String);        // категории -> равное расстояние, подписи = обороты из шкалы
-  const cols=D.z[ti].map((_,xi)=> D.corr[ti][xi] ? '#1a7' : '#e33');   // зелёный=поправлено, красный=без лога
-  const val={x,y:D.z[ti],mode:'lines+markers',type:'scatter',line:{color:'#8a9099',width:1.5},
-             marker:{size:9,color:cols,line:{color:'#333',width:1}},name:'ЦН'};
-  const bluey=D.zsmooth ? D.zsmooth[ti].map((v,xi)=> D.corr[ti][xi] ? null : v) : [];  // синие — только на красных
-  const prop={x,y:bluey,mode:'markers',type:'scatter',marker:{size:8,color:'#2255ff',line:{color:'#012',width:1}},name:'сглажено'};
-  const bar={x,y:D.count[ti],type:'bar',yaxis:'y2',marker:{color:'#c9ccd1'},name:'точек'};
-  const layout={margin:{t:34,l:50,r:12,b:64},showlegend:false,
-    title:'Дроссель '+D.thr[ti]+'% — цикловое наполнение по оборотам',
-    xaxis:{type:'category',title:'обороты',tickangle:-45},
-    yaxis:{title:'ЦН',range:[0,1.2],domain:[0.30,1],zeroline:false},
-    yaxis2:{title:'точек',domain:[0,0.20]}};
-  Plotly.react('left',[val,prop,bar],layout,{responsive:true});
-  if(!bound){ document.getElementById('left').on('plotly_click',onClick); bound=true; }
+
+// маркер: 1 цвет = кружок, N цветов = пирог долями
+function marker(cx,cy,r,colors){
+  if(colors.length===1)
+    return `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${colors[0]}" stroke="#333" stroke-width="1"/>`;
+  let out='', n=colors.length;
+  for(let k=0;k<n;k++){
+    const a0=(k/n)*2*Math.PI-Math.PI/2, a1=((k+1)/n)*2*Math.PI-Math.PI/2;
+    const x0=(cx+r*Math.cos(a0)).toFixed(1), y0=(cy+r*Math.sin(a0)).toFixed(1);
+    const x1=(cx+r*Math.cos(a1)).toFixed(1), y1=(cy+r*Math.sin(a1)).toFixed(1);
+    out+=`<path d="M${cx},${cy} L${x0},${y0} A${r},${r} 0 0,1 ${x1},${y1} Z" fill="${colors[k]}" stroke="#333" stroke-width="0.6"/>`;
+  }
+  return out;
 }
-function onClick(ev){
-  const p=ev.points[0]; if(!p||p.data.type!=='scatter') return;   // правим только точки ЦН, не столбики
-  const xi=p.pointIndex, cur=D.z[ti][xi];
-  const nv=prompt('ЦН — обороты '+D.rpm[xi]+', дроссель '+D.thr[ti]+'%:', cur);
-  if(nv===null) return;
-  const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
-  D.z[ti][xi]=v;
-  fetch('/api/pcn',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({ti,xi,val:v})});
-  drawLeft(); drawRight();
+function drawLeft(){
+  const N=D.rpm.length, W=960, H=430, mL=52, mR=14;
+  const valTop=28, valBot=300, cntTop=332, cntBot=398, lblY=316, yMax=1.2;
+  const px=i=> mL+(i+0.5)*((W-mR-mL)/N);
+  const vy=v=> valBot-(v/yMax)*(valBot-valTop);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="font:12px system-ui;display:block">`;
+  s+=`<text x="${mL}" y="16" fill="#333" font-weight="bold">Дроссель ${D.thr[ti]}% — цикловое наполнение по оборотам</text>`;
+  s+=`<rect x="${mL}" y="${valTop}" width="${W-mR-mL}" height="${valBot-valTop}" fill="#fff" stroke="#c7ccd2"/>`;
+  for(let g=0;g<=1.2001;g+=0.1){ const y=vy(g);
+    s+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e7eaef"/>`;
+    s+=`<text x="${mL-6}" y="${y+4}" text-anchor="end" fill="#999">${g.toFixed(1)}</text>`; }
+  for(let i=0;i<N;i++){ const x=px(i);
+    s+=`<line x1="${x}" y1="${valTop}" x2="${x}" y2="${lblY-2}" stroke="#e2e6ea"/>`;
+    s+=`<text x="${x}" y="${lblY}" text-anchor="end" fill="#555" transform="rotate(-45 ${x} ${lblY})">${D.rpm[i]}</text>`; }
+  // линия исходника (синий) когда включён
+  if(on('blue') && D.zbase)
+    s+=`<polyline points="${D.zbase[ti].map((v,i)=>px(i)+','+vy(v)).join(' ')}" fill="none" stroke="#9db4ff" stroke-width="1.5"/>`;
+  // столбики точек лога
+  const cmax=Math.max(1,...(D.count?D.count[ti]:[]).map(c=>c||0));
+  if(D.count) for(let i=0;i<N;i++){ const c=D.count[ti][i]; if(!c) continue;
+    const h=(c/cmax)*(cntBot-cntTop); s+=`<rect x="${px(i)-5}" y="${cntBot-h}" width="10" height="${h}" fill="#c9ccd1"/>`; }
+  s+=`<text x="${mL-6}" y="${cntBot}" text-anchor="end" fill="#999">точек</text>`;
+  // точки слоёв с учётом наложения
+  for(let i=0;i<N;i++){
+    let list=[];
+    if(on('blue') && D.zbase) list.push({v:D.zbase[ti][i],c:CB});
+    if(on('green') && D.corr[ti][i]) list.push({v:D.z[ti][i],c:CG});
+    if(on('red') && D.zred && D.zred[ti][i]!=null) list.push({v:D.zred[ti][i],c:CR});
+    if(on('yellow') && D.z5k && D.z5k[ti][i]!=null) list.push({v:D.z5k[ti][i],c:CY});
+    if(!list.length) continue;
+    list.forEach(p=>p.y=vy(p.v)); list.sort((a,b)=>a.y-b.y);
+    let cl=[]; list.forEach(p=>{ const L=cl[cl.length-1];
+      if(L && Math.abs(p.y-L.items[0].y)<7) L.items.push(p); else cl.push({items:[p]}); });
+    cl.forEach(c=>{ const cy=c.items.reduce((a,p)=>a+p.y,0)/c.items.length, cx=px(i);
+      let tgt=c.items[0]; c.items.forEach(p=>{ if(PRIO[p.c]>PRIO[tgt.c]) tgt=p; });
+      s+=`<g class="pt" data-xi="${i}" data-arr="${ARR[tgt.c]}" data-val="${tgt.v}">`+marker(cx,cy,c.items.length>1?7:6,c.items.map(p=>p.c))
+        +`<circle cx="${cx}" cy="${cy}" r="9" fill="transparent"/></g>`; });
+  }
+  s+=`</svg>`;
+  const el=document.getElementById('left'); el.innerHTML=s;
+  el.querySelectorAll('.pt').forEach(g=>g.onclick=()=>editPt(g));
+}
+function editPt(g){
+  const xi=+g.getAttribute('data-xi'), arr=g.getAttribute('data-arr'), cur=g.getAttribute('data-val');
+  const nv=prompt('ЦН ['+arr+'] — обороты '+D.rpm[xi]+', дроссель '+D.thr[ti]+'%:', cur);
+  if(nv===null) return; const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
+  D[arr][ti][xi]=v;
+  fetch('/api/pcn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ti,xi,val:v,arr})});
+  drawLeft();
 }
 function drawRight(){
-  const ix=D.rpm.map((_,i)=>i), iy=D.thr.map((_,i)=>i);   // индексы -> равные шаги; подписи из шкалы
+  const ix=D.rpm.map((_,i)=>i), iy=D.thr.map((_,i)=>i);
   const rd=document.getElementById('right');
   const cam=(rd&&rd.layout&&rd.layout.scene&&rd.layout.scene.camera)||{eye:{x:1.7,y:-1.5,z:1.0}};
-  const zz=D.zsmooth||D.z;   // синий график = сглаженное предложение
+  const zz=D.zsurf||D.z;
   const s={type:'surface',x:ix,y:iy,z:zz,cmin:0.2,cmax:1.0,colorscale:'Blues',colorbar:{title:'ЦН',len:.7}};
-  const layout={margin:{t:26,l:0,r:0,b:0},title:'Сглаженная ЦН (синяя, вся таблица)',
+  const layout={margin:{t:26,l:0,r:0,b:0},title:'Итоговая ЦН (3D)',
     scene:{xaxis:{title:'обороты',tickvals:ix,ticktext:D.rpm.map(String)},
            yaxis:{title:'дроссель %',tickvals:iy,ticktext:D.thr.map(String)},
            zaxis:{title:'ЦН',range:[0,1.2]}, camera:cam}};
-  Plotly.react('right',[s],layout,{responsive:true});
+  Plotly.react('right',[s],layout,{responsive:true,displayModeBar:false});
+}
+function drawBcn(){
+  if(!B) return;
+  const N=B.rpm.length, W=960, H=430, mL=52, mR=14;
+  const valTop=28, valBot=300, cntTop=332, cntBot=398, lblY=316;
+  let mx=0; B.zbase.forEach(r=>r.forEach(v=>{if(v>mx)mx=v})); B.z.forEach(r=>r.forEach(v=>{if(v>mx)mx=v}));
+  const yMax=Math.ceil(mx/50)*50||550;
+  const px=i=> mL+(i+0.5)*((W-mR-mL)/N);
+  const vy=v=> valBot-(v/yMax)*(valBot-valTop);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="font:12px system-ui;display:block">`;
+  s+=`<text x="${mL}" y="16" fill="#333" font-weight="bold">БЦН, дроссель ${B.thr[tib]}% — базовое наполнение мг/цикл</text>`;
+  s+=`<rect x="${mL}" y="${valTop}" width="${W-mR-mL}" height="${valBot-valTop}" fill="#fff" stroke="#c7ccd2"/>`;
+  for(let g=0;g<=yMax+1;g+=50){ const y=vy(g);
+    s+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e7eaef"/>`;
+    s+=`<text x="${mL-6}" y="${y+4}" text-anchor="end" fill="#999">${g}</text>`; }
+  for(let i=0;i<N;i++){ const x=px(i);
+    s+=`<line x1="${x}" y1="${valTop}" x2="${x}" y2="${lblY-2}" stroke="#e2e6ea"/>`;
+    s+=`<text x="${x}" y="${lblY}" text-anchor="end" fill="#555" transform="rotate(-45 ${x} ${lblY})">${B.rpm[i]}</text>`; }
+  if(onB('blue'))
+    s+=`<polyline points="${B.zbase[tib].map((v,i)=>px(i)+','+vy(v)).join(' ')}" fill="none" stroke="#9db4ff" stroke-width="1.5"/>`;
+  const cmax=Math.max(1,...(B.count?B.count[tib]:[]).map(c=>c||0));
+  if(B.count) for(let i=0;i<N;i++){ const c=B.count[tib][i]; if(!c) continue;
+    const h=(c/cmax)*(cntBot-cntTop); s+=`<rect x="${px(i)-5}" y="${cntBot-h}" width="10" height="${h}" fill="#c9ccd1"/>`; }
+  s+=`<text x="${mL-6}" y="${cntBot}" text-anchor="end" fill="#999">точек</text>`;
+  for(let i=0;i<N;i++){
+    if(onB('blue')) s+=`<circle cx="${px(i)}" cy="${vy(B.zbase[tib][i])}" r="4" fill="${CB}" stroke="#333" stroke-width="0.6"/>`;
+    const green=B.corr[tib][i], red=B.filled&&B.filled[tib][i];
+    if(green && onB('green')) s+=`<circle cx="${px(i)}" cy="${vy(B.z[tib][i])}" r="6" fill="${CG}" stroke="#333"/>`;
+    if(red && onB('red')) s+=`<circle cx="${px(i)}" cy="${vy(B.z[tib][i])}" r="6" fill="${CR}" stroke="#333"/>`;
+  }
+  s+=`</svg>`;
+  document.getElementById('bcn').innerHTML=s;
+}
+function drawBcn3d(){
+  if(!B) return;
+  const ix=B.rpm.map((_,i)=>i), iy=B.thr.map((_,i)=>i);
+  const rd=document.getElementById('bcn3d');
+  const cam=(rd&&rd.layout&&rd.layout.scene&&rd.layout.scene.camera)||{eye:{x:1.7,y:-1.5,z:1.0}};
+  const s={type:'surface',x:ix,y:iy,z:B.z,colorscale:'Viridis',colorbar:{title:'мг',len:.7}};
+  const layout={margin:{t:26,l:0,r:0,b:0},title:'БЦН (3D), мг/цикл',
+    scene:{xaxis:{title:'обороты',tickvals:ix,ticktext:B.rpm.map(String)},
+           yaxis:{title:'дроссель %',tickvals:iy,ticktext:B.thr.map(String)},
+           zaxis:{title:'мг'}, camera:cam}};
+  Plotly.react('bcn3d',[s],layout,{responsive:true,displayModeBar:false});
 }
 load(); setInterval(load,2500);
 </script>

@@ -23,6 +23,7 @@ ROM_PATH = os.environ.get("ECU_ROM", "/data/rom.bin")
 ROM_BASE = int(os.environ.get("ECU_ROM_BASE", "0x8000"), 0)
 FRONT_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 PCN_PATH = os.path.join(FRONT_DIR, "pcn_data.json")
+BCN_PATH = os.path.join(FRONT_DIR, "bcn_data.json")
 
 app = FastAPI(title="ЭБУ-двойник M30 (SIL)")
 
@@ -47,6 +48,13 @@ def machine():
     if _machine is None:
         _machine = Machine(ROM_PATH, rom_base=ROM_BASE)
     return _machine
+
+
+def active_profile():
+    """Определить вариант прошивки (M30/J30) по reset-вектору загруженного ROM."""
+    reset = machine().peek16(0xFFFE)
+    name, prof = symbols.resolve(reset)
+    return name, prof
 
 
 def engine_machine():
@@ -101,13 +109,17 @@ class StateReq(BaseModel):
 
 @app.get("/api/meta")
 def meta():
+    name, prof = active_profile()
     return {
         "inputs": symbols.INPUTS,
         "watch": symbols.WATCH,
         "flags": symbols.FLAGS,
-        "routines": symbols.ROUTINES,
+        "routines": prof["routines"],      # точки входа выбранного варианта
         "tables": symbols.TABLES,
         "rom_base": ROM_BASE,
+        "variant": name,                    # M30 / J30 / UNKNOWN
+        "variant_desc": prof.get("desc", ""),
+        "engine_plant": prof.get("engine_plant", False),
     }
 
 
@@ -155,6 +167,16 @@ def engine(req: EngineReq):
     """ЖИВОЙ МОТОР (плант-модель): жмёшь газ -> обороты раскручиваются сами."""
     global _engine
 
+    name, prof = active_profile()
+    if not prof.get("engine_plant", False):
+        # Полный «живой мотор» завязан на M30-адреса планировщика/главного цикла
+        # (0x83CE, 0x82A1 и т.д.). Для J30 эти адреса другие — engine_plant пока
+        # не перепривязан. Рутинный уровень (/api/run, /api/sweep) для J30 работает.
+        return {"state": None, "outputs": {},
+                "notice": f"Живой мотор для варианта {name} ещё не привязан "
+                          f"(нужны адреса планировщика/главного цикла J30). "
+                          f"Рутины (/api/run, /api/sweep) работают."}
+
     def _step():
         em = engine_machine()
         return em, em.engine_plant_step(req.gas / 100.0,
@@ -184,8 +206,9 @@ def engine(req: EngineReq):
 def state(req: StateReq):
     """Прогнать мини-цикл с входами и вернуть ВСЕ наблюдаемые + флаги (для панели)."""
     m = machine()
+    _, prof = active_profile()
     info = m.run_chain([i.model_dump() for i in req.inputs],
-                       symbols.CHAIN, iterations=req.iterations)
+                       prof["chain"], iterations=req.iterations)
     watch = {name: m.get_var(d["addr"], d.get("size", 8))
              for name, d in symbols.WATCH.items()}
     flags = {}
@@ -254,6 +277,13 @@ def mixmap():
     return FileResponse(os.path.join(FRONT_DIR, "mixmap.html"))
 
 
+@app.get("/editor")
+def editor():
+    """Редактор данных прошивки J30 (все данные интерпретированно/сырьём, сравнение,
+    скачивание дампа с пересчётом чек-суммы). Автономная страница (ROM вшит)."""
+    return FileResponse(os.path.join(FRONT_DIR, "editor.html"))
+
+
 @app.get("/api/pcn")
 def get_pcn():
     """Отдать таблицу ЦН из pcn_data.json — читаем с диска каждый раз, чтобы правки были видны сразу."""
@@ -261,21 +291,30 @@ def get_pcn():
         return json.load(f)
 
 
+@app.get("/api/bcn")
+def get_bcn():
+    """Отдать таблицу БЦН из bcn_data.json (синий=сток, зелёный=факт из логов, красный=достроено)."""
+    with open(BCN_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
 class PcnEdit(BaseModel):
-    ti: int      # индекс дросселя (строка)
-    xi: int      # индекс оборотов (столбец)
+    ti: int              # индекс дросселя (строка)
+    xi: int              # индекс оборотов (столбец)
     val: float
+    arr: str = "z"       # какой слой правим: z / zred / z5k / zbase
 
 
 @app.post("/api/pcn")
 def set_pcn(e: PcnEdit):
-    """Записать одну ячейку обратно в pcn_data.json (правка из UI)."""
+    """Записать одну ячейку выбранного слоя обратно в pcn_data.json (правка из UI)."""
+    arr = e.arr if e.arr in ("z", "zred", "z5k", "zbase", "zsurf") else "z"
     with open(PCN_PATH, encoding="utf-8") as f:
         d = json.load(f)
-    d["z"][e.ti][e.xi] = e.val
+    d[arr][e.ti][e.xi] = e.val
     with open(PCN_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=0)
-    return {"ok": True, "ti": e.ti, "xi": e.xi, "val": e.val}
+    return {"ok": True, "ti": e.ti, "xi": e.xi, "val": e.val, "arr": arr}
 
 
 if os.path.isdir(FRONT_DIR):

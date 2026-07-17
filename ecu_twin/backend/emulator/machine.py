@@ -6,6 +6,50 @@
 from .cpu6303 import CPU6303
 
 
+# ==========================================================================
+#  ПРОФИЛИ АДРЕСОВ «ЖИВОГО МОТОРА» ПО ВАРИАНТУ ПРОШИВКИ (reset-вектор $FFFE).
+#  RAM/IO/таблицы/lookup-рутины у M30 и J30 идентичны (проверено побайтно) —
+#  различаются только несколько АДРЕСОВ КОДА в цепочке живого мотора.
+#  M30 — рабочие значения, ЗАМОРОЖЕНЫ (переключишься на M30 -> всё как было).
+#  J30 — свои; планировщик-редирект ещё не найден (sched_patch=None) -> его
+#  живой мотор выключен (engine_plant_supported=False), но M30 не затрагивается.
+# ==========================================================================
+ENGINE_PROFILES = {
+    0xB06F: {   # M30 (infiniti90m30at.bin)
+        "name": "M30",
+        "sched_patch_addr": 0x83C7,      # JMP $83CE -> JMP $83C8 (поток через планировщик)
+        "sched_patch_val":  0xC8,
+        "boot_gate_addr":   0x54,         # одноразовая гейт-массивная чистка $54.0x04
+        "boot_gate_or":     0x04,
+        "mainloop_pc":      (0x82A1, 0x82A4),   # возврат в главный цикл
+        "pos_mark":         0x20,         # код метки коленвала в $102E (M30: бит5)
+        "gate_force":       None,         # гейт расчёта открывает планировщик (редирект)
+        "engine_plant_supported": True,
+    },
+    0xAE17: {   # J30 (HN27C256G@DIP28.BIN) — родная
+        "name": "J30",
+        # У J30 планировщик другой (OIM #$40,$54 @ cpu885A вместо JMP-редиректа M30);
+        # гейт расчёта $54.6 открываем напрямую (эквивалент редиректа M30).
+        "sched_patch_addr": None,
+        "sched_patch_val":  None,
+        "boot_gate_addr":   0x54,
+        "boot_gate_or":     0x04,
+        "mainloop_pc":      (0x82A1, 0x82A4),   # совпадает с M30 (проверено побайтно)
+        "pos_mark":         0x08,         # код метки коленвала J30 в $102E (бит3, vec_IRQ гейт)
+        "gate_force":       0x40,         # форс $54.6 = «расчёт готов» (вместо редиректа M30)
+        # У J30 MAF-задача НЕ в фоновом ADC-скане (фон опрашивает каналы 1,2,4,5,7,8,
+        # но не 0=MAF). Прогоняем её явно: 0x8908 MAF adc0 -> $1408 -> VQ -> $1577.
+        # ПРИМЕЧАНИЕ: родная переменная нагрузки/впрыска $150C у J30 в живом потоке пока
+        # не вычисляется — надо найти правильный триггер её РОДНОГО расчёта (0x89B6),
+        # а не подменять костылём. Пока explicit_chain = только MAF.
+        "explicit_chain":   (0x8908,),
+        "engine_plant_supported": True,
+    },
+}
+# Дефолт для незнакомого reset-вектора — M30 (безопасный эталон).
+_ENGINE_DEFAULT = ENGINE_PROFILES[0xB06F]
+
+
 class Bus:
     """Память + перехват аппаратных регистров (ADC, таймер HD6303, порты)."""
     def __init__(self):
@@ -77,6 +121,13 @@ class Machine:
         self.rom_base = rom_base
         self.rom = bytearray()
         self.load_rom(rom_path)
+        # выбрать профиль адресов живого мотора по reset-вектору загруженного ROM
+        self.eng = ENGINE_PROFILES.get(self.peek16(0xFFFE), _ENGINE_DEFAULT)
+
+    @property
+    def engine_plant_supported(self):
+        """Привязан ли полный «живой мотор» к текущему варианту прошивки."""
+        return self.eng.get("engine_plant_supported", False)
 
     def load_rom(self, path):
         with open(path, "rb") as f:
@@ -171,6 +222,18 @@ class Machine:
     def get_var(self, addr, size):
         return self.peek16(addr) if size == 16 else self.peek8(addr)
 
+    # ---- прогон рутины БЕЗ порчи контекста живого цикла ----
+    def _call_preserving(self, addr, max_steps=200_000):
+        """Выполнить рутину до RTS, сохранив/восстановив регистры CPU.
+        Запись рутины в ПАМЯТЬ (переменные ЭБУ) остаётся; регистры/стек — как были.
+        Нужно, чтобы явно прогнать фоновую задачу (MAF/нагрузка) внутри живого цикла."""
+        c = self.cpu
+        saved = (c.A, c.B, c.X, c.SP, c.PC, c.H, c.I, c.N, c.Z, c.V, c.C,
+                 c.instr, c.halted)
+        self.call_routine(addr, max_steps=max_steps)
+        (c.A, c.B, c.X, c.SP, c.PC, c.H, c.I, c.N, c.Z, c.V, c.C,
+         c.instr, c.halted) = saved
+
     # ---- прогон одной рутины до RTS ----
     def call_routine(self, addr, max_steps=200_000, trace=False):
         """
@@ -245,8 +308,10 @@ class Machine:
         """Завести прошивку: boot + redirect через планировщик."""
         self.boot(boot_steps)
         # JMP $83CE -> JMP $83C8: поток идёт ЧЕРЕЗ планировщик $88DE,
-        # как это делает гейт-массив на реальном железе.
-        self.bus.mem[0x83C7] = 0xC8
+        # как это делает гейт-массив на реальном железе. Адрес — из профиля
+        # варианта; если не найден (J30) — редирект пропускаем.
+        if self.eng.get("sched_patch_addr") is not None:
+            self.bus.mem[self.eng["sched_patch_addr"]] = self.eng["sched_patch_val"]
         # ФИКС ПОРЯДКА ЗАГРУЗКИ: одноразовая гейт-массивная инициализация ($88A2)
         # на $88DA чистит $51 ОДИН раз (гейт $54.0x04). На железе она проходит РАНЬШЕ,
         # чем init ставит защёлки подсистем (boot $B15F ставит $51.0x20 = «WOT-обогащение
@@ -254,7 +319,8 @@ class Machine:
         # ПОЗЖЕ и стирает boot-защёлки -> подсистема WOT-обогащения (клапан мощности и др.)
         # запирается в дедлоке. Помечаем одноразовую чистку выполненной, чтобы защёлки
         # выжили — как на железе. Net-эффект тот же: после boot $51 уже чист ($B15F).
-        self.poke8(0x54, self.peek8(0x54) | 0x04)
+        self.poke8(self.eng["boot_gate_addr"],
+                   self.peek8(self.eng["boot_gate_addr"]) | self.eng["boot_gate_or"])
         self._engine_started = True
 
     def _eng_tick(self, n):
@@ -277,7 +343,7 @@ class Machine:
             bus.counter = (bus.counter + 1) & 0xFFFF
             if bus.counter < prev:
                 bus.tof = 1
-            if cpu.PC in (0x82A1, 0x82A4):     # вернулись в главный цикл
+            if cpu.PC in self.eng["mainloop_pc"]:     # вернулись в главный цикл
                 break
 
     def _eng_mark(self, ref, rpm_period, maf_adc):
@@ -288,8 +354,12 @@ class Machine:
         self._eng_tick(600)
         bus.icr = bus.counter
         self.poke16(0x1046, rpm_period & 0xFFFF)   # период -> RPM
-        self.poke8(0x102E, 0x20)                   # бит метки положения
+        self.poke8(0x102E, self.eng["pos_mark"])   # код метки положения (M30 бит5 / J30 бит3)
         self.poke8(0x102F, 0x10)
+        # Гейт расчёта $54.6: у M30 его открывает планировщик (редирект $83C7);
+        # у J30 планировщик другой (OIM #$40,$54) — форсим гейт напрямую.
+        if self.eng.get("gate_force"):
+            self.poke8(0x54, self.peek8(0x54) | self.eng["gate_force"])
         if ref:
             self.poke8(0x17, self.peek8(0x17) | 0x08)   # опорный на порт $17.бит3
         if cpu.I == 0:
@@ -323,6 +393,14 @@ class Machine:
         for _ in range(max(1, cycles)):
             for seg in range(6):
                 self._eng_mark(seg == 0, rpm_period, maf_adc)
+        # J30: задачи MAF/нагрузки/впрыска не в фоновом ADC-скане -> прогоняем цепочку
+        # явно (контекст CPU сохраняем: запись в память $1577/$1413/$150C остаётся,
+        # регистры/стек живого цикла не портим).
+        chain = self.eng.get("explicit_chain")
+        if chain:
+            self.bus.adc[0] = maf_adc & 0xFFFF
+            for addr in chain:
+                self._call_preserving(addr)
         # фоновый цикл: датчики (температура), idle-контроль (РХХ), коррекции
         self._eng_mainloop(15000)
         return self._engine_state()

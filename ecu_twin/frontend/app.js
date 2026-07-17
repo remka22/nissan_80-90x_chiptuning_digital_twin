@@ -270,6 +270,12 @@ async function updateEngine() {
   buildSwWatch();
   document.getElementById('iterations').addEventListener('change', scheduleUpdate);
   document.getElementById('btn-sweep').addEventListener('click', doSweep);
-  document.getElementById('status').textContent = 'готов · ROM base 0x' + META.rom_base.toString(16);
+  const h1 = document.querySelector('header h1');
+  if (h1) h1.textContent = '🧠 ЭБУ-двойник ' + (META.variant || '?') + ' · виртуальная панель';
+  document.getElementById('status').textContent =
+    'готов · вариант ' + (META.variant || '?') +
+    ' (' + (META.variant_desc || '') + ')' +
+    ' · живой мотор: ' + (META.engine_plant ? 'да' : 'нет (только рутины)') +
+    ' · ROM base 0x' + META.rom_base.toString(16);
   updateState();   // первый прогон
 })();

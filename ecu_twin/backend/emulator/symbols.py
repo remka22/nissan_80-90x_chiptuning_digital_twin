@@ -60,9 +60,49 @@ FLAGS = {
 # --- цепочка «мини-цикла» для панели (что прогоняем по очереди) ---
 CHAIN = [0x899A, 0x89D4, 0x8A6A]
 
-# --- ROM-таблицы (CPU-адрес = file + 0x8000) ---
+# --- ROM-таблицы (CPU-адрес = file + 0x8000). Адреса совпадают у M30 и J30. ---
 TABLES = {
     "VQ_MAF":     0xFA70,   # MAF Translation (file 0x7A70)
     "Timing":     0xFC00,   # карта угла (file 0x7C00)
-    "GearFuel":   0xF400,   # file 0x7400
+    "GearFuel":   0xF400,   # file 0x7400 (у J30 — структурный блок, не Knock)
+    "Fuel":       0xFD00,   # Primary Fuel Map (file 0x7D00)
 }
+
+# ==========================================================================
+#  ВАРИАНТ-ПРОФИЛИ. RAM/IO/таблицы у M30 и J30 ИДЕНТИЧНЫ (проверено побайтно),
+#  различаются только ТОЧКИ ВХОДА РУТИН (код собран по-разному). Вариант
+#  определяется по reset-вектору ($FFFE): M30=0xB06F, J30=0xAE17.
+#  Точки входа J30 получены трассировкой родного дизасма (dis6303/Ghidra).
+# ==========================================================================
+PROFILES = {
+    "M30": {
+        "reset": 0xB06F,
+        "desc": "Infiniti M30 90-92 (infiniti90m30at.bin)",
+        "routines": {
+            "maf_to_load": {"addr": 0x899A, "desc": "MAF: $1408 -> VQ(0xFA70) -> $1577"},
+            "load_calc":   {"addr": 0x89D4, "desc": "Расчёт нагрузки $1413"},
+            "tp_filter":   {"addr": 0x8A6A, "desc": "Фильтр Tp: $1413 -> $1482"},
+        },
+        "chain": [0x899A, 0x89D4, 0x8A6A],
+        "engine_plant": True,   # полный «живой мотор» откалиброван под M30
+    },
+    "J30": {
+        "reset": 0xAE17,
+        "desc": "Nissan Maxima J30 1994 (HN27C256G@DIP28.BIN) — родная",
+        "routines": {
+            "maf_to_load": {"addr": 0x8908, "desc": "MAF: ADC -> $1408 -> VQ(0xFA70) -> $1577"},
+            "load_calc":   {"addr": 0x89A8, "desc": "Расчёт нагрузки $1413"},
+            "tp_filter":   {"addr": 0x8A26, "desc": "Фильтр Tp: $1413 -> $1482"},
+        },
+        "chain": [0x8908, 0x89A8, 0x8A26],
+        "engine_plant": True,   # живой мотор перепривязан на J30 (crank-sync рецепт в machine.py)
+    },
+}
+
+
+def resolve(reset_vec):
+    """По reset-вектору вернуть (имя_варианта, профиль). Неизвестный -> M30 как дефолт."""
+    for name, p in PROFILES.items():
+        if p["reset"] == reset_vec:
+            return name, p
+    return "UNKNOWN", PROFILES["M30"]
