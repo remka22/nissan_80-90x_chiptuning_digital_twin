@@ -59,6 +59,12 @@ class Bus:
         self.adc_result = [0, 0, 0, 0]        # 4 регистра-результата (канал&3 -> слот)
         self.port2000 = 0x00                  # порт положения коленвала
         self.io_writes = []
+        # --- заглушка SCI для теста логгера-телеметрии ---
+        # Настоящий SCI в двойнике не эмулируется. Для прогона патча-логгера:
+        # чтение TRCSR ($0011) всегда отдаёт TDRE=1 (передатчик готов),
+        # запись в TDR ($0013) складываем в sci_tx (перехваченный поток байт).
+        self.sci_stub = True
+        self.sci_tx = []
         # --- таймер HD6303 ---
         self.counter = 0x0000                 # free-running counter ($09/$0A)
         self.icr = 0x0000                     # input capture register ($0D/$0E)
@@ -95,6 +101,9 @@ class Bus:
         # --- порт положения ---
         if a == 0x2000:
             return self.port2000
+        # --- заглушка SCI: TRCSR всегда с TDRE=1 (передатчик готов) ---
+        if self.sci_stub and a == 0x0011:
+            return self.mem[a] | 0x20
         return self.mem[a]
 
     def write8(self, a, v):
@@ -111,6 +120,9 @@ class Bus:
             self.adc_mux = ch
             # защёлкиваем значение канала в его регистр-результат (канал & 3)
             self.adc_result[ch & 3] = self.adc.get(ch, 0)
+        # --- заглушка SCI: запись в TDR ($0013) перехватываем в поток ---
+        if self.sci_stub and a == 0x0013:
+            self.sci_tx.append(v)
         self.mem[a] = v
 
 

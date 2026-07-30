@@ -24,6 +24,7 @@ ROM_BASE = int(os.environ.get("ECU_ROM_BASE", "0x8000"), 0)
 FRONT_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 PCN_PATH = os.path.join(FRONT_DIR, "pcn_data.json")
 BCN_PATH = os.path.join(FRONT_DIR, "bcn_data.json")
+DAD_PATH = os.path.join(FRONT_DIR, "dad_data.json")
 
 app = FastAPI(title="ЭБУ-двойник M30 (SIL)")
 
@@ -295,6 +296,13 @@ def get_pcn():
 def get_bcn():
     """Отдать таблицу БЦН из bcn_data.json (синий=сток, зелёный=факт из логов, красный=достроено)."""
     with open(BCN_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+@app.get("/api/dad")
+def get_dad():
+    """Отдать ПЦН по давлению (ДАД): зелёный=измерено логами, красный=достроено/экстраполяция."""
+    with open(DAD_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 

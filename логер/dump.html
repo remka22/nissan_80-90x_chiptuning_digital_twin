@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Логгер J30 — дамп ОЗУ</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 0; padding: 24px; background:#111; color:#eee; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color:#888; font-size: 13px; margin-bottom: 18px; }
+  #status { display:inline-block; padding:2px 10px; border-radius:10px;
+            font-size:12px; margin-left:8px; }
+  .on { background:#1a4; color:#fff; } .off { background:#a33; color:#fff; }
+  table { border-collapse: collapse; width:100%; max-width:680px; }
+  th { text-align:left; color:#888; font-weight:500; font-size:12px;
+       padding:6px 12px; border-bottom:1px solid #333; }
+  td { padding:8px 12px; border-bottom:1px solid #232323;
+       font-variant-numeric: tabular-nums; }
+  .addr { color:#678; font-size:12px; width:60px; }
+  .name { color:#cde; }
+  .val  { font-size:20px; text-align:right; width:90px; }
+  .unit { color:#888; font-size:12px; width:60px; }
+  .raw  { color:#667; font-size:12px; text-align:right; width:110px; }
+  .conf { font-size:10px; padding:1px 6px; border-radius:8px; }
+  .high { background:#173; color:#cfe; }
+  .med  { background:#640; color:#fec; }
+  .addrc{ background:#334; color:#bcd; }
+  tr.hit td { background:#1c2630; }
+</style>
+</head>
+<body>
+  <h1>Логгер J30 — дамп ОЗУ <span id="status" class="off">нет связи</span></h1>
+  <div class="sub">Проход <span id="sweep">—</span> · обновление <span id="age">—</span>.
+     Сырой полный образ пишется в <code>*_raw.csv</code>.</div>
+  <table>
+    <thead><tr><th>адрес</th><th>что</th><th>физика</th><th></th><th>сырое</th><th>увер.</th></tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+
+<script>
+const tb = document.getElementById('tb');
+const rows = {};
+let lastWall = 0;
+
+function connect() {
+  const es = new EventSource('/stream');
+  const st = document.getElementById('status');
+  es.onopen  = () => { st.textContent='связь есть'; st.className='on'; };
+  es.onerror = () => { st.textContent='нет связи';  st.className='off'; };
+  es.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    if (!d.vars) return;
+    lastWall = Date.now();
+    document.getElementById('sweep').textContent = d.sweep;
+    for (const key in d.vars) {
+      const v = d.vars[key];
+      let tr = rows[key];
+      if (!tr) {
+        tr = document.createElement('tr');
+        tr.innerHTML = `<td class="addr">${key}</td>`
+          + `<td class="name"></td><td class="val"></td><td class="unit"></td>`
+          + `<td class="raw"></td><td><span class="conf"></span></td>`;
+        tb.appendChild(tr); rows[key] = tr;
+      }
+      tr.children[1].textContent = v.name;
+      tr.children[2].textContent = (v.phys===null||v.phys===undefined) ? '—' : v.phys;
+      tr.children[3].textContent = v.unit || '';
+      tr.children[4].textContent = v.raw + ' (0x' + v.raw.toString(16).toUpperCase() + ')';
+      const c = tr.children[5].firstChild;
+      c.textContent = v.conf;
+      c.className = 'conf ' + (v.conf==='high'?'high':v.conf==='med'?'med':'addrc');
+      tr.classList.add('hit'); setTimeout(()=>tr.classList.remove('hit'), 150);
+    }
+  };
+}
+setInterval(() => {
+  const a = lastWall ? (Date.now()-lastWall) : null;
+  document.getElementById('age').textContent =
+    a===null ? '—' : (a<2000 ? a+' мс назад' : 'давно');
+}, 250);
+connect();
+</script>
+</body>
+</html>

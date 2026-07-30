@@ -5,7 +5,7 @@ sys.path.insert(0, "/Users/remka22/Documents/ЭБУ Максима/1994_Nissan_M
 import rom_editor as RE
 
 ROOT = "/Users/remka22/Documents/ЭБУ Максима/1994_Nissan_Maxima_J30_RUS"
-orig = bytearray(open(RE.ORIG, "rb").read())
+orig = bytearray(open(RE.ORIG, "rb").read())   # СТОК вшит; ДАД-карты появятся при «Загрузить дамп» боевого бина
 layout = RE.build_layout(orig, orig)
 
 # ось (шкала X) по адресу таблицы: чем индексируется значение
@@ -27,7 +27,7 @@ for it in layout:
         "a": it["a"], "len": it["len"], "kind": it["kind"], "conv": it["conv"],
         "name": it["name"], "unit": unit, "unknown": it.get("unknown", False),
         "locked": it.get("locked", False), "note": it.get("note", ""),
-        "rax": it.get("rax"), "cax": it.get("cax"),
+        "rax": it.get("rax"), "cax": it.get("cax"), "own": it.get("own", False),
         "axis": AXIS.get(it["a"], ""), "dead": it.get("dead", False),
     })
 rom_b64 = base64.b64encode(bytes(orig)).decode()
@@ -211,7 +211,7 @@ HTML = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  <label class=filebtn style="padding:6px 12px;border-radius:4px">📎 Эталон<input type=file id=reff accept=".bin" style=display:none></label>
  <span id=refname title="клик — вернуть эталон = сток">эталон: сток</span>
  <label><input type=checkbox id=rawm> Сырые байты (0-255)</label>
- <label><input type=checkbox id=heat checked> 🌡 Заливка карт</label>
+ <label><input type=checkbox id=heat> 🌡 Заливка карт</label>
  <span id=status></span>
 </header>
 <div class=hint>Оригинал (сток) вшит в страницу. По умолчанию сравнение со стоком; «📎 Эталон» — сравнить с выбранным .bin (клик по «эталон: …» вернёт сток). У каждой ячейки кнопка ↺ — свести к эталону. Протяни мышью по ячейкам → массовое изменение снизу. «Сохранить дамп» пересчитывает чек-сумму.</div>
@@ -234,6 +234,14 @@ const INJ_CALC=`<div class=calc>
 <button id=calcgo>⚙ ЗАМЕНИТЬ ФОРСУНКИ — пересчитать K + пусковое + задержку</button>
 <div class=calcnote>Считает от СТОКА × отношение (старые÷новые). Жать можно повторно — не накапливается. Наклон 0x7F87 не трогается. После — проверь значения ниже и сохрани дамп.</div>
 </div>`;
+
+const DAD_CALC=`<div class=calc>
+<b>📐 Расчёт тарировки ДАД по 2 точкам</b> — введи две пары (напряжение → давление) из паспорта датчика:<br>
+Точка 1: <input id=dv1 class=ci placeholder="0.5"> В → <input id=dp1 class=ci placeholder="0"> кПа<br>
+Точка 2: <input id=dv2 class=ci placeholder="4.5"> В → <input id=dp2 class=ci placeholder="100"> кПа<br>
+<button id=dadgo>📐 РАССЧИТАТЬ — Наклон + Смещение</button>
+<div class=calcnote>Наклон = (P2−P1)/(V2−V1) кПа/В; Смещение = напряжение при 0 кПа. Пишет прямо в поля Наклон/Смещение выше. Пример: 0.5В→0кПа, 4.5В→100кПа даёт наклон 25, смещение 0.5. После — сохрани дамп.</div>
+</div>`;
 const ROM_ORIG=Uint8Array.from(atob("__ROM__"),c=>c.charCodeAt(0));
 let ROM=ROM_ORIG.slice();      // редактируемая копия
 let REF=ROM_ORIG.slice();      // эталон сравнения (по умолчанию = сток, можно загрузить файл)
@@ -241,7 +249,7 @@ const CHK=[0x7F7A,0x7F7B];
 const EXPANDED=new Set();       // адреса свёрнутых секций, которые раскрыли вручную
 let RAWMODE=false;              // показывать/править сырые байты 0..255 вместо интерпретации
 // граф-вид: у неизвестных вкл по умолчанию, НО только если есть разброс (константы оставляем свёрнутыми)
-let HEATMAP=true;               // тепловая заливка ячеек карт 16x16 по значению
+let HEATMAP=false;              // тепловая заливка ячеек карт 16x16 по значению (по умолчанию ВЫКЛ)
 function heat(v,mn,mx){const t=(mx>mn)?(v-mn)/(mx-mn):0.5;return 'hsl('+Math.round((1-t)*230)+',68%,60%)';}
 const GRAPHED=new Set(ITEMS.filter(i=>{
   if(!i.unknown||i.len<3)return false;
@@ -270,6 +278,11 @@ function rawToPhys(conv,x){switch(conv){
   case 'tp125': return Math.round(x*0.125*100)/100;
   case 'temp': return x-50;
   case 'idlerpm': return Math.round((64+x)*7.2);
+  case 've': return Math.round(x/128*1000)/1000;
+  case 'kpa': return x;
+  case 'dadofs': return Math.round(x*0.0195*100)/100;
+  case 'dadslope': return Math.round(x/5*10)/10;
+  case 'km': return Math.round(x/255*1000)/1000;
   default: return x;
 }}
 // физика->байт (null = не менять)
@@ -286,6 +299,11 @@ function physToRaw(conv,v){v=(''+v).trim();if(v==='')return null;
    case 'tp125': return clamp(Math.round(+v/0.125));
    case 'temp': return clamp((+v)+50);
    case 'idlerpm': return clamp(Math.round(+v/7.2-64));
+   case 've': return clamp(Math.round(+v*128));
+   case 'kpa': return clamp(Math.round(+v));
+   case 'dadofs': return clamp(Math.round(+v/0.0195));
+   case 'dadslope': return clamp(Math.round(+v*5));
+   case 'km': return clamp(Math.round(+v*255));
    default: return clamp(parseInt(v));
   }}
 function clamp(x){x=x|0;return isNaN(x)?null:Math.max(0,Math.min(255,x));}
@@ -377,7 +395,7 @@ function secHtml(it){
     const rax=byName(it.rax),cax=byName(it.cax);
     let mn=0,mx=1;
     if(HEATMAP){const vs=[];for(let j=0;j<256;j++)vs.push(cnum(it,j,ROM));mn=Math.min(...vs);mx=Math.max(...vs);}
-    h+='<table class=map><tr><td class=ax>об\\нагр</td>';
+    h+=`<table class=map><tr><td class=ax>об\\${cax?cax.unit:'нагр'}</td>`;
     for(let c=0;c<16;c++)h+=`<td class=ax>${cax?cellVal(cax,c,ROM):c}</td>`;
     h+='</tr>';
     for(let r=0;r<16;r++){h+=`<tr><td class=ax>${rax?cellVal(rax,r,ROM):r}</td>`;
@@ -399,9 +417,20 @@ function secHtml(it){
 }
 function render(){
   const app=document.getElementById('app');
-  const known=ITEMS.filter(i=>!i.unknown), unk=ITEMS.filter(i=>i.unknown);
+  const own=ITEMS.filter(i=>i.own);
+  // Собственные карты показывать ТОЛЬКО если ДАД-патч реально прошит:
+  // врезка 89D8 указывает на нашу рутину C700 (ROM[0x09D9]==0xC7). В стоке там 0x80.
+  const dadOn=(ROM[0x09D9]===0xC7);
+  const known=ITEMS.filter(i=>!i.unknown && !i.own), unk=ITEMS.filter(i=>i.unknown);
   const byA={}; for(const i of known) byA[i.a]=i;
-  let html='<div class=group>✅ ИЗВЕСТНЫЕ ДАННЫЕ ('+known.length+') — смысл известен, подписано</div>';
+  let html='';
+  if(own.length && dadOn){
+    html+='<div class=group style="color:#fc6">🔧 СОБСТВЕННЫЕ КАРТЫ ('+own.length+') — НАШ ПАТЧ: speed-density по ДАД</div>';
+    html+='<div class=hint>НЕ заводское — наш патч перевода на ДАД (давление вместо MAF). Наполнение = Об·Д·VE, впрыск ∝ наполнению. <b>VE</b> — основная карта тюна (крутишь по ШДК: форма наполнения по оборотам×давлению, 1.0=норма). <b>Ось давления</b> — 16 точек в кПа (атмо 20-110). <b>Смещение</b> (В) и <b>Наклон</b> (кПа/В) — тарировка ДАД (у каждого датчика свои, из паспорта). <b>КМ</b> — общий уровень топлива (0-1, старт ~0.5). Работает ТОЛЬКО с прошитым патчем и ДАД на месте MAF.</div>';
+    for(const it of own) html+=secHtml(it);
+    html+=DAD_CALC;
+  }
+  html+='<div class=group>✅ ИЗВЕСТНЫЕ ДАННЫЕ ('+known.length+') — смысл известен, подписано</div>';
   const used=new Set();
   for(const g of GROUPS){
     const title=g[0], addrs=g[1], info=g[2];
@@ -434,6 +463,8 @@ function render(){
       if(typed!=='' && !isNaN(dt) && !isNaN(dr) && Math.abs(dt-dr)>0.05){
         inp.classList.add('adj'); setTimeout(()=>inp.classList.remove('adj'),1200);
       }
+      // правили ТАБЛИЦУ-ОСЬ (её адрес = rax/cax какой-то карты)? -> перерисовать, чтобы оси на картах обновились
+      if(ITEMS.some(m=>m.rax===a||m.cax===a)) render();
     });
   });
   document.querySelectorAll('#app button.exp').forEach(b=>{
@@ -460,6 +491,22 @@ function render(){
     if(lat>0) ROM[0x7F88]=Math.max(0,Math.min(255,Math.round(lat*100)));
     mark();
     document.getElementById('status').textContent='форсунки пересчитаны: отношение '+r.toFixed(3)+' → K='+K+', задержка байт '+ROM[0x7F88];
+    render();
+  });
+  const dg=document.getElementById('dadgo');
+  if(dg)dg.addEventListener('click',()=>{
+    const v1=parseFloat(document.getElementById('dv1').value), p1=parseFloat(document.getElementById('dp1').value);
+    const v2=parseFloat(document.getElementById('dv2').value), p2=parseFloat(document.getElementById('dp2').value);
+    if(isNaN(v1)||isNaN(p1)||isNaN(v2)||isNaN(p2)||v1===v2){alert('Введи две РАЗНЫЕ точки: напряжение → давление');return;}
+    const slope=(p2-p1)/(v2-v1);            // кПа/В
+    const voff=v1 - p1/slope;               // В при 0 кПа
+    const smRaw=Math.round(voff/0.0195), slRaw=Math.round(slope*5);
+    if(slRaw<0||slRaw>255||smRaw<0||smRaw>255){alert('Вне диапазона байта: наклон>51 кПа/В (3-бар+ не влезает) или смещение <0/>5В. Запишу с ограничением — проверь датчик/точки.');}
+    const smByte=Math.max(0,Math.min(255,smRaw));
+    const slByte=Math.max(0,Math.min(255,slRaw));
+    ROM[0x4A10]=smByte; ROM[0x4A11]=slByte;
+    mark();
+    document.getElementById('status').textContent='ДАД: наклон '+slope.toFixed(1)+' кПа/В (байт '+slByte+'), смещение '+voff.toFixed(2)+' В (байт '+smByte+')';
     render();
   });
 }

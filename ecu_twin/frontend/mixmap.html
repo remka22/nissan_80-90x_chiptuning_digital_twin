@@ -53,8 +53,23 @@
    <div class="hint">3D БЦН (факт + достроено), мг/цикл. Крути мышью.</div>
  </div>
 </div>
+<div class="wrap">
+ <div class="card" style="flex:1.9;min-width:600px">
+   <div class="layers">
+     <label><input type="checkbox" id="cb-dgreen" checked> <b style="color:#1a7">&#9679; измерено логами</b></label>
+     <label><input type="checkbox" id="cb-dred" checked> <b style="color:#e33">&#9679; достроено / экстраполяция</b></label>
+   </div>
+   <div id="dad"></div>
+   <div class="thr-row" id="dadbtns"></div>
+   <div class="hint">ПЦН по ДАВЛЕНИЮ (ДАД) — перенос откатанной ПЦН-дросселя на ось давления. Кнопки = давление, кПа.</div>
+ </div>
+ <div class="card" style="flex:1;min-width:360px">
+   <div id="dad3d" style="height:460px"></div>
+   <div class="hint">3D ПЦН-ДАД (обороты × давление). Крути мышью.</div>
+ </div>
+</div>
 <script>
-let D=null, ti=7, lastJson="", B=null, lastBcn="", tib=15;
+let D=null, ti=7, lastJson="", B=null, lastBcn="", tib=15, A=null, lastDad="", pi=12;
 const CB='#2255ff', CG='#1a7', CR='#e33', CY='#f5c000';
 const PRIO={[CG]:3,[CY]:2,[CR]:1,[CB]:0}, ARR={[CG]:'z',[CY]:'z5k',[CR]:'zred',[CB]:'zbase'};
 function on(name){ const e=document.getElementById('cb-'+name); return e?e.checked:true; }
@@ -66,7 +81,21 @@ async function load(){
     const sb=JSON.stringify(b);
     if(sb!==lastBcn){ lastBcn=sb; B=b; buildBtnsB(); drawBcn(); drawBcn3d(); }
   }catch(e){}
+  try{ const a=await (await fetch('/api/dad')).json();
+    const sa=JSON.stringify(a);
+    if(sa!==lastDad){ lastDad=sa; A=a; buildBtnsD(); drawDad(); drawDad3d(); }
+  }catch(e){}
 }
+function buildBtnsD(){
+  const box=document.getElementById('dadbtns'); if(!box||!A) return; box.innerHTML='';
+  A.press.forEach((p,i)=>{
+    const b=document.createElement('button'); b.textContent=Math.round(p);
+    if(i===pi) b.className='on';
+    b.onclick=()=>{ pi=i; buildBtnsD(); drawDad(); };
+    box.appendChild(b);
+  });
+}
+function onD(name){ const e=document.getElementById('cb-d'+name); return e?e.checked:true; }
 function buildBtnsB(){
   const box=document.getElementById('bthrbtns'); if(!box||!B) return; box.innerHTML='';
   B.thr.forEach((t,i)=>{
@@ -90,6 +119,9 @@ function buildBtns(){
 });
 ['bblue','bgreen','bred'].forEach(n=>{
   const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawBcn();
+});
+['dgreen','dred'].forEach(n=>{
+  const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawDad();
 });
 function onB(name){ const e=document.getElementById('cb-b'+name); return e?e.checked:true; }
 function draw(){ drawLeft(); drawRight(); }
@@ -212,6 +244,46 @@ function drawBcn3d(){
            yaxis:{title:'дроссель %',tickvals:iy,ticktext:B.thr.map(String)},
            zaxis:{title:'мг'}, camera:cam}};
   Plotly.react('bcn3d',[s],layout,{responsive:true,displayModeBar:false});
+}
+function drawDad(){
+  if(!A) return;
+  const N=A.rpm.length, W=960, H=430, mL=52, mR=14;
+  const valTop=28, valBot=300, cntTop=332, cntBot=398, lblY=316, yMax=1.0;
+  const px=i=> mL+(i+0.5)*((W-mR-mL)/N);
+  const vy=v=> valBot-(v/yMax)*(valBot-valTop);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="font:12px system-ui;display:block">`;
+  s+=`<text x="${mL}" y="16" fill="#333" font-weight="bold">ПЦН ДАД — давление ${Math.round(A.press[pi])} кПа</text>`;
+  s+=`<rect x="${mL}" y="${valTop}" width="${W-mR-mL}" height="${valBot-valTop}" fill="#fff" stroke="#c7ccd2"/>`;
+  for(let g=0;g<=yMax+0.001;g+=0.1){ const y=vy(g);
+    s+=`<line x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}" stroke="#e7eaef"/>`;
+    s+=`<text x="${mL-6}" y="${y+4}" text-anchor="end" fill="#999">${g.toFixed(1)}</text>`; }
+  for(let i=0;i<N;i++){ const x=px(i);
+    s+=`<line x1="${x}" y1="${valTop}" x2="${x}" y2="${lblY-2}" stroke="#e2e6ea"/>`;
+    s+=`<text x="${x}" y="${lblY}" text-anchor="end" fill="#555" transform="rotate(-45 ${x} ${lblY})">${A.rpm[i]}</text>`; }
+  s+=`<polyline points="${A.z[pi].map((v,i)=>px(i)+','+vy(v)).join(' ')}" fill="none" stroke="#bbb" stroke-width="1.5"/>`;
+  const cmax=Math.max(1,...(A.count?A.count[pi]:[]).map(c=>c||0));
+  if(A.count) for(let i=0;i<N;i++){ const c=A.count[pi][i]; if(!c) continue;
+    const h=(c/cmax)*(cntBot-cntTop); s+=`<rect x="${px(i)-5}" y="${cntBot-h}" width="10" height="${h}" fill="#c9ccd1"/>`; }
+  s+=`<text x="${mL-6}" y="${cntBot}" text-anchor="end" fill="#999">точек</text>`;
+  for(let i=0;i<N;i++){
+    const meas=A.corr[pi][i];
+    if(meas && onD('green')) s+=`<circle cx="${px(i)}" cy="${vy(A.z[pi][i])}" r="6" fill="${CG}" stroke="#333"/>`;
+    if(!meas && onD('red')) s+=`<circle cx="${px(i)}" cy="${vy(A.z[pi][i])}" r="5" fill="${CR}" stroke="#333"/>`;
+  }
+  s+=`</svg>`;
+  document.getElementById('dad').innerHTML=s;
+}
+function drawDad3d(){
+  if(!A) return;
+  const ix=A.rpm.map((_,i)=>i), iy=A.press.map((_,i)=>i);
+  const rd=document.getElementById('dad3d');
+  const cam=(rd&&rd.layout&&rd.layout.scene&&rd.layout.scene.camera)||{eye:{x:1.7,y:-1.5,z:1.0}};
+  const s={type:'surface',x:ix,y:iy,z:A.z,colorscale:'Blues',colorbar:{title:'ПЦН',len:.7}};
+  const layout={margin:{t:26,l:0,r:0,b:0},title:'ПЦН ДАД (3D)',
+    scene:{xaxis:{title:'обороты',tickvals:ix,ticktext:A.rpm.map(String)},
+           yaxis:{title:'давление кПа',tickvals:iy,ticktext:A.press.map(p=>String(Math.round(p)))},
+           zaxis:{title:'ПЦН',range:[0,1.0]}, camera:cam}};
+  Plotly.react('dad3d',[s],layout,{responsive:true,displayModeBar:false});
 }
 load(); setInterval(load,2500);
 </script>

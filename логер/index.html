@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Логгер J30 — живая телеметрия</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+         margin: 0; padding: 24px; background:#111; color:#eee; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color:#888; font-size: 13px; margin-bottom: 20px; }
+  #status { display:inline-block; padding:2px 10px; border-radius:10px;
+            font-size:12px; margin-left:8px; }
+  .on  { background:#1a4; color:#fff; }
+  .off { background:#a33; color:#fff; }
+  table { border-collapse: collapse; width:100%; max-width:560px; }
+  td { padding:10px 14px; border-bottom:1px solid #2a2a2a; }
+  .key  { color:#9ad; font-weight:600; width:120px; }
+  .val  { font-size:28px; font-variant-numeric: tabular-nums; text-align:right; }
+  .unit { color:#888; font-size:13px; width:70px; }
+  .raw  { color:#666; font-size:12px; font-variant-numeric: tabular-nums;
+          text-align:right; width:90px; }
+  .flash { transition: background .12s; }
+  .hit  { background:#243; }
+</style>
+</head>
+<body>
+  <h1>Логгер J30 — живая телеметрия <span id="status" class="off">нет связи</span></h1>
+  <div class="sub">Сырое из ОЗУ блока → физика. Обновление <span id="age">—</span></div>
+  <table id="tbl"><tbody></tbody></table>
+
+<script>
+const tbody = document.querySelector('#tbl tbody');
+const rows = {};
+let units = {};
+let lastT = 0, lastWall = 0;
+
+async function init() {
+  const f = await (await fetch('/fields')).json();
+  f.fields.forEach(fd => {
+    units[fd.key] = fd.unit;
+    const tr = document.createElement('tr');
+    tr.className = 'flash';
+    tr.innerHTML =
+      `<td class="key">${fd.key}</td>` +
+      `<td class="val" data-v>—</td>` +
+      `<td class="unit">${fd.unit}</td>` +
+      `<td class="raw" data-r></td>`;
+    tbody.appendChild(tr);
+    rows[fd.key] = tr;
+  });
+  connect();
+  setInterval(tick, 250);
+}
+
+function connect() {
+  const es = new EventSource('/stream');
+  const st = document.getElementById('status');
+  es.onopen  = () => { st.textContent='связь есть'; st.className='on'; };
+  es.onerror = () => { st.textContent='нет связи';  st.className='off'; };
+  es.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    lastT = d.t; lastWall = Date.now();
+    for (const k in d.phys) {
+      const tr = rows[k]; if (!tr) continue;
+      const v = d.phys[k];
+      tr.querySelector('[data-v]').textContent =
+        (v === null || v === undefined) ? '—' : v;   // нет данных (напр. ШДК) -> —
+      const rv = d.raw ? d.raw[k] : undefined;
+      tr.querySelector('[data-r]').textContent =
+        (rv === undefined) ? '' : '0x' + rv.toString(16).toUpperCase();
+      tr.classList.add('hit');
+      setTimeout(() => tr.classList.remove('hit'), 120);
+    }
+  };
+}
+
+function tick() {
+  const age = lastWall ? Math.round((Date.now()-lastWall)) : null;
+  document.getElementById('age').textContent =
+    age===null ? '—' : (age < 2000 ? age+' мс назад' : 'давно ('+age+' мс)');
+}
+
+init();
+</script>
+</body>
+</html>
