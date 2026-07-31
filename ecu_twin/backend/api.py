@@ -26,6 +26,17 @@ PCN_PATH = os.path.join(FRONT_DIR, "pcn_data.json")
 BCN_PATH = os.path.join(FRONT_DIR, "bcn_data.json")
 DAD_PATH = os.path.join(FRONT_DIR, "dad_data.json")
 
+
+_edit_lock = threading.Lock()   # правки таблиц — строго по одной, иначе затирают друг друга
+
+
+def _atomic_write(path, data):
+    """Пишем через временный файл + подмену — иначе быстрые правки подряд бьют JSON."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=0)
+    os.replace(tmp, path)
+
 app = FastAPI(title="ЭБУ-двойник M30 (SIL)")
 
 
@@ -306,6 +317,26 @@ def get_dad():
         return json.load(f)
 
 
+class DadEdit(BaseModel):
+    pi: int      # индекс давления (строка)
+    xi: int      # индекс оборотов (столбец)
+    val: float
+
+
+@app.post("/api/dad")
+def set_dad(e: DadEdit):
+    """Записать одну ячейку ПЦН-ДАД обратно в dad_data.json (правка мышью из UI)."""
+    with _edit_lock:                      # читаем-меняем-пишем без гонки
+        with open(DAD_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        d["z"][e.pi][e.xi] = e.val
+        if "hand" not in d:               # отметка «правил руками» — отдельный слой/цвет
+            d["hand"] = [[False] * len(d["z"][0]) for _ in range(len(d["z"]))]
+        d["hand"][e.pi][e.xi] = True
+        _atomic_write(DAD_PATH, d)
+    return {"ok": True, "pi": e.pi, "xi": e.xi, "val": e.val}
+
+
 class PcnEdit(BaseModel):
     ti: int              # индекс дросселя (строка)
     xi: int              # индекс оборотов (столбец)
@@ -317,11 +348,14 @@ class PcnEdit(BaseModel):
 def set_pcn(e: PcnEdit):
     """Записать одну ячейку выбранного слоя обратно в pcn_data.json (правка из UI)."""
     arr = e.arr if e.arr in ("z", "zred", "z5k", "zbase", "zsurf") else "z"
-    with open(PCN_PATH, encoding="utf-8") as f:
-        d = json.load(f)
-    d[arr][e.ti][e.xi] = e.val
-    with open(PCN_PATH, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=0)
+    with _edit_lock:                      # читаем-меняем-пишем без гонки
+        with open(PCN_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        d[arr][e.ti][e.xi] = e.val
+        if "hand" not in d:               # отметка «правил руками» — отдельный слой/цвет
+            d["hand"] = [[False] * len(d["z"][0]) for _ in range(len(d["z"]))]
+        d["hand"][e.ti][e.xi] = True
+        _atomic_write(PCN_PATH, d)
     return {"ok": True, "ti": e.ti, "xi": e.xi, "val": e.val, "arr": arr}
 
 

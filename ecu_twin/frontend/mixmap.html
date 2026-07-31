@@ -19,7 +19,7 @@
 </style></head>
 <body>
 <header><h1>&#128295; ЦН по дросселю — редактор (y30)</h1>
-<div class="sub">Плоский график, без зума. Клик по точке — правка. Данные живьём из pcn_data.json.</div></header>
+<div class="sub"><button onclick="lastJson='';lastBcn='';lastDad='';load()" style="margin-right:10px">перечитать данные</button>Плоский график, без зума. Клик по точке — правка. Данные живьём из pcn_data.json.</div></header>
 <div class="wrap">
  <div class="card" style="flex:1.9;min-width:600px">
    <div class="layers">
@@ -27,9 +27,11 @@
      <label><input type="checkbox" id="cb-green" checked> <b style="color:#1a7">&#9679; поправка (изменённые)</b></label>
      <label><input type="checkbox" id="cb-red" checked> <b style="color:#e33">&#9679; сглажено &lt;5к</b></label>
      <label><input type="checkbox" id="cb-yellow" checked> <b style="color:#c8a000">&#9679; сглажено &gt;5к</b></label>
+     <label><input type="checkbox" id="cb-hand" checked> <b style="color:#9b30d9">&#9679; правил руками</b></label>
    </div>
    <div id="left"></div>
    <div class="thr-row" id="thrbtns"></div>
+   <div class="thr-row"><button id="lt-set">задать значение</button><button id="lt-lin">линейно между крайними</button><button id="lt-clr">снять выделение</button><span id="lt-info" style="font-size:12px;color:#666;align-self:center"></span></div>
    <div class="hint">Кнопки = дроссель %. Клик по точке — правка. Наложились точки — кружок красится долями всех цветов.</div>
  </div>
  <div class="card" style="flex:1;min-width:360px">
@@ -56,11 +58,13 @@
 <div class="wrap">
  <div class="card" style="flex:1.9;min-width:600px">
    <div class="layers">
-     <label><input type="checkbox" id="cb-dgreen" checked> <b style="color:#1a7">&#9679; измерено логами</b></label>
-     <label><input type="checkbox" id="cb-dred" checked> <b style="color:#e33">&#9679; достроено / экстраполяция</b></label>
+     <label><input type="checkbox" id="cb-dblue" checked> <b style="color:#2255ff">&#9679; исходник ПЦН ДАД</b></label>
+     <label><input type="checkbox" id="cb-dgreen" checked> <b style="color:#1a7">&#9679; поправка (изменённые)</b></label>
+     <label><input type="checkbox" id="cb-dhand" checked> <b style="color:#9b30d9">&#9679; правил руками</b></label>
    </div>
    <div id="dad"></div>
    <div class="thr-row" id="dadbtns"></div>
+   <div class="thr-row"><button id="dt-set">задать значение</button><button id="dt-lin">линейно между крайними</button><button id="dt-clr">снять выделение</button><span id="dt-info" style="font-size:12px;color:#666;align-self:center"></span></div>
    <div class="hint">ПЦН по ДАВЛЕНИЮ (ДАД) — перенос откатанной ПЦН-дросселя на ось давления. Кнопки = давление, кПа.</div>
  </div>
  <div class="card" style="flex:1;min-width:360px">
@@ -70,8 +74,107 @@
 </div>
 <script>
 let D=null, ti=7, lastJson="", B=null, lastBcn="", tib=15, A=null, lastDad="", pi=12;
-const CB='#2255ff', CG='#1a7', CR='#e33', CY='#f5c000';
-const PRIO={[CG]:3,[CY]:2,[CR]:1,[CB]:0}, ARR={[CG]:'z',[CY]:'z5k',[CR]:'zred',[CB]:'zbase'};
+const CB='#2255ff', CG='#1a7', CR='#e33', CY='#f5c000', CH='#9b30d9';
+const GVT=28, GVB=300, YMAX_PCN=1.2, YMAX_DAD=1.0;
+let dragging=false;   // общая геометрия поля значений
+// ---- перетаскивание точек мышью по вертикали ----
+function svgPtOf(svg,evt){
+  const p=svg.createSVGPoint(); p.x=evt.clientX; p.y=evt.clientY;
+  return p.matrixTransform(svg.getScreenCTM().inverse());
+}
+function svgYof(svg,evt){ return svgPtOf(svg,evt).y; }
+let selL=new Set(), selD=new Set();
+// ---- сохранение с ВИДИМОЙ ошибкой (раньше правки молча терялись) ----
+function errBox(msg){
+  let e=document.getElementById('errbox');
+  if(!e){ e=document.createElement('div'); e.id='errbox';
+    e.style.cssText='position:fixed;left:0;right:0;top:0;z-index:999;background:#c0392b;color:#fff;padding:10px 16px;font:14px system-ui;text-align:center';
+    document.body.appendChild(e); }
+  e.textContent=msg;
+}
+function okBox(){ const e=document.getElementById('errbox'); if(e) e.remove(); }
+function save(url, body){
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>{ if(!r.ok) throw new Error('сервер ответил '+r.status); okBox(); })
+    .catch(e=>{ errBox('ПРАВКА НЕ СОХРАНЕНА: '+e.message+'. Не продолжай — правки теряются. Обнови страницу.'); });
+}
+// рамка выделения: тянем по пустому месту графика
+function wireSelect(host, sel, redraw){
+  const svg=host.querySelector('svg'); if(!svg) return;
+  svg.onmousedown=e=>{
+    if(e.target.closest && e.target.closest('.pt')) return;   // по точке — это перетаскивание
+    e.preventDefault();
+    const x0=svgPtOf(svg,e).x; let x1=x0;
+    const r=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    r.setAttribute('y',GVT); r.setAttribute('height',GVB-GVT);
+    r.setAttribute('fill','#9b30d9'); r.setAttribute('opacity','0.15');
+    svg.appendChild(r);
+    const mv=ev=>{ x1=svgPtOf(svg,ev).x;
+      r.setAttribute('x',Math.min(x0,x1)); r.setAttribute('width',Math.abs(x1-x0)); };
+    const up=ev=>{
+      document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up);
+      r.remove();
+      const lo=Math.min(x0,x1), hi=Math.max(x0,x1);
+      if(!ev.shiftKey) sel.clear();
+      if(hi-lo>=3) host.querySelectorAll('.pt').forEach(g=>{
+        const cx=parseFloat(g.querySelector('circle').getAttribute('cx'));
+        if(cx>=lo&&cx<=hi) sel.add(+g.getAttribute('data-xi'));
+      });
+      redraw();
+    };
+    document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up);
+  };
+}
+// задать одно значение всем выделенным
+function bulkSet(sel, apply, redraw){
+  if(!sel.size){ alert('Сначала выдели точки: протяни мышью по пустому месту графика (Shift — добавить к выделению).'); return; }
+  const nv=prompt('Значение для '+sel.size+' выделенных точек:');
+  if(nv===null) return; const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
+  [...sel].forEach(xi=>apply(xi,v)); redraw();
+}
+// линейно между крайними выделенными
+function bulkLinear(sel, getCur, apply, redraw){
+  if(sel.size<2){ alert('Нужно минимум 2 выделенных точки — сгладит линейно между крайними.'); return; }
+  const idx=[...sel].sort((a,b)=>a-b), a=idx[0], b=idx[idx.length-1];
+  const va=getCur(a), vb=getCur(b);
+  for(let i=a+1;i<b;i++) apply(i, va+(vb-va)*(i-a)/(b-a));
+  redraw();
+}
+function tip(){ let t=document.getElementById('dragtip');
+  if(!t){ t=document.createElement('div'); t.id='dragtip';
+    t.style.cssText='position:fixed;z-index:99;background:#1e2a38;color:#fff;padding:3px 7px;border-radius:4px;font:13px system-ui;pointer-events:none;display:none';
+    document.body.appendChild(t); } return t; }
+function wireDrag(host, yMax, getVal, commit, onClick, selHost){
+  const svg=host.querySelector('svg'); if(!svg) return;
+  host.querySelectorAll('.pt').forEach(g=>{
+    g.style.cursor='ns-resize';
+    g.onmousedown=e=>{
+      e.preventDefault();
+      if(e.shiftKey){ const xi=+g.getAttribute('data-xi');
+        if(selHost===selL){ selL.has(xi)?selL.delete(xi):selL.add(xi); drawLeft(); }
+        else { selD.has(xi)?selD.delete(xi):selD.add(xi); drawDad(); }
+        return; }
+      const y0=svgYof(svg,e), v0=getVal(g); let moved=false, val=v0; dragging=true;
+      const T=tip();
+      const mv=ev=>{
+        const y=svgYof(svg,ev);
+        if(Math.abs(y-y0)>2) moved=true;
+        val=Math.max(0,Math.min(yMax,(GVB-y)/(GVB-GVT)*yMax));
+        const dy=-((val-v0)/yMax)*(GVB-GVT);   // в SVG Y растёт вниз
+        g.setAttribute('transform','translate(0,'+dy+')');
+        T.style.display='block'; T.style.left=(ev.clientX+14)+'px'; T.style.top=(ev.clientY-26)+'px';
+        T.textContent=val.toFixed(3)+'  (было '+v0.toFixed(3)+')';
+      };
+      const up=()=>{
+        document.removeEventListener('mousemove',mv); document.removeEventListener('mouseup',up);
+        T.style.display='none'; g.removeAttribute('transform'); dragging=false;
+        if(moved) commit(g,val); else if(onClick) onClick(g);
+      };
+      document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up);
+    };
+  });
+}
+const PRIO={[CH]:4,[CG]:3,[CY]:2,[CR]:1,[CB]:0}, ARR={[CH]:'z',[CG]:'z',[CY]:'z5k',[CR]:'zred',[CB]:'zbase'};
 function on(name){ const e=document.getElementById('cb-'+name); return e?e.checked:true; }
 async function load(){
   const t=await (await fetch('/api/pcn')).json();
@@ -81,10 +184,10 @@ async function load(){
     const sb=JSON.stringify(b);
     if(sb!==lastBcn){ lastBcn=sb; B=b; buildBtnsB(); drawBcn(); drawBcn3d(); }
   }catch(e){}
-  try{ const a=await (await fetch('/api/dad')).json();
-    const sa=JSON.stringify(a);
+  try{ const r=await fetch('/api/dad'); if(!r.ok) throw new Error('HTTP '+r.status);
+    const a=await r.json(); const sa=JSON.stringify(a);
     if(sa!==lastDad){ lastDad=sa; A=a; buildBtnsD(); drawDad(); drawDad3d(); }
-  }catch(e){}
+  }catch(e){ errBox('ПЦН ДАД не загрузился: '+e.message); }
 }
 function buildBtnsD(){
   const box=document.getElementById('dadbtns'); if(!box||!A) return; box.innerHTML='';
@@ -114,17 +217,37 @@ function buildBtns(){
     box.appendChild(b);
   });
 }
-['blue','green','red','yellow'].forEach(n=>{
+['blue','green','red','yellow','hand'].forEach(n=>{
   const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawLeft();
 });
 ['bblue','bgreen','bred'].forEach(n=>{
   const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawBcn();
 });
-['dgreen','dred'].forEach(n=>{
+['dblue','dgreen','dhand'].forEach(n=>{
   const e=document.getElementById('cb-'+n); if(e) e.onchange=()=>drawDad();
 });
 function onB(name){ const e=document.getElementById('cb-b'+name); return e?e.checked:true; }
 function draw(){ drawLeft(); drawRight(); }
+// применить значение к ячейке (+пометить «руками») и отправить на сервер
+function applyL(xi,v,arr){
+  arr=arr||'z';
+  D[arr][ti][xi]=v; if(!D.hand) D.hand=D.z.map(r=>r.map(()=>false)); D.hand[ti][xi]=true;
+  save('/api/pcn',{ti,xi,val:v,arr});
+}
+function applyD(xi,v){
+  A.z[pi][xi]=v; if(!A.hand) A.hand=A.z.map(r=>r.map(()=>false)); A.hand[pi][xi]=true;
+  save('/api/dad',{pi,xi,val:v});
+}
+// кнопки групповых операций
+addEventListener('DOMContentLoaded',()=>{
+  const bind=(id,fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; };
+  bind('lt-set',()=>bulkSet(selL,(xi,v)=>applyL(xi,v),drawLeft));
+  bind('lt-lin',()=>bulkLinear(selL,xi=>D.z[ti][xi],(xi,v)=>applyL(xi,v),drawLeft));
+  bind('lt-clr',()=>{ selL.clear(); drawLeft(); });
+  bind('dt-set',()=>bulkSet(selD,(xi,v)=>applyD(xi,v),drawDad));
+  bind('dt-lin',()=>bulkLinear(selD,xi=>A.z[pi][xi],(xi,v)=>applyD(xi,v),drawDad));
+  bind('dt-clr',()=>{ selD.clear(); drawDad(); });
+});
 
 // маркер: 1 цвет = кружок, N цветов = пирог долями
 function marker(cx,cy,r,colors){
@@ -141,7 +264,7 @@ function marker(cx,cy,r,colors){
 }
 function drawLeft(){
   const N=D.rpm.length, W=960, H=430, mL=52, mR=14;
-  const valTop=28, valBot=300, cntTop=332, cntBot=398, lblY=316, yMax=1.2;
+  const valTop=GVT, valBot=GVB, cntTop=332, cntBot=398, lblY=316, yMax=YMAX_PCN;
   const px=i=> mL+(i+0.5)*((W-mR-mL)/N);
   const vy=v=> valBot-(v/yMax)*(valBot-valTop);
   let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="font:12px system-ui;display:block">`;
@@ -161,11 +284,13 @@ function drawLeft(){
   if(D.count) for(let i=0;i<N;i++){ const c=D.count[ti][i]; if(!c) continue;
     const h=(c/cmax)*(cntBot-cntTop); s+=`<rect x="${px(i)-5}" y="${cntBot-h}" width="10" height="${h}" fill="#c9ccd1"/>`; }
   s+=`<text x="${mL-6}" y="${cntBot}" text-anchor="end" fill="#999">точек</text>`;
+  for(const i of selL) if(i<N) s+=`<rect x="${px(i)-7}" y="${valTop}" width="14" height="${valBot-valTop}" fill="#9b30d9" opacity="0.13"/>`;
   // точки слоёв с учётом наложения
   for(let i=0;i<N;i++){
     let list=[];
     if(on('blue') && D.zbase) list.push({v:D.zbase[ti][i],c:CB});
-    if(on('green') && D.corr[ti][i]) list.push({v:D.z[ti][i],c:CG});
+    if(D.hand && D.hand[ti][i]){ if(on('hand')) list.push({v:D.z[ti][i],c:CH}); }
+    else if(on('green') && D.corr[ti][i]) list.push({v:D.z[ti][i],c:CG});
     if(on('red') && D.zred && D.zred[ti][i]!=null) list.push({v:D.zred[ti][i],c:CR});
     if(on('yellow') && D.z5k && D.z5k[ti][i]!=null) list.push({v:D.z5k[ti][i],c:CY});
     if(!list.length) continue;
@@ -175,18 +300,24 @@ function drawLeft(){
     cl.forEach(c=>{ const cy=c.items.reduce((a,p)=>a+p.y,0)/c.items.length, cx=px(i);
       let tgt=c.items[0]; c.items.forEach(p=>{ if(PRIO[p.c]>PRIO[tgt.c]) tgt=p; });
       s+=`<g class="pt" data-xi="${i}" data-arr="${ARR[tgt.c]}" data-val="${tgt.v}">`+marker(cx,cy,c.items.length>1?7:6,c.items.map(p=>p.c))
-        +`<circle cx="${cx}" cy="${cy}" r="9" fill="transparent"/></g>`; });
+        +`<circle cx="${cx}" cy="${cy}" r="9" fill="transparent"/></g>`;
+      s+=`<text x="${cx}" y="${cy-11}" text-anchor="middle" font-size="10" fill="#555">${tgt.v.toFixed(2)}</text>`; });
   }
   s+=`</svg>`;
   const el=document.getElementById('left'); el.innerHTML=s;
-  el.querySelectorAll('.pt').forEach(g=>g.onclick=()=>editPt(g));
+  wireDrag(el, yMax,
+    g=>parseFloat(g.getAttribute('data-val')),
+    (g,v)=>{ applyL(+g.getAttribute('data-xi'), v, g.getAttribute('data-arr')); drawLeft(); },
+    g=>editPt(g), selL);
+  wireSelect(el, selL, drawLeft);
+  const inf=document.getElementById('lt-info'); if(inf) inf.textContent=selL.size?('выделено: '+selL.size):'';
 }
 function editPt(g){
   const xi=+g.getAttribute('data-xi'), arr=g.getAttribute('data-arr'), cur=g.getAttribute('data-val');
   const nv=prompt('ЦН ['+arr+'] — обороты '+D.rpm[xi]+', дроссель '+D.thr[ti]+'%:', cur);
   if(nv===null) return; const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
-  D[arr][ti][xi]=v;
-  fetch('/api/pcn',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ti,xi,val:v,arr})});
+  D[arr][ti][xi]=v; if(!D.hand) D.hand=D.z.map(r=>r.map(()=>false)); D.hand[ti][xi]=true;
+  save('/api/pcn',{ti,xi,val:v,arr});
   drawLeft();
 }
 function drawRight(){
@@ -248,7 +379,7 @@ function drawBcn3d(){
 function drawDad(){
   if(!A) return;
   const N=A.rpm.length, W=960, H=430, mL=52, mR=14;
-  const valTop=28, valBot=300, cntTop=332, cntBot=398, lblY=316, yMax=1.0;
+  const valTop=GVT, valBot=GVB, cntTop=332, cntBot=398, lblY=316, yMax=YMAX_DAD;
   const px=i=> mL+(i+0.5)*((W-mR-mL)/N);
   const vy=v=> valBot-(v/yMax)*(valBot-valTop);
   let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="font:12px system-ui;display:block">`;
@@ -260,18 +391,35 @@ function drawDad(){
   for(let i=0;i<N;i++){ const x=px(i);
     s+=`<line x1="${x}" y1="${valTop}" x2="${x}" y2="${lblY-2}" stroke="#e2e6ea"/>`;
     s+=`<text x="${x}" y="${lblY}" text-anchor="end" fill="#555" transform="rotate(-45 ${x} ${lblY})">${A.rpm[i]}</text>`; }
-  s+=`<polyline points="${A.z[pi].map((v,i)=>px(i)+','+vy(v)).join(' ')}" fill="none" stroke="#bbb" stroke-width="1.5"/>`;
+  if(onD('blue') && A.zbase)
+    s+=`<polyline points="${A.zbase[pi].map((v,i)=>px(i)+','+vy(v)).join(' ')}" fill="none" stroke="#9db4ff" stroke-width="1.5"/>`;
   const cmax=Math.max(1,...(A.count?A.count[pi]:[]).map(c=>c||0));
   if(A.count) for(let i=0;i<N;i++){ const c=A.count[pi][i]; if(!c) continue;
     const h=(c/cmax)*(cntBot-cntTop); s+=`<rect x="${px(i)-5}" y="${cntBot-h}" width="10" height="${h}" fill="#c9ccd1"/>`; }
   s+=`<text x="${mL-6}" y="${cntBot}" text-anchor="end" fill="#999">точек</text>`;
+  for(const i of selD) if(i<N) s+=`<rect x="${px(i)-7}" y="${valTop}" width="14" height="${valBot-valTop}" fill="#9b30d9" opacity="0.13"/>`;
   for(let i=0;i<N;i++){
-    const meas=A.corr[pi][i];
-    if(meas && onD('green')) s+=`<circle cx="${px(i)}" cy="${vy(A.z[pi][i])}" r="6" fill="${CG}" stroke="#333"/>`;
-    if(!meas && onD('red')) s+=`<circle cx="${px(i)}" cy="${vy(A.z[pi][i])}" r="5" fill="${CR}" stroke="#333"/>`;
+    if(onD('blue') && A.zbase) s+=`<circle cx="${px(i)}" cy="${vy(A.zbase[pi][i])}" r="4" fill="${CB}" stroke="#333" stroke-width="0.6"/>`;
+    const hd=A.hand&&A.hand[pi][i], g=A.corr[pi][i], v=A.z[pi][i];
+    if(hd && !onD('hand')) continue;
+    if(!hd && g && !onD('green')) continue;
+    const col = hd?CH : (g?CG:'#dfe3e8');
+    s+=`<g class="pt" data-xi="${i}" data-val="${v}">`
+      +`<circle cx="${px(i)}" cy="${vy(v)}" r="${(hd||g)?6:4}" fill="${col}" stroke="#333" stroke-width="${(hd||g)?1:0.6}"/>`
+      +`<circle cx="${px(i)}" cy="${vy(v)}" r="9" fill="transparent"/></g>`;
+    s+=`<text x="${px(i)}" y="${vy(v)-11}" text-anchor="middle" font-size="10" fill="#555">${v.toFixed(2)}</text>`;
   }
   s+=`</svg>`;
-  document.getElementById('dad').innerHTML=s;
+  const el=document.getElementById('dad'); el.innerHTML=s;
+  wireDrag(el, yMax,
+    g=>parseFloat(g.getAttribute('data-val')),
+    (g,v)=>{ applyD(+g.getAttribute('data-xi'), v); drawDad(); },
+    g=>{ const xi=+g.getAttribute('data-xi');
+      const nv=prompt('ПЦН ДАД — обороты '+A.rpm[xi]+', давление '+Math.round(A.press[pi])+' кПа:', A.z[pi][xi]);
+      if(nv===null) return; const v=parseFloat(String(nv).replace(',','.')); if(isNaN(v)) return;
+      applyD(xi,v); drawDad(); }, selD);
+  wireSelect(el, selD, drawDad);
+  const inf=document.getElementById('dt-info'); if(inf) inf.textContent=selD.size?('выделено: '+selD.size):'';
 }
 function drawDad3d(){
   if(!A) return;
@@ -285,6 +433,6 @@ function drawDad3d(){
            zaxis:{title:'ПЦН',range:[0,1.0]}, camera:cam}};
   Plotly.react('dad3d',[s],layout,{responsive:true,displayModeBar:false});
 }
-load(); setInterval(load,2500);
+load();   // автообновление ОТКЛЮЧЕНО — правки не затираются. Новые данные: F5 или кнопка «перечитать»
 </script>
 </body></html>
