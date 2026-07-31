@@ -279,7 +279,14 @@ def disasm(addr: int, n: int = 12):
 
 # ---------- статика фронта ----------
 @app.get("/")
+def home():
+    """Главная: список всех страниц и роутов проекта кнопками."""
+    return FileResponse(os.path.join(FRONT_DIR, "home.html"))
+
+
+@app.get("/twin")
 def index():
+    """Панель двойника ЭБУ (живой мотор на эмуляторе). Раньше висела на /."""
     return FileResponse(os.path.join(FRONT_DIR, "index.html"))
 
 

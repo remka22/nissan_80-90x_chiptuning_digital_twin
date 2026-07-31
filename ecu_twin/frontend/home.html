@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>ЭБУ Максима — все страницы</title>
+<style>
+ body{font-family:system-ui,Arial;margin:0;background:#f5f6f8;color:#222}
+ header{background:#1e2a38;color:#fff;padding:14px 20px}
+ header h1{margin:0;font-size:20px}
+ header .sub{font-size:12px;opacity:.85;margin-top:3px}
+ .wrap{padding:20px;max-width:1000px}
+ h2{font-size:14px;color:#667;margin:22px 0 10px;text-transform:uppercase;letter-spacing:.5px}
+ .grid{display:flex;flex-wrap:wrap;gap:12px}
+ a.card{display:block;text-decoration:none;color:inherit;background:#fff;border-radius:8px;
+        box-shadow:0 1px 4px rgba(0,0,0,.1);padding:14px 16px;min-width:260px;flex:1;
+        border-left:4px solid #1a7;transition:box-shadow .15s}
+ a.card:hover{box-shadow:0 3px 12px rgba(0,0,0,.18)}
+ a.card b{display:block;font-size:15px;margin-bottom:4px}
+ a.card span{font-size:12px;color:#667;line-height:1.4}
+ a.card code{font-size:11px;color:#89a;display:block;margin-top:6px}
+ .api a.card{border-left-color:#2255ff}
+ .post a.card{border-left-color:#c8a000;cursor:default}
+ .post a.card:hover{box-shadow:0 1px 4px rgba(0,0,0,.1)}
+</style></head>
+<body>
+<header>
+  <h1>&#128295; ЭБУ Максима — все страницы проекта</h1>
+  <div class="sub">Двойник ЭБУ M30/J30 + редакторы калибровок y30 (Январь J73S)</div>
+</header>
+<div class="wrap">
+
+  <h2>Страницы</h2>
+  <div class="grid">
+    <a class="card" href="/mixmap">
+      <b>&#128200; Редактор ЦН (mixmap)</b>
+      <span>ПЦН по дросселю, БЦН (базовое наполнение) и ПЦН по давлению (ДАД).
+            Точки тянутся мышью, выделение, линейное сглаживание.</span>
+      <code>/mixmap</code>
+    </a>
+    <a class="card" href="/editor">
+      <b>&#128736; Редактор прошивки J30</b>
+      <span>Данные прошивки интерпретированно и сырьём, сравнение версий,
+            выгрузка дампа с пересчётом чек-суммы.</span>
+      <code>/editor</code>
+    </a>
+    <a class="card" href="/twin">
+      <b>&#9881; Панель двойника ЭБУ</b>
+      <span>Живой мотор на эмуляторе: газ, температуры, винт ХХ, стартёр,
+            наблюдаемые переменные и выходы.</span>
+      <code>/twin</code>
+    </a>
+    <a class="card" href="http://localhost:8009/" target="_blank" style="border-left-color:#c0392b">
+      <b>&#128225; Панель логгера ЭБУ</b>
+      <span>Выбор порта (авто-FTDI) + скорость + Старт/Стоп. Live: поток / тишина,
+            байт/сек, кадры AE17. Пишет сырьё в файл (офлайн) + скачивание лога. Всё из браузера.
+            Это ОТДЕЛЬНЫЙ процесс — сперва запусти в терминале.</span>
+      <code>localhost:8009 &middot; python3 "логер/панель логгера 31.07.26 ИИ.py"</code>
+    </a>
+  </div>
+
+  <h2>API — чтение (открывается в браузере)</h2>
+  <div class="grid api">
+    <a class="card" href="/api/pcn"><b>ПЦН по дросселю</b><span>Данные верхнего графика mixmap.</span><code>GET /api/pcn</code></a>
+    <a class="card" href="/api/dad"><b>ПЦН по давлению (ДАД)</b><span>Данные нижнего графика mixmap.</span><code>GET /api/dad</code></a>
+    <a class="card" href="/api/bcn"><b>БЦН — базовое наполнение</b><span>Данные среднего графика mixmap, мг/цикл.</span><code>GET /api/bcn</code></a>
+    <a class="card" href="/api/meta"><b>Метаданные двойника</b><span>Входы, наблюдаемые, флаги, рутины, таблицы, вариант ROM.</span><code>GET /api/meta</code></a>
+    <a class="card" href="/api/disasm?addr=0x8000"><b>Дизассемблер</b><span>Короткий дизасм вокруг адреса.</span><code>GET /api/disasm?addr=…</code></a>
+    <a class="card" href="/docs"><b>Swagger — вся схема API</b><span>Автодокументация FastAPI: все методы, тела запросов, попробовать вживую.</span><code>/docs</code></a>
+  </div>
+
+  <h2>API — запись (только из кода, не по ссылке)</h2>
+  <div class="grid post">
+    <a class="card"><b>Правка ячейки ПЦН</b><span>Пишет одну ячейку таблицы по дросселю.</span><code>POST /api/pcn</code></a>
+    <a class="card"><b>Правка ячейки ПЦН ДАД</b><span>Пишет одну ячейку таблицы по давлению.</span><code>POST /api/dad</code></a>
+    <a class="card"><b>Живой мотор — шаг</b><span>Прокрутить модель мотора на кадр.</span><code>POST /api/engine</code></a>
+    <a class="card"><b>Состояние / рутина / свип</b><span>Прогон рутины прошивки, свип входа, снятие состояния.</span><code>POST /api/state · /api/run · /api/sweep</code></a>
+  </div>
+
+</div>
+</body></html>

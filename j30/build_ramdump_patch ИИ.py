@@ -30,6 +30,8 @@ ORIG_CALL = 0xA99B
 # (метка|None, токен, операнд)  операнд: число или метка (для ветвлений)
 PROG = [
     (None,     "JSR",   ORIG_CALL),     # C600 (врезка) — родной вызов
+    (None,     "OIMd",  (0x02, 0x11)),  # TE=1: включить передатчик SCI (сток его не включает
+                                        # в рабочем режиме — гейт $40.7; без этого нога P24 молчит)
     ("DUMP",   "LDAAd", 0x11),          # TRCSR
     (None,     "BITA#", 0x20),          # TDRE?
     (None,     "BNE",   "CONT"),        # готов -> дальше
@@ -110,7 +112,7 @@ PROG = [
 LEN = {"JSR":3,"LDAAd":2,"LDAA#":2,"LDAAx":2,"BITA#":2,"BEQ":2,"BNE":2,"BCC":2,
        "BCS":2,"BRA":2,"LDABd":2,"CMPB#":2,"CMPA#":2,"ORAAd":2,"EORAd":2,
        "STAAd":2,"LDXd":2,"CLRe":3,"INCe":3,"ADDA#":2,"SUBB#":2,"ABX":1,
-       "PSHA":1,"PULA":1,"RTS":1}
+       "PSHA":1,"PULA":1,"RTS":1,"OIMd":3}
 OP1 = {"ABX":0x3A,"PSHA":0x36,"PULA":0x32,"RTS":0x39}
 BR  = {"BEQ":0x27,"BNE":0x26,"BCC":0x24,"BCS":0x25,"BRA":0x20}
 
@@ -144,6 +146,7 @@ def assemble(org):
         elif op == "SUBB#": out += bytes([0xC0, arg & 0xFF])
         elif op == "CLRe":  out += bytes([0x7F, arg >> 8, arg & 0xFF])
         elif op == "INCe":  out += bytes([0x7C, arg >> 8, arg & 0xFF])
+        elif op == "OIMd":  out += bytes([0x72, arg[0], arg[1]])  # OIM #imm, dd (прямая)
         elif op in OP1:     out += bytes([OP1[op]])
         elif op in BR:
             rel = labels[arg] - nxt
@@ -160,9 +163,11 @@ def main():
     assert len(rom) == 32768
     code, labels = assemble(CODE_ORG)
     off = CODE_ORG - ROM_BASE
-    assert all(b == 0x3F for b in rom[off:off + len(code)]), "блок C600 не пуст"
+    assert len(code) <= 0x100, "рутина не влезает в страницу C600..C6FF"
     hoff = HOOK_CPU - ROM_BASE
-    assert rom[hoff] == 0xBD and (rom[hoff + 1] << 8 | rom[hoff + 2]) == ORIG_CALL
+    tgt = rom[hoff + 1] << 8 | rom[hoff + 2]
+    # допускаем и свежий бин (JSR A99B), и уже пропатченный (JSR C600) — перепатч
+    assert rom[hoff] == 0xBD and tgt in (ORIG_CALL, CODE_ORG), "по 83F8 не JSR A99B/C600"
     rom[off:off + len(code)] = code
     rom[hoff + 1], rom[hoff + 2] = CODE_ORG >> 8, CODE_ORG & 0xFF
 
