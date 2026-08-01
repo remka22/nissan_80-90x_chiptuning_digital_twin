@@ -25,6 +25,7 @@ LABELS = [
     (0x1411, "Впрыск расчёт",     16, "тики 5мкс",        None),     # Tp×K+deadtime, сырьё
     (0x1482, "Нагрузка Tp (сгл.)", 8, "у.е.",             None),     # внутр. нагрузка, /8=TP только по XDF
     (0x1413, "Tp мгновенная",      8, "у.е.",             None),
+    (0x0015, "Дроссель (флаг)",    8, "бит 0x10=газ",     None),     # $15 бит 0x10: 1=газ, 0=ХХ
     (0x1400, "O2 узкий",           8, "отсчёты АЦП",      None),     # НЕ вольты (пороги 75/21 отсчёта)
     (0x1408, "MAF (ch0)",         16, "сырьё АЦП 10б",    None),
     (0x008F, "Напряжение (ch1)",   8, "≈В (прикидка)",    0.08),     # анкер 175≈14В; точный масштаб код НЕ даёт
@@ -38,6 +39,12 @@ LABELS = [
     (0x1574, "АЦП ch8",            8, "сырьё АЦП",        None),
 ]
 
+# Узкий кадр v8: маркер $FFF0, 13 байт значений в фикс. порядке (декод по позиции).
+# Порядок = ADDR_LIST билдера build_targeted_patch: раскладываем на РЕАЛЬНЫЕ адреса.
+NARROW_MARKER = 0xFFF0
+NARROW_MAP = [0x140A, 0x140B, 0x1482, 0x1400, 0x144E, 0x144F,
+              0x1411, 0x1412, 0x1431, 0x0015, 0x004C, 0x1408, 0x1409]
+
 STATE = {
     "running": False, "port": "", "baud": 0,
     "total": 0, "events": deque(maxlen=4000),
@@ -48,7 +55,195 @@ STATE = {
 }
 CTRL = {"thread": None, "stop": None, "ser": None}
 CTRL_LOCK = threading.Lock()
-import glob
+import glob, re
+
+# ---------- ШДК (широкополосник) — второй серийный поток, AFR факт ----------
+WBL = {"running": False, "port": "", "total": 0, "raw": "", "hex": "", "afr": None, "last_t": 0, "error": ""}
+WLOCK = threading.Lock()
+WCTRL = {"thread": None, "stop": None, "ser": None}
+
+
+def parse_afr(buf):
+    # формат AEM пока неизвестен (0 байт) — наивный разбор ASCII-числа AFR.
+    # когда пойдут реальные байты — уточним по факту формата.
+    try:
+        s = "".join(chr(x) for x in buf if 32 <= x < 127)
+        m = re.findall(r"\d{1,2}\.\d+", s)
+        if m:
+            v = float(m[-1])
+            if 7.0 <= v <= 25.0:
+                return round(v, 2)
+    except Exception:
+        pass
+    return None
+
+
+def wbl_reader(ser, stop_ev):
+    buf = bytearray()
+    while not stop_ev.is_set():
+        try:
+            chunk = ser.read(256)
+        except Exception as e:
+            with WLOCK: WBL["error"] = str(e)
+            break
+        if chunk:
+            buf += chunk
+            if len(buf) > 96: buf = buf[-96:]
+            asc = "".join(chr(x) if 32 <= x < 127 else "." for x in buf[-48:])
+            hx = " ".join("%02X" % x for x in buf[-24:])
+            afr = parse_afr(buf)
+            with WLOCK:
+                WBL["total"] += len(chunk); WBL["raw"] = asc; WBL["hex"] = hx
+                WBL["last_t"] = time.time()
+                if afr is not None: WBL["afr"] = afr
+    try: ser.close()
+    except Exception: pass
+    with WLOCK: WBL["running"] = False
+
+
+def wbl_start(port):
+    import serial
+    with WLOCK:
+        if WCTRL["stop"]: WCTRL["stop"].set()
+    if WCTRL["thread"]: WCTRL["thread"].join(timeout=1.0)
+    try:
+        ser = serial.Serial(port, 9600, bytesize=8, parity="N", stopbits=1, timeout=1)
+    except Exception as e:
+        with WLOCK: WBL["error"] = str(e); WBL["running"] = False
+        return False, str(e)
+    stop_ev = threading.Event()
+    th = threading.Thread(target=wbl_reader, args=(ser, stop_ev), daemon=True)
+    with WLOCK:
+        WBL["running"] = True; WBL["port"] = port; WBL["error"] = ""; WBL["total"] = 0
+    WCTRL["thread"] = th; WCTRL["stop"] = stop_ev; WCTRL["ser"] = ser
+    th.start()
+    return True, ""
+
+
+def wbl_stop():
+    if WCTRL["stop"]: WCTRL["stop"].set()
+    if WCTRL["thread"]: WCTRL["thread"].join(timeout=1.0)
+    WCTRL["thread"] = None; WCTRL["stop"] = None; WCTRL["ser"] = None
+    with WLOCK: WBL["running"] = False
+    return True
+
+
+# ---------- Таблицы из бина (смесь 0x7D00 / угол 0x7C00) + поиск ячейки ----------
+# По умолчанию — v8-дамп. Оси: смесь rax=RPM(7B00)/cax=load(7AF0); угол rax=RPM(7B20)/cax=load(7B10).
+DEFAULT_BIN = os.path.join(HERE, "J30_vq-форсы_v8-узкий_01.08.26 ИИ.bin")
+SEL = {"bin": DEFAULT_BIN if os.path.exists(DEFAULT_BIN) else ""}
+_tab_cache = {}
+
+
+def list_bins():
+    found = []
+    for d in (HERE, os.path.join(HERE, "..", "j30")):
+        for f in sorted(glob.glob(os.path.join(d, "*.bin"))):
+            if os.path.getsize(f) == 32768:
+                found.append(os.path.abspath(f))
+    # уникальные, дамп-бины первыми
+    seen = set(); out = []
+    for f in found:
+        if f in seen: continue
+        seen.add(f); out.append(f)
+    return out
+
+
+def load_tables(path):
+    if not path or not os.path.exists(path):
+        return None
+    mt = os.path.getmtime(path)
+    c = _tab_cache.get(path)
+    if c and c[0] == mt:
+        return c[1]
+    b = open(path, "rb").read()
+    if len(b) != 32768:
+        return None
+    rd = lambda a, n: list(b[a - 0x8000:a - 0x8000 + n])
+    t = {
+        "fuel": rd(0x7D00, 256), "fuel_rax": rd(0x7B00, 16), "fuel_cax": rd(0x7AF0, 16),
+        "ign":  rd(0x7C00, 256), "ign_rax":  rd(0x7B20, 16), "ign_cax":  rd(0x7B10, 16),
+    }
+    # ДАД speed-density: хук 89D8 = JSR C700 (файл 0x09D8). VE @ C900, ось давл @ CA00.
+    dad = (b[0x09D8] == 0xBD and b[0x09D9] == 0xC7 and b[0x09DA] == 0x00)
+    t["dad"] = dad
+    if dad:
+        t["ve"] = rd(0x4900, 256)       # VE 16×16 (значение/128 = наполнение)
+        t["ve_rax"] = rd(0x7B20, 16)    # ось оборотов (родная FB20)
+        t["ve_pax"] = rd(0x4A00, 16)    # ось давления, кПа
+        t["dad_ofs"] = b[0x4A10]        # Смещ (ноль датчика, отсчёты>>2)
+        t["dad_slope"] = b[0x4A11]      # наклон кПа/отсчёт ×256
+    _tab_cache[path] = (mt, t)
+    return t
+
+
+def afr_of(x):        # значение карты смеси → AFR (формула M30-XDF)
+    return round(1881.6 / (x - 64), 2) if x >= 128 else round(1881.6 / (x + 128), 2)
+
+
+def deg_of(x):        # значение карты угла → градусы (1.0×X, ≥90 = флаг)
+    return x if x < 90 else None
+
+
+def nearest_idx(val, axis):   # индекс ближайшей точки оси (сырьё vs сырьё)
+    best, bd = 0, 1e18
+    for i, a in enumerate(axis):
+        d = abs(val - a)
+        if d < bd: bd, best = d, i
+    return best
+
+
+# ---------- лог ИНТЕРПРЕТИРОВАННЫХ данных в CSV (Старт/Стоп лог) ----------
+LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": None, "t0": 0}
+LOG_HEADER = ["время_с", "обороты", "нагрузка", "TP", "давление_кПа", "темп_сырьё",
+              "ALPHA", "O2", "впрыск_факт_мс", "AFR_цель", "AFR_факт", "УОЗ", "поправка_VE"]
+
+
+def _log_row():
+    d = snapshot(); tp = d["top"]
+    with LOCK:
+        ram = dict(STATE["ram"])
+    o2 = ram.get(0x1400)
+    inj = (ram[0x144E] << 8) | ram[0x144F] if (0x144E in ram and 0x144F in ram) else None
+    g = lambda x: "" if x is None else x
+    return [round(time.time() - LOGST["t0"], 2), g(tp["rpm"]), g(tp["load"]),
+            round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
+            g(tp["press"]), g(tp["temp"]), g(tp["alpha"]), g(o2),
+            round(inj * 0.005, 2) if inj is not None else "",
+            g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["uoz"]), g(tp["ve_corr"])]
+
+
+def _log_sampler(stop_ev):
+    while not stop_ev.is_set():
+        try:
+            row = _log_row()
+            LOGST["f"].write(";".join(str(x) for x in row) + "\n"); LOGST["f"].flush()
+            LOGST["n"] += 1
+        except Exception:
+            pass
+        stop_ev.wait(0.2)
+
+
+def log_start():
+    if LOGST["on"]:
+        return True, os.path.basename(LOGST["path"])
+    d = os.path.join(HERE, "логи"); os.makedirs(d, exist_ok=True)
+    fn = os.path.join(d, "лог_" + datetime.now().strftime("%Y%m%d_%H%M%S") + " ИИ.csv")
+    f = open(fn, "w", encoding="utf-8-sig")
+    f.write(";".join(LOG_HEADER) + "\n"); f.flush()
+    LOGST.update(on=True, path=fn, n=0, f=f, t0=time.time())
+    ev = threading.Event(); th = threading.Thread(target=_log_sampler, args=(ev,), daemon=True)
+    LOGST["stop"] = ev; LOGST["thread"] = th; th.start()
+    return True, os.path.basename(fn)
+
+
+def log_stop():
+    if LOGST["stop"]: LOGST["stop"].set()
+    if LOGST["thread"]: LOGST["thread"].join(timeout=1.0)
+    try: LOGST["f"].close()
+    except Exception: pass
+    LOGST["on"] = False; LOGST["stop"] = None; LOGST["thread"] = None
+    return True
 
 
 def list_ports():
@@ -136,8 +331,13 @@ def reader_loop(ser, stop_ev, fname):
                     if ok:
                         STATE["frames"] += 1
                         STATE["last_frame_t"] = now
-                        for k, b in enumerate(data):
-                            STATE["ram"][addr + k] = b
+                        if addr == NARROW_MARKER and len(data) == len(NARROW_MAP):
+                            # узкий кадр v8: разложить 13 байт по реальным адресам
+                            for k, b in enumerate(data):
+                                STATE["ram"][NARROW_MAP[k]] = b
+                        else:
+                            for k, b in enumerate(data):
+                                STATE["ram"][addr + k] = b
                     else:
                         STATE["bad"] += 1
     try: ser.close()
@@ -214,6 +414,79 @@ def snapshot():
         lines.append("%04X: %s" % (base, hx))
     d["ram_lines"] = lines
     d["ram_count"] = len(ram)
+
+    # ---- живые значения для верхней строки + подсветка ячеек карт ----
+    def w(a):  # слово
+        return (ram[a] << 8) | ram[a + 1] if (a in ram and a + 1 in ram) else None
+    rpm_raw = w(0x140A)
+    load_raw = ram.get(0x1482)
+    temp_raw = ram.get(0x004C)
+    alpha_raw = ram.get(0x1431)
+    with WLOCK:
+        wbl = {"running": WBL["running"], "port": WBL["port"], "total": WBL["total"],
+               "raw": WBL["raw"], "hex": WBL["hex"], "afr": WBL["afr"], "error": WBL["error"],
+               "fresh": (now - WBL["last_t"]) < 2.0 if WBL["last_t"] else False}
+    d["wbl"] = wbl
+
+    top = {
+        "rpm": int(round(rpm_raw * 12.807)) if rpm_raw is not None else None,
+        "load": load_raw,                              # сырьё (÷8 = TP%)
+        "temp": temp_raw,                              # сырьё АЦП
+        "alpha": round(alpha_raw * 0.01, 2) if alpha_raw is not None else None,
+        "afr_target": None, "uoz": None,
+        "afr_fact": wbl["afr"], "press": None, "ve_corr": None,
+    }
+    t = load_tables(SEL["bin"])
+    fuel_out = ign_out = ve_out = None
+    top["is_dad"] = bool(t and t.get("dad"))
+    if t:
+        # смесь: ряды=обороты(7B00), колонки=нагрузка(7AF0)
+        fuel_cells = [afr_of(v) for v in t["fuel"]]
+        fuel_out = {"cells": fuel_cells,
+                    "rows": [b * 50 for b in t["fuel_rax"]],           # обороты
+                    "cols": [round(b * 0.125, 2) for b in t["fuel_cax"]],  # нагрузка TP
+                    "hr": -1, "hc": -1}
+        ign_cells = [deg_of(v) for v in t["ign"]]
+        ign_out = {"cells": ign_cells,
+                   "rows": [b * 50 for b in t["ign_rax"]],
+                   "cols": [round(b * 0.125, 2) for b in t["ign_cax"]],
+                   "hr": -1, "hc": -1}
+        if rpm_raw is not None and load_raw is not None:
+            fr = nearest_idx(rpm_raw / 4.0, t["fuel_rax"])
+            fc = nearest_idx(load_raw, t["fuel_cax"])
+            fuel_out["hr"], fuel_out["hc"] = fr, fc
+            top["afr_target"] = fuel_cells[fr * 16 + fc]
+            ir = nearest_idx(rpm_raw / 4.0, t["ign_rax"])
+            ic = nearest_idx(load_raw, t["ign_cax"])
+            ign_out["hr"], ign_out["hc"] = ir, ic
+            top["uoz"] = ign_cells[ir * 16 + ic]
+        # --- VE (только ДАД-прошивка): ось давления из $1408 через тарировку ---
+        if t.get("dad"):
+            ve_cells = [round(v / 128.0, 3) for v in t["ve"]]
+            ve_out = {"cells": ve_cells,
+                      "rows": [bb * 50 for bb in t["ve_rax"]],   # обороты
+                      "cols": list(t["ve_pax"]),                 # давление, кПа
+                      "hr": -1, "hc": -1}
+            maf_raw = w(0x1408)
+            if maf_raw is not None:
+                praw = (maf_raw >> 2) - t["dad_ofs"]
+                if praw < 0: praw = 0
+                press = (praw * t["dad_slope"]) >> 8             # давление, кПа
+                top["press"] = press
+                if rpm_raw is not None:
+                    vr = nearest_idx(rpm_raw / 4.0, t["ve_rax"])
+                    vc = nearest_idx(press, t["ve_pax"])
+                    ve_out["hr"], ve_out["hc"] = vr, vc
+            # поправка VE = AFR факт / AFR цель (>1 = добавить топлива в ячейку)
+            if top["afr_fact"] and top["afr_target"]:
+                top["ve_corr"] = round(top["afr_fact"] / top["afr_target"], 3)
+    d["top"] = top
+    d["fuel"] = fuel_out
+    d["ign"] = ign_out
+    d["ve"] = ve_out
+    d["bin"] = os.path.basename(SEL["bin"]) if SEL["bin"] else ""
+    d["log"] = {"on": LOGST["on"], "n": LOGST["n"],
+                "file": os.path.basename(LOGST["path"]) if LOGST["path"] else ""}
     return d
 
 
@@ -249,8 +522,74 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  pre{background:#0a0d11;border:1px solid #263040;border-radius:8px;padding:10px;overflow:auto;max-height:60vh;font-size:11px;line-height:1.5;font-family:ui-monospace,Menlo,monospace}
  .foot{padding:0 18px 16px;font-size:12px;color:#8aa}
  a.dl{color:#9cf;text-decoration:none;border:1px solid #30404f;border-radius:6px;padding:6px 11px}
+ /* липкий верх: лог-бар + строка параметров */
+ .topstick{position:sticky;top:0;z-index:20;box-shadow:0 2px 10px #000a}
+ .logbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:8px 18px;background:#141c26;border-bottom:1px solid #263040;font-size:13px}
+ .logbar .st{color:#8aa}
+ .logbar a.dl{padding:4px 9px}
+ .hud{display:flex;flex-wrap:wrap;gap:2px;padding:10px 18px;background:#0e1520;border-bottom:1px solid #2a3a4a}
+ .hud .cell{flex:1;min-width:96px;background:#151d2a;border:1px solid #22303f;border-radius:8px;padding:8px 10px;text-align:center}
+ .hud .lbl{font-size:10px;color:#8aa;text-transform:uppercase;letter-spacing:.4px}
+ .hud .num{font-size:24px;font-weight:700;font-family:ui-monospace,Menlo,monospace;color:#7fd;line-height:1.2}
+ .hud .cell.tgt .num{color:#fc8}.hud .cell.fact .num{color:#8f8}.hud .cell.uoz .num{color:#9cf}.hud .cell.vec .num{color:#f9a}
+ .hud .num.na{color:#556;font-weight:400}
+ /* панель ШДК */
+ .wblbar{display:flex;flex-wrap:wrap;gap:10px;align-items:end;padding:10px 18px;background:#131922;border-bottom:1px solid #263040}
+ .wblbar .raw{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9c8;background:#0a0d11;border:1px solid #263040;border-radius:6px;padding:6px 9px;min-width:220px}
+ /* карты */
+ .maps{display:flex;flex-direction:column;gap:18px;padding:12px 18px;background:#0f141b;border-bottom:1px solid #263040}
+ .mapbox{width:100%;overflow:auto}
+ table.map{border-collapse:collapse;font-size:11px;width:auto}
+ table.map td,table.map th{width:34px;min-width:34px}
+ table.map td,table.map th{border:1px solid #223040;padding:2px 5px;text-align:right;font-family:ui-monospace,Menlo,monospace}
+ table.map th{background:#161e29;color:#9ab;position:sticky;top:0}
+ table.map th.corner{color:#678}
+ table.map td.hl{outline:2px solid #2ecc40;outline-offset:-2px;background:#12351a;color:#bfe;font-weight:700}
+ table.map td.flag{color:#a86}
 </style></head><body>
 <header><h1>&#128225; Панель логгера ЭБУ — что рассказывает блок</h1></header>
+
+<!-- ЛИПКИЙ ВЕРХ: лог-кнопки + строка живых параметров -->
+<div class=topstick>
+<div class=logbar>
+ <button class=start id=logStart onclick=logstart()>&#9679; Старт лог</button>
+ <button class=stop id=logStop onclick=logstop()>&#9632; Стоп лог</button>
+ <span class=st id=logst>лог выключен</span>
+ <a class=dl href="/api/log/download">&#11015; CSV</a>
+ <span class=st style="margin-left:auto">CSV = интерпретированные значения (5 Гц)</span>
+</div>
+<div class=hud id=hud>
+ <div class=cell><div class=lbl>Обороты</div><div class="num na" id=t_rpm>—</div></div>
+ <div class=cell><div class=lbl>Нагрузка</div><div class="num na" id=t_load>—</div></div>
+ <div class=cell><div class=lbl>Темп сырьё</div><div class="num na" id=t_temp>—</div></div>
+ <div class=cell><div class=lbl>ALPHA</div><div class="num na" id=t_alpha>—</div></div>
+ <div class="cell tgt"><div class=lbl>AFR цель</div><div class="num na" id=t_tgt>—</div></div>
+ <div class="cell fact"><div class=lbl>AFR факт</div><div class="num na" id=t_fact>—</div></div>
+ <div class="cell uoz"><div class=lbl>УОЗ</div><div class="num na" id=t_uoz>—</div></div>
+ <div class="cell vec" id=cell_vec style="display:none"><div class=lbl>Поправка VE</div><div class="num na" id=t_vecorr>—</div></div>
+</div>
+</div>
+
+<!-- ПАНЕЛЬ ШДК (AFR факт) — свой порт, 9600 8N1 -->
+<div class=wblbar>
+ <div class=fld><label>Порт ШДК</label><select id=wport></select></div>
+ <button class=ghost onclick=loadPorts()>&#8635;</button>
+ <button class=start id=wStart onclick=wstart()>&#9654; ШДК</button>
+ <button class=stop id=wStop onclick=wstop()>&#9632;</button>
+ <div class=fld><label>сырьё ШДК (9600 8N1)</label><div class=raw id=wraw>— (нет данных)</div></div>
+</div>
+
+<!-- КАРТЫ смеси и угла из выбираемого бина (по умолч. v8-дамп), подсветка ячейки -->
+<div class=maps>
+ <div style="width:100%;display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+   <div class=fld><label>Бин для карт</label><select id=binsel onchange=selbin()></select></div>
+   <span style="font-size:12px;color:#8aa">зелёная рамка = текущая ячейка (обороты×нагрузка)</span>
+ </div>
+ <div class=mapbox><h2>&#9819; Карта смеси (AFR) &nbsp;<span id=binlbl style="color:#678;font-weight:400"></span></h2><div id=fuelmap>—</div></div>
+ <div class=mapbox><h2>&#9889; Карта угла (УОЗ, град)</h2><div id=ignmap>—</div></div>
+ <div class=mapbox id=vebox style="display:none"><h2>&#127777; Карта VE (наполнение ×, 1.0=номинал) — ДАД</h2><div id=vemap>—</div></div>
+</div>
+
 <div class=panel>
  <div class=fld><label>Порт</label><select id=port></select></div>
  <button class=ghost onclick=loadPorts()>&#8635; порты</button>
@@ -286,11 +625,44 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
 <script>
 async function loadPorts(){
  try{const r=await fetch('/api/ports');const d=await r.json();
-  const s=document.getElementById('port');s.innerHTML='';
-  d.ports.forEach(p=>{const o=document.createElement('option');o.value=p.device;
-    o.textContent=p.device+(p.ftdi?' (FTDI)':'');s.appendChild(o);});
-  if(d.suggested)s.value=d.suggested;}catch(e){}
+  for(const sid of ['port','wport']){
+    const s=document.getElementById(sid);const cur=s.value;s.innerHTML='';
+    d.ports.forEach(p=>{const o=document.createElement('option');o.value=p.device;
+      o.textContent=p.device+(p.ftdi?' (FTDI)':'');s.appendChild(o);});
+    if(cur)s.value=cur; else if(sid==='port'&&d.suggested)s.value=d.suggested;
+  }}catch(e){}
 }
+async function loadBins(){
+ try{const r=await fetch('/api/bins');const d=await r.json();
+  const s=document.getElementById('binsel');s.innerHTML='';
+  d.bins.forEach(b=>{const o=document.createElement('option');o.value=b.path;o.textContent=b.name;s.appendChild(o);});
+  if(d.selected)s.value=d.selected;}catch(e){}
+}
+async function selbin(){const p=document.getElementById('binsel').value;
+ await fetch('/api/selectbin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bin:p})});mapBin=null;}
+async function wstart(){const port=document.getElementById('wport').value;
+ if(!port){alert('Порт ШДК не выбран');return;}
+ const r=await fetch('/api/wbl/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})});
+ const d=await r.json();if(!d.ok)alert('ШДК не удалось: '+d.error);}
+async function wstop(){await fetch('/api/wbl/stop',{method:'POST'});}
+async function logstart(){await fetch('/api/log/start',{method:'POST'});}
+async function logstop(){await fetch('/api/log/stop',{method:'POST'});}
+let mapBin=null,hlIds={fuel:null,ign:null};
+function renderMap(m,prefix){
+ let h='<table class=map><tr><th class=corner>об\\нагр</th>';
+ for(const c of m.cols)h+='<th>'+c+'</th>';h+='</tr>';
+ for(let r=0;r<16;r++){h+='<tr><th>'+m.rows[r]+'</th>';
+  for(let c=0;c<16;c++){const v=m.cells[r*16+c];
+   const cls=(v===null)?' class=flag':'';const disp=(v===null)?'фл':v;
+   h+='<td id='+prefix+'_'+r+'_'+c+cls+'>'+disp+'</td>';}
+  h+='</tr>';}
+ return h+'</table>';}
+function setHL(prefix,hr,hc){
+ if(hlIds[prefix]){const e=document.getElementById(hlIds[prefix]);if(e)e.classList.remove('hl');hlIds[prefix]=null;}
+ if(hr>=0&&hc>=0){const id=prefix+'_'+hr+'_'+hc;const e=document.getElementById(id);if(e){e.classList.add('hl');hlIds[prefix]=id;}}}
+function setNum(id,val,suf){const e=document.getElementById(id);
+ if(val===null||val===undefined){e.textContent='—';e.classList.add('na');}
+ else{e.textContent=val+(suf||'');e.classList.remove('na');}}
 async function start(){const port=document.getElementById('port').value;const baud=document.getElementById('baud').value;
  if(!port){alert('Порт не выбран');return;}
  const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port,baud})});
@@ -312,8 +684,37 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  document.getElementById('vars').innerHTML=h;
  document.getElementById('ram').textContent=(d.ram_lines&&d.ram_lines.length)?d.ram_lines.join('\n'):'— (ждём кадры)';
  document.getElementById('btnStart').disabled=d.running;document.getElementById('btnStop').disabled=!d.running;
+ // верхняя строка
+ const tp=d.top||{};
+ setNum('t_rpm',tp.rpm);setNum('t_load',tp.load);setNum('t_temp',tp.temp);setNum('t_alpha',tp.alpha);
+ setNum('t_tgt',tp.afr_target);setNum('t_fact',tp.afr_fact);setNum('t_uoz',tp.uoz);
+ // сырьё ШДК
+ const wb=d.wbl||{};
+ document.getElementById('wraw').textContent=(wb.raw&&wb.raw.length)?(wb.raw+'   ['+(wb.hex||'')+']'):(wb.error?('ошибка: '+wb.error):(wb.running?'порт открыт, байт нет':'— (нет данных)'));
+ document.getElementById('wStart').disabled=wb.running;document.getElementById('wStop').disabled=!wb.running;
+ // карты (перестраиваем при смене бина, подсветку двигаем каждый тик)
+ if(d.fuel&&d.ign){
+  if(mapBin!==d.bin){
+   document.getElementById('fuelmap').innerHTML=renderMap(d.fuel,'fuel');
+   document.getElementById('ignmap').innerHTML=renderMap(d.ign,'ign');
+   document.getElementById('binlbl').textContent=d.bin||'';
+   const vb=document.getElementById('vebox');
+   if(d.ve){document.getElementById('vemap').innerHTML=renderMap(d.ve,'ve');vb.style.display='';}
+   else vb.style.display='none';
+   mapBin=d.bin;hlIds={fuel:null,ign:null,ve:null};
+  }
+  setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
+  if(d.ve)setHL('ve',d.ve.hr,d.ve.hc);
+ }
+ // ДАД: ячейка «Поправка VE»
+ const cv=document.getElementById('cell_vec');
+ if(tp.is_dad){cv.style.display='';setNum('t_vecorr',tp.ve_corr,'×');}else cv.style.display='none';
+ // статус лога
+ const lg=d.log||{};
+ document.getElementById('logst').textContent=lg.on?('● пишется: '+lg.file+' ('+lg.n+' строк)'):(lg.file?('остановлен: '+lg.file+' ('+lg.n+')'):'лог выключен');
+ document.getElementById('logStart').disabled=lg.on;document.getElementById('logStop').disabled=!lg.on;
 }).catch(e=>{}).finally(()=>setTimeout(tick,400));}
-loadPorts();tick();
+loadPorts();loadBins();tick();
 </script></body></html>"""
 
 
@@ -327,6 +728,19 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/status"): self._json(snapshot()); return
         if self.path.startswith("/api/ports"):
             ports, sug = list_ports(); self._json({"ports": ports, "suggested": sug}); return
+        if self.path.startswith("/api/bins"):
+            bins = [{"path": p, "name": os.path.basename(p)} for p in list_bins()]
+            self._json({"bins": bins, "selected": SEL["bin"]}); return
+        if self.path.startswith("/api/log/download"):
+            fn = LOGST["path"]
+            if fn and os.path.exists(fn):
+                data = open(fn, "rb").read()
+                self.send_response(200); self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="%s"' % os.path.basename(fn))
+                self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+            else:
+                self.send_response(404); self.end_headers()
+            return
         if self.path.startswith("/api/download"):
             with LOCK: fn = STATE["file"]
             if not (fn and os.path.exists(fn)):   # запасной вариант — последний файл в сырьё/
@@ -352,6 +766,18 @@ class H(BaseHTTPRequestHandler):
             ok, err = do_start(data.get("port", ""), data.get("baud", 125000)); self._json({"ok": ok, "error": err}); return
         if self.path.startswith("/api/stop"):
             do_stop(); self._json({"ok": True}); return
+        if self.path.startswith("/api/selectbin"):
+            p = data.get("bin", "")
+            if p and os.path.exists(p): SEL["bin"] = p
+            self._json({"ok": True}); return
+        if self.path.startswith("/api/wbl/start"):
+            ok, err = wbl_start(data.get("port", "")); self._json({"ok": ok, "error": err}); return
+        if self.path.startswith("/api/wbl/stop"):
+            wbl_stop(); self._json({"ok": True}); return
+        if self.path.startswith("/api/log/start"):
+            ok, fn = log_start(); self._json({"ok": ok, "file": fn}); return
+        if self.path.startswith("/api/log/stop"):
+            log_stop(); self._json({"ok": True}); return
         self._json({"ok": False, "error": "unknown"}, 404)
 
 
