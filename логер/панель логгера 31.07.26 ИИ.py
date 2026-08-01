@@ -80,7 +80,7 @@ def find_frames(buf):
             ln = buf[i + 4]; end = i + 5 + ln
             if end < n:
                 c = 0
-                for b in buf[i:i + 5 + ln]:
+                for b in buf[i + 2:i + 5 + ln]:   # chk = XOR(addr,len,data) БЕЗ синхро AE/17
                     c ^= b
                 if c == buf[end]:
                     ok += 1; i = end + 1; continue
@@ -91,12 +91,15 @@ def find_frames(buf):
 
 
 def reader_loop(ser, stop_ev, fname):
-    f = open(fname, "ab")
+    f = None   # файл создаём ЛЕНИВО — только когда реально пошли байты (пустых не плодим)
     winbuf = bytearray()
     try:
         while not stop_ev.is_set():
             chunk = ser.read(512)
             if chunk:
+                if f is None:
+                    os.makedirs(os.path.dirname(fname), exist_ok=True)
+                    f = open(fname, "ab")
                 f.write(chunk); f.flush()
                 now = time.time()
                 winbuf += chunk
@@ -113,7 +116,7 @@ def reader_loop(ser, stop_ev, fname):
     finally:
         try: ser.close()
         except Exception: pass
-        f.close()
+        if f: f.close()
         with LOCK:
             STATE["running"] = False
 
@@ -137,7 +140,7 @@ def do_start(port, baud):
         time.sleep(0.2)
         try: ser.reset_input_buffer()
         except Exception: pass
-        fname = os.path.join(HERE, "raw_вход_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
+        fname = os.path.join(HERE, "сырьё", "raw_вход_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
         # сброс статистики
         with LOCK:
             STATE.update({"running": True, "port": port, "baud": int(baud),
