@@ -591,6 +591,12 @@ render();
 </script></body></html>"""
 
 HTML = HTML.replace("__ITEMS__", json.dumps(items, ensure_ascii=False)).replace("__ROM__", rom_b64).replace("__GROUPS__", json.dumps(GROUPS, ensure_ascii=False))
-out = os.path.join(ROOT, "j30", "J30_редактор.html")
-open(out, "w", encoding="utf-8").write(HTML)
-print("OK:", out, "| размер", len(HTML), "| секций", len(items))
+# пишем в ОБА места: локальный html + реальный редактор контейнера ecu_twin (:8080/editor)
+outs = [
+    os.path.join(ROOT, "j30", "J30_редактор.html"),
+    os.path.join(ROOT, "ecu_twin", "frontend", "editor.html"),
+]
+for out in outs:
+    if os.path.isdir(os.path.dirname(out)):
+        open(out, "w", encoding="utf-8").write(HTML)
+        print("OK:", out, "| размер", len(HTML), "| секций", len(items))

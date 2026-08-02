@@ -27,52 +27,47 @@ LABELS = [
     (0x1413, "Расход мгновенный",     8, "сырьё (гэп→транзит)", None),  # $1413−$1482 = газовка
     (0x1431, "ALPHA",                 8, "× (100=1.0)",        0.01),
     (0x1411, "Впрыск факт",          16, "мс",                 0.005),  # $142A×$1413+deadtime
-    # --- ДРОССЕЛЬ (TPS) — всё вместе ---
+    # --- ДРОССЕЛЬ (TPS) ---
     (0x1492, "TPS дроссель",         16, "сырьё 10б",          None),   # аналог. дроссель, ch6
-    (0x14A2, "TPS открытие",          8, "АЦП $1492 (от ХХ)",  2),      # ×2 = шкала $1492, как в редакторе
-    (0x14A3, "TPS скорость откр.",    8, "АЦП $1492/такт",     2),      # газуешь → >0
-    (0x14DE, "Обогащ. ускорения",    16, "добавка в форсунку", None),   # накачка при газовке
+    (0x14A2, "TPS открытие",          8, "%",                  0.581395),  # 172=100% (span 344/2)
+    (0x14DE, "Обогащ. ускорения",    16, "добавка в форсунку", None),   # >0 = было обогащение
     (0x00B9, "Флаг TPS",              8, "0x20=ХХ/WOT/обрыв",  None),
-    # --- ДАД: выбранные из ОЗУ ---
+    # --- ДАД: выбранные из ОЗУ (на MAF-бине = мусор) ---
     (0x00F8, "VE выбранное",          8, "×нап (128=1.0)",     0.0078125),  # карта 0x4900
     (0x00F9, "Ktps выбранное",        8, "× (128=1.0)",        0.0078125),  # карта 0x4B00
     # --- концевики / флаги режима ---
     (0x0054, "Флаг ХХ/газ",           8, "б0=ХХ",              None),
-    (0x0015, "Банк концевиков",       8, "0x10ХХ 0x20нейтр 0x40ГУР 0x80AC", None),
-    (0x0053, "Флаги угла",            8, "б0ХХ б1крэнк б2нейтр", None),
+    (0x0015, "Банк концевиков",       8, "0x80=СТАРТЕР(255=крутит) 0x20нейтр 0x10ХХ", None),
+    (0x0053, "Флаги угла",            8, "б0ХХ б1крэнк б2нейтр (какая карта)", None),
     (0x00AE, "Замкнутый цикл",        8, "0x80=вошёл",         None),
-    # --- УОЗ ---
-    (0x140F, "УОЗ финал",             8, "град (доставленный)", None),
-    (0x143B, "УОЗ карта",             8, "град (ХХ=0x76F0)",   None),
+    # --- УОЗ (°BTDC = 70 − сырьё; см. колонку УОЗ_°BTDC) ---
+    (0x140F, "УОЗ финал сырьё",       8, "°=70−байт",          None),
+    (0x143B, "УОЗ карта",             8, "≈градусы (база)",    None),
     # --- контур ХХ ---
     (0x142C, "Цель ХХ",               8, "у.е.",               None),
-    (0x004D, "РХХ duty",             16, "у.е.",               None),
-    (0x144E, "Ошибка контура ХХ",     8, "у.е. (НЕ впрыск)",   None),
-    # --- АЦП опознанные ---
+    # --- АЦП опознанные (рабочие) ---
     (0x1408, "АЦП ch0 MAF",          16, "сырьё 10б",          None),
     (0x008F, "АЦП ch1 напряжение",    8, "сырьё",              None),
     (0x004C, "АЦП ch2 темп ОЖ",       8, "сырьё",              None),
-    (0x1400, "АЦП ch3 O2",            8, "сырьё",              None),
-    # --- АЦП НЕ опознаны (в самый низ, отключай датчик → смотри что в 0/FF) ---
-    (0x1402, "АЦП ch4 (?)",           8, "сырьё, не опознан",  None),
-    (0x1401, "АЦП ch5 (?)",           8, "сырьё, не опознан",  None),
-    (0x1583, "АЦП ch7 Vbatt−",        8, "сырьё (voltage-fb)", None),
-    (0x1574, "АЦП ch8 (?)",           8, "сырьё, не опознан",  None),
+    (0x1400, "АЦП ch3 O2",            8, "сырьё (лямбда титан)", None),
+    # --- RX-ТЕСТ приёма по SCI ---
+    (0x1600, "RX-тест приём",         8, "принятый байт (шли 170 → жди 170)", None),
 ]
 
 # Узкий кадр v8: маркер $FFF0, 13 байт значений в фикс. порядке (декод по позиции).
 # Порядок = ADDR_LIST билдера build_targeted_patch: раскладываем на РЕАЛЬНЫЕ адреса.
 NARROW_MARKER = 0xFFF0
-# Порядок ДОЛЖЕН совпадать с ADDR_LIST в build_targeted_patch ИИ.py (27 байт).
+# Порядок ДОЛЖЕН совпадать с ADDR_LIST в build_targeted_patch ИИ.py (27 адресов).
+# Декод позиционный + панель адаптивна по длине — терпит старые бины (короче/длиннее).
 NARROW_MAP = [
     0x140A, 0x140B, 0x1482, 0x1413, 0x1431, 0x1411, 0x1412,
-    0x1408, 0x1409, 0x008F, 0x004C, 0x1400, 0x1402, 0x1401,
-    0x1492, 0x1493, 0x1583, 0x1574,
+    0x1408, 0x1409, 0x008F, 0x004C, 0x1400,
+    0x1492, 0x1493,
     0x140F, 0x143B, 0x0053,
-    0x0015, 0x0054,
-    0x142C, 0x004D, 0x004E, 0x144E,
-    0x14A2, 0x14A3, 0x14DE, 0x14DF, 0x00B9, 0x00AE,
+    0x0015, 0x0054, 0x142C,
+    0x14A2, 0x14DE, 0x14DF, 0x00B9, 0x00AE,
     0x00F8, 0x00F9,
+    0x1600,   # RX-тест: последний принятый по SCI байт
 ]
 
 STATE = {
@@ -161,7 +156,20 @@ def wbl_stop():
 # ---------- Таблицы из бина (смесь 0x7D00 / угол 0x7C00) + поиск ячейки ----------
 # По умолчанию — v8-дамп. Оси: смесь rax=RPM(7B00)/cax=load(7AF0); угол rax=RPM(7B20)/cax=load(7B10).
 DEFAULT_BIN = os.path.join(HERE, "J30_vq-форсы_v8-узкий_01.08.26 ИИ.bin")
-SEL = {"bin": DEFAULT_BIN if os.path.exists(DEFAULT_BIN) else ""}
+
+
+def pick_default_bin():
+    # автовыбор: ПОСЛЕДНЯЯ по времени НЕ-ДАД прошивка в логер/ (dad/дад в имени → пропуск)
+    cands = [f for f in glob.glob(os.path.join(HERE, "*.bin"))
+             if os.path.getsize(f) == 32768
+             and "дад" not in os.path.basename(f).lower()
+             and "dad" not in os.path.basename(f).lower()]
+    if cands:
+        return max(cands, key=os.path.getmtime)
+    return DEFAULT_BIN if os.path.exists(DEFAULT_BIN) else ""
+
+
+SEL = {"bin": ""}   # по умолчанию НЕ выбрана — пользователь выбирает вручную (иначе молча подставятся чужие карты/AFR)
 _tab_cache = {}
 
 
@@ -232,7 +240,7 @@ def nearest_idx(val, axis):   # индекс ближайшей точки ос�
 LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": None, "t0": 0}
 # колонки = ВСЁ: время + все декодированные сигналы (LABELS) + вычисленные (производные)
 LOG_HEADER = (["время_с"] + [nm for (_a, nm, _f, _u, _m) in LABELS] +
-              ["TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа"])
+              ["УОЗ_°BTDC", "TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа"])
 
 
 def _log_row():
@@ -244,7 +252,8 @@ def _log_row():
         row.append(v["real"] if v["real"] is not None else g(v["val"]))
     # вычисленные производные
     tp = d["top"]
-    row += [round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
+    row += [g(tp["uoz_deg"]),
+            round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
             g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["ve_corr"]), g(tp["press"])]
     return row
 
@@ -362,10 +371,12 @@ def reader_loop(ser, stop_ev, fname):
                     if ok:
                         STATE["frames"] += 1
                         STATE["last_frame_t"] = now
-                        if addr == NARROW_MARKER and len(data) == len(NARROW_MAP):
-                            # узкий кадр v8: разложить 13 байт по реальным адресам
+                        if addr == NARROW_MARKER:
+                            # узкий кадр v8: позиционно, ЛЮБАЯ длина (терпим к версии бина —
+                            # порядок совпадает по префиксу, лишние адреса просто не придут)
                             for k, b in enumerate(data):
-                                STATE["ram"][NARROW_MAP[k]] = b
+                                if k < len(NARROW_MAP):
+                                    STATE["ram"][NARROW_MAP[k]] = b
                         else:
                             for k, b in enumerate(data):
                                 STATE["ram"][addr + k] = b
@@ -465,6 +476,8 @@ def snapshot():
         "temp": temp_raw,                              # сырьё АЦП
         "alpha": round(alpha_raw * 0.01, 2) if alpha_raw is not None else None,
         "afr_target": None, "uoz": None,
+        # °BTDC = 70 − $140F (код: SBA #0x46; проверено: ХХ-нейтраль 55→15° = спец VG30E)
+        "uoz_deg": (70 - ram[0x140F]) if 0x140F in ram else None,
         "afr_fact": wbl["afr"], "press": None, "ve_corr": None,
     }
     t = load_tables(SEL["bin"])
@@ -593,8 +606,40 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  table.map th.corner{color:#678}
  table.map td.hl{outline:2px solid #2ecc40;outline-offset:-2px;background:#12351a;color:#bfe;font-weight:700}
  table.map td.flag{color:#a86}
-</style></head><body>
-<header><h1>&#128225; Панель логгера ЭБУ — что рассказывает блок</h1></header>
+ /* ===== СВЕТЛАЯ ТЕМА (контрастная, для солнца) ===== */
+ body.light{background:#fff;color:#111}
+ body.light header{background:#dbe7f3;border-bottom:2px solid #7fa3c4}
+ body.light .panel{background:#eef1f5;border-bottom:2px solid #b3bcc7}
+ body.light .fld label,body.light .logbar .st,body.light .stats,body.light .foot,body.light td.u,body.light .hud .lbl{color:#334}
+ body.light select,body.light input{background:#fff;color:#111;border:1px solid #7f8a99}
+ body.light .ghost{background:#ccd4dd;color:#123}
+ body.light .stats b{color:#000}
+ body.light .live{background:#0a5d26;color:#dfffe6}body.light .quiet{background:#7a6a10;color:#fff8dc}body.light .off{background:#c3ccd6;color:#334}body.light .err{background:#8a1a1a;color:#ffe0e0}
+ body.light td,body.light th{border:1px solid #9aa6b3}
+ body.light th{background:#d6dee7;color:#123}
+ body.light td.v{color:#046}body.light td.r{color:#063}body.light td.a{color:#456}body.light td.na{color:#99a}
+ body.light pre{background:#f6f8fa;border:1px solid #9aa6b3;color:#111}
+ body.light a.dl{color:#046;border:1px solid #7f8a99}
+ body.light .topstick{box-shadow:0 2px 10px #0004}
+ body.light .logbar{background:#e3ecf5;border-bottom:2px solid #b3bcc7}
+ body.light .hud{background:#e9eef4;border-bottom:2px solid #b3bcc7}
+ body.light .hud .cell{background:#fff;border:1px solid #9aa6b3}
+ body.light .hud .num{color:#046}
+ body.light .hud .cell.tgt .num{color:#a3520a}body.light .hud .cell.fact .num{color:#0a6b2a}body.light .hud .cell.uoz .num{color:#1650a3}body.light .hud .cell.vec .num{color:#a3186a}
+ body.light .hud .num.na{color:#99a}
+ body.light .wblbar{background:#e6edf4;border-bottom:2px solid #b3bcc7}
+ body.light .wblbar .raw{color:#0a5d26;background:#f6f8fa;border:1px solid #9aa6b3}
+ body.light .maps{background:#eef1f5;border-bottom:2px solid #b3bcc7}
+ body.light h2{color:#234}
+ body.light table.map td,body.light table.map th{border:1px solid #9aa6b3}
+ body.light table.map th{background:#d6dee7;color:#123}
+ body.light table.map th.corner{color:#567}
+ body.light table.map td.hl{outline:2px solid #0a7a2a;background:#c6f0ce;color:#031;font-weight:700}
+ body.light table.map td.flag{color:#8a5a10}
+ .themebox{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
+ header .themebox{float:right;color:inherit;font-weight:600}
+</style></head><body class=light>
+<header><span class=themebox><input type=checkbox id=darkbox onchange=toggletheme()> &#127769; Тёмная тема</span><h1>&#128225; Панель логгера ЭБУ — что рассказывает блок</h1></header>
 
 <!-- ЛИПКИЙ ВЕРХ: лог-кнопки + строка живых параметров -->
 <div class=topstick>
@@ -612,7 +657,7 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  <div class=cell><div class=lbl>ALPHA</div><div class="num na" id=t_alpha>—</div></div>
  <div class="cell tgt"><div class=lbl>AFR цель</div><div class="num na" id=t_tgt>—</div></div>
  <div class="cell fact"><div class=lbl>AFR факт</div><div class="num na" id=t_fact>—</div></div>
- <div class="cell uoz"><div class=lbl>УОЗ</div><div class="num na" id=t_uoz>—</div></div>
+ <div class="cell uoz"><div class=lbl>УОЗ °BTDC</div><div class="num na" id=t_uoz>—</div></div>
  <div class="cell vec" id=cell_vec style="display:none"><div class=lbl>Поправка VE</div><div class="num na" id=t_vecorr>—</div></div>
 </div>
 </div>
@@ -630,6 +675,7 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
 <div class=maps>
  <div style="width:100%;display:flex;gap:10px;align-items:end;flex-wrap:wrap">
    <div class=fld><label>Бин для карт</label><select id=binsel onchange=selbin()></select></div>
+   <span id=nobinlbl style="color:#f33;font-weight:800;font-size:15px;display:none">&#9888; НЕ ВЫБРАНА ПРОШИВКА</span>
    <span style="font-size:12px;color:#8aa">зелёная рамка = текущая ячейка (обороты×нагрузка)</span>
  </div>
  <div class=mapbox><h2>&#9819; Карта смеси (AFR) &nbsp;<span id=binlbl style="color:#678;font-weight:400"></span></h2><div id=fuelmap>—</div></div>
@@ -651,6 +697,13 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  <div class=fld><label>или своё</label><input class=baud id=baud value=15625></div>
  <button class=start id=btnStart onclick=start()>&#9654; Старт</button>
  <button class=stop id=btnStop onclick=stop() disabled>&#9632; Стоп</button>
+</div>
+<div class=panel style="border:1px solid #f80;border-radius:6px;padding:8px">
+ <b style="color:#fa0">RX-тест приёма</b>
+ <div class=fld><label>байт 0-255</label><input id=txbyte type=number min=0 max=255 value=170 style="width:80px"></div>
+ <button class=ghost onclick=txsend()>&#9654; Отправить в ЭБУ</button>
+ <label style="font-size:13px"><input type=checkbox id=txspam onchange=txspamtog()> спам (для замера напряжения)</label>
+ <span id=txstat style="font-size:13px;color:#8aa"></span>
 </div>
 <div id=banner class=off>остановлено</div>
 <div class=stats>
@@ -685,11 +738,22 @@ async function loadPorts(){
 async function loadBins(){
  try{const r=await fetch('/api/bins');const d=await r.json();
   const s=document.getElementById('binsel');s.innerHTML='';
+  const ph=document.createElement('option');ph.value='';ph.textContent='— выберите прошивку —';s.appendChild(ph);
   d.bins.forEach(b=>{const o=document.createElement('option');o.value=b.path;o.textContent=b.name;s.appendChild(o);});
-  if(d.selected)s.value=d.selected;}catch(e){}
+  s.value=d.selected||'';
+  updBinLbl(s.value);}catch(e){}
 }
+function updBinLbl(v){const l=document.getElementById('nobinlbl');if(l)l.style.display=v?'none':'';}
 async function selbin(){const p=document.getElementById('binsel').value;
- await fetch('/api/selectbin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bin:p})});mapBin=null;}
+ await fetch('/api/selectbin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bin:p})});mapBin=null;updBinLbl(p);}
+async function txsend(){const v=parseInt(document.getElementById('txbyte').value)||0;
+ try{const r=await fetch('/api/tx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({byte:v})});
+  const d=await r.json();
+  document.getElementById('txstat').textContent=d.ok?('отправлен '+v+' → жди в «RX-тест приём»'):('ошибка: '+d.error);
+ }catch(e){document.getElementById('txstat').textContent='ошибка сети';}}
+let txTimer=null;
+function txspamtog(){const on=document.getElementById('txspam').checked;
+ if(on){if(!txTimer)txTimer=setInterval(txsend,15);}else{clearInterval(txTimer);txTimer=null;}}
 async function wstart(){const port=document.getElementById('wport').value;
  if(!port){alert('Порт ШДК не выбран');return;}
  const r=await fetch('/api/wbl/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})});
@@ -755,7 +819,7 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  // верхняя строка
  const tp=d.top||{};
  setNum('t_rpm',tp.rpm);setNum('t_load',tp.tp);setNum('t_temp',tp.temp);setNum('t_alpha',tp.alpha);
- setNum('t_tgt',tp.afr_target);setNum('t_fact',tp.afr_fact);setNum('t_uoz',tp.uoz);
+ setNum('t_tgt',tp.afr_target);setNum('t_fact',tp.afr_fact);setNum('t_uoz',tp.uoz_deg,'°');
  // сырьё ШДК
  const wb=d.wbl||{};
  document.getElementById('wraw').textContent=(wb.raw&&wb.raw.length)?(wb.raw+'   ['+(wb.hex||'')+']'):(wb.error?('ошибка: '+wb.error):(wb.running?'порт открыт, байт нет':'— (нет данных)'));
@@ -788,6 +852,11 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  else{ls.className='st';ls.textContent=lg.file?('остановлен: '+lg.file+' ('+lg.n+')'):'лог выключен';}
  document.getElementById('logStart').disabled=lg.on;document.getElementById('logStop').disabled=!lg.on;
 }).catch(e=>{}).finally(()=>setTimeout(tick,400));}
+function toggletheme(){const dark=document.getElementById('darkbox').checked;
+ document.body.classList.toggle('light',!dark);
+ try{localStorage.setItem('j30theme',dark?'dark':'light');}catch(_){}}
+// по умолчанию СВЕТЛАЯ (тёмная только если явно сохранена)
+try{if(localStorage.getItem('j30theme')=='dark'){document.body.classList.remove('light');document.getElementById('darkbox').checked=true;}}catch(_){}
 loadPorts();loadBins();tick();
 </script></body></html>"""
 
@@ -848,8 +917,19 @@ class H(BaseHTTPRequestHandler):
             do_stop(); self._json({"ok": True}); return
         if self.path.startswith("/api/selectbin"):
             p = data.get("bin", "")
-            if p and os.path.exists(p): SEL["bin"] = p
+            if p == "": SEL["bin"] = ""            # сброс в «не выбрано»
+            elif os.path.exists(p): SEL["bin"] = p
             self._json({"ok": True}); return
+        if self.path.startswith("/api/tx"):
+            # RX-тест: шлём байт в ЭБУ по тому же порту (FTDI TX → Rx блока)
+            try:
+                v = int(data.get("byte", 0)) & 0xFF
+                s = CTRL.get("ser")
+                if s: s.write(bytes([v])); self._json({"ok": True, "error": ""})
+                else: self._json({"ok": False, "error": "порт не открыт — нажми Старт"})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
+            return
         if self.path.startswith("/api/wbl/start"):
             ok, err = wbl_start(data.get("port", "")); self._json({"ok": ok, "error": err}); return
         if self.path.startswith("/api/wbl/stop"):
