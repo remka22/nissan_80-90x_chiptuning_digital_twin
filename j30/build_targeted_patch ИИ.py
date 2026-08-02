@@ -81,12 +81,59 @@ PROG = [
     (None,   "STAAd", 0x10),
     (None,   "CLRe",  0x001E),        # TRCSR2=0 → 8N1
     (None,   "OIMd",  (0x0A, 0x11)),  # TE=1 + RE=1 (приём включён)
-    # --- RX: пришёл байт по SCI → положить в тест-ячейку $1600 ---
+    (None,   "LDAA#", 0x16),          # peek_ptr hi = 0x16
+    (None,   "STAAd", 0xF5),
+    (None,   "CLRe",  0x00F6),        # peek_ptr lo = 0 → указатель = $1600
+    (None,   "CLRe",  0x00F4),        # rxsi = 0 (состояние приёма)
+    # --- RX: протокол команд. [C5 hi lo val]=POKE(запись), [C6 hi lo]=PEEK(указатель) ---
+    # состояние в $F4, указатель адреса в $F5(hi):$F6(lo). Значение $1600 = *(указатель).
     ("DUMP", "LDAAd", 0x11),          # TRCSR
-    (None,   "BITA#", 0x80),          # RDRF? (принят байт)
-    (None,   "BEQ",   "TXCHK"),
-    (None,   "LDAAd", 0x12),          # A = RDR (чтение сбрасывает RDRF)
-    (None,   "STAAe", 0x1600),        # → тест-ячейка приёма
+    (None,   "BITA#", 0x80),          # RDRF? принят байт
+    (None,   "BEQ",   "RXCOPY"),      # нет байта → к чтению peek
+    (None,   "LDAAd", 0x12),          # A = принятый байт (сброс RDRF)
+    (None,   "LDABd", 0xF4),          # B = rxsi
+    (None,   "CMPB#", 0),
+    (None,   "BNE",   "RXS1"),
+    (None,   "CMPA#", 0xC5),          # маркер POKE?
+    (None,   "BNE",   "RXCK6"),
+    (None,   "LDAB#", 1),
+    (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXCK6","CMPA#", 0xC6),          # маркер PEEK?
+    (None,   "BNE",   "RXCOPY"),      # не команда → игнор байта
+    (None,   "LDAB#", 4),
+    (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXS1", "CMPB#", 1),
+    (None,   "BNE",   "RXS2"),
+    (None,   "STAAd", 0xF5),          # POKE: адрес hi
+    (None,   "LDAB#", 2),
+    (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXS2", "CMPB#", 2),
+    (None,   "BNE",   "RXS3"),
+    (None,   "STAAd", 0xF6),          # POKE: адрес lo
+    (None,   "LDAB#", 3),
+    (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXS3", "CMPB#", 3),
+    (None,   "BNE",   "RXS4"),
+    (None,   "LDXd",  0xF5),          # X = адрес ($F5:$F6)
+    (None,   "STAAx", 0x00),          # [X] = значение  → ЗАПИСЬ
+    (None,   "CLRe",  0x00F4),        # rxsi = 0
+    (None,   "BRA",   "RXCOPY"),
+    ("RXS4", "CMPB#", 4),
+    (None,   "BNE",   "RXS5"),
+    (None,   "STAAd", 0xF5),          # PEEK: адрес hi
+    (None,   "LDAB#", 5),
+    (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXS5", "STAAd", 0xF6),          # PEEK: адрес lo (rxsi==5)
+    (None,   "CLRe",  0x00F4),        # rxsi = 0
+    # --- читаем *(указатель) → $1600 (видно в кадре как peek) ---
+    ("RXCOPY","LDXd", 0xF5),          # X = указатель
+    (None,   "LDAAx", 0x00),          # A = *(указатель)
+    (None,   "STAAe", 0x1600),        # $1600 = прочитанный байт
     # --- TX: передать следующий байт кадра ---
     ("TXCHK","LDAAd", 0x11),
     (None,   "BITA#", 0x20),          # TDRE?
@@ -138,7 +185,7 @@ PROG = [
 ]
 
 LEN = {"JSR":3,"LDAAd":2,"LDAA#":2,"LDAAx":2,"LDABd":2,"LDXx":2,"LDX#":3,"BITA#":2,
-       "CMPB#":2,"SUBB#":2,"ASLB":1,"ABX":1,"STAAd":2,"STAAe":3,"EORAd":2,"CLRe":3,"INCe":3,
+       "CMPB#":2,"CMPA#":2,"LDAB#":2,"SUBB#":2,"ASLB":1,"ABX":1,"STAAd":2,"STAAe":3,"STABd":2,"STAAx":2,"LDXd":2,"EORAd":2,"CLRe":3,"INCe":3,
        "PSHA":1,"PULA":1,"OIMd":3,"RTS":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2}
 BR = {"BNE":0x26,"BEQ":0x27,"BCC":0x24,"BCS":0x25,"BRA":0x20}
 
@@ -174,6 +221,11 @@ def assemble(org):
         elif op == "ABX":   out += bytes([0x3A])
         elif op == "STAAd": out += bytes([0x97, arg & 0xFF])
         elif op == "STAAe": out += bytes([0xB7, arg >> 8, arg & 0xFF])
+        elif op == "CMPA#": out += bytes([0x81, arg & 0xFF])
+        elif op == "LDAB#": out += bytes([0xC6, arg & 0xFF])
+        elif op == "STABd": out += bytes([0xD7, arg & 0xFF])
+        elif op == "STAAx": out += bytes([0xA7, arg & 0xFF])
+        elif op == "LDXd":  out += bytes([0xDE, arg & 0xFF])
         elif op == "EORAd": out += bytes([0x98, arg & 0xFF])
         elif op == "CLRe":  out += bytes([0x7F, arg >> 8, arg & 0xFF])
         elif op == "INCe":  out += bytes([0x7C, arg >> 8, arg & 0xFF])
@@ -200,7 +252,7 @@ def main():
     rom = bytearray(open(SRC, "rb").read()); assert len(rom) == 32768
     code, addrtbl, const2t = assemble(CODE_ORG)
     off = CODE_ORG - ROM_BASE
-    assert len(code) <= 0x100, "не влезает в страницу C600"
+    assert len(code) <= 0x180, "не влезает в C600-C77F"
     hoff = HOOK_CPU - ROM_BASE
     tgt = rom[hoff + 1] << 8 | rom[hoff + 2]
     assert rom[hoff] == 0xBD and tgt in (ORIG_CALL, CODE_ORG), "по 83F8 не JSR A99B/C600"

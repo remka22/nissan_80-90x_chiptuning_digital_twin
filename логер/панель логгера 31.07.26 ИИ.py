@@ -51,7 +51,7 @@ LABELS = [
     (0x004C, "АЦП ch2 темп ОЖ",       8, "сырьё",              None),
     (0x1400, "АЦП ch3 O2",            8, "сырьё (лямбда титан)", None),
     # --- RX-ТЕСТ приёма по SCI ---
-    (0x1600, "RX-тест приём",         8, "принятый байт (шли 170 → жди 170)", None),
+    (0x1600, "peek ($1600)",          8, "*(указатель) — poke/peek/проба", None),
 ]
 
 # Узкий кадр v8: маркер $FFF0, 13 байт значений в фикс. порядке (декод по позиции).
@@ -387,6 +387,26 @@ def reader_loop(ser, stop_ev, fname):
     with LOCK: STATE["running"] = False
 
 
+def _probe_wait(addr, nframes=2, timeout=2.0):
+    # ждём nframes свежих кадров, возвращаем текущий байт по адресу из образа ОЗУ
+    start = STATE.get("frames", 0); t0 = time.time()
+    while STATE.get("frames", 0) - start < nframes:
+        if time.time() - t0 > timeout: break
+        time.sleep(0.02)
+    return STATE["ram"].get(addr)
+
+
+TXFLOOD = {"on": False, "byte": 0, "thread_alive": False}
+def tx_flood_loop():
+    # непрерывный поток байтов в ЭБУ — чтобы мультиметром увидеть просадку на ноге Rx
+    while TXFLOOD["on"]:
+        s = CTRL.get("ser")
+        if not s: break
+        try: s.write(bytes([TXFLOOD["byte"]]) * 128)
+        except Exception: break
+    TXFLOOD["thread_alive"] = False
+
+
 def do_start(port, baud):
     import serial
     with CTRL_LOCK:
@@ -705,6 +725,16 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  <label style="font-size:13px"><input type=checkbox id=txspam onchange=txspamtog()> спам (для замера напряжения)</label>
  <span id=txstat style="font-size:13px;color:#8aa"></span>
 </div>
+<div class=panel style="border:1px solid #6cf;border-radius:6px;padding:8px;flex-wrap:wrap">
+ <b style="color:#6cf">POKE / PEEK / проба ОЗУ</b>
+ <div class=fld><label>адрес hex</label><input id=pkaddr value=1600 style="width:70px"></div>
+ <div class=fld><label>значение</label><input id=pkval type=number min=0 max=255 value=170 style="width:70px"></div>
+ <button class=ghost onclick=pokeAddr()>Записать (poke)</button>
+ <button class=ghost onclick=peekAddr()>Читать (peek)</button>
+ <button class=ghost onclick=ramProbe()>Проба ОЗУ $1600-$1FFF</button>
+ <span id=pkstat style="font-size:13px;color:#8aa"></span>
+ <pre id=probeout style="width:100%;max-height:140px;overflow:auto;font-size:12px;margin:4px 0 0"></pre>
+</div>
 <div id=banner class=off>остановлено</div>
 <div class=stats>
  <span>всего: <b id=total>0</b> б</span><span><b id=rate>0</b> б/с</span>
@@ -751,9 +781,24 @@ async function txsend(){const v=parseInt(document.getElementById('txbyte').value
   const d=await r.json();
   document.getElementById('txstat').textContent=d.ok?('отправлен '+v+' → жди в «RX-тест приём»'):('ошибка: '+d.error);
  }catch(e){document.getElementById('txstat').textContent='ошибка сети';}}
-let txTimer=null;
 function txspamtog(){const on=document.getElementById('txspam').checked;
- if(on){if(!txTimer)txTimer=setInterval(txsend,15);}else{clearInterval(txTimer);txTimer=null;}}
+ const v=parseInt(document.getElementById('txbyte').value)||0;
+ fetch('/api/tx/hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on,byte:v})});
+ document.getElementById('txstat').textContent=on?('ПОТОК '+v+' → мерь ногу Rx (байт 0 = должна упасть до ~0.5-1В)'):'поток стоп';}
+function hx(v){return parseInt(v,16)||0;}
+async function pokeAddr(){const a=hx(document.getElementById('pkaddr').value),v=parseInt(document.getElementById('pkval').value)||0;
+ const r=await fetch('/api/poke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addr:a,val:v})});const d=await r.json();
+ document.getElementById('pkstat').textContent=d.ok?('poke $'+a.toString(16)+' = '+v):('ошибка: '+d.error);}
+async function peekAddr(){const a=hx(document.getElementById('pkaddr').value);
+ const r=await fetch('/api/peek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addr:a})});const d=await r.json();
+ document.getElementById('pkstat').textContent=d.ok?('peek $'+a.toString(16)+' → смотри «peek ($1600)» в таблице'):('ошибка: '+d.error);}
+async function ramProbe(){const addrs=[];for(let a=0x1600;a<=0x1FFF;a+=64)addrs.push(a);
+ document.getElementById('pkstat').textContent='проба... ~20с, МОТОР ЗАГЛУШЁН!';
+ const r=await fetch('/api/ramprobe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addrs:addrs})});const d=await r.json();
+ if(!d.ok){document.getElementById('pkstat').textContent='ошибка: '+d.error;return;}
+ let top=null,out='';d.res.forEach(x=>{let st=x.skip?('SKIP '+x.skip):(x.ram?'ОЗУ ✓':'—');if(x.ram)top=x.addr;out+='$'+x.addr.toString(16)+': '+st+'\n';});
+ document.getElementById('probeout').textContent=out;
+ document.getElementById('pkstat').textContent=top?('верх живого ОЗУ ≈ $'+top.toString(16)):'ОЗУ в диапазоне не найдено';}
 async function wstart(){const port=document.getElementById('wport').value;
  if(!port){alert('Порт ШДК не выбран');return;}
  const r=await fetch('/api/wbl/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})});
@@ -920,6 +965,47 @@ class H(BaseHTTPRequestHandler):
             if p == "": SEL["bin"] = ""            # сброс в «не выбрано»
             elif os.path.exists(p): SEL["bin"] = p
             self._json({"ok": True}); return
+        if self.path.startswith("/api/poke"):
+            try:
+                a = int(data.get("addr", 0)) & 0xFFFF; v = int(data.get("val", 0)) & 0xFF
+                s = CTRL.get("ser")
+                if s: s.write(bytes([0xC5, a >> 8, a & 0xFF, v])); self._json({"ok": True})
+                else: self._json({"ok": False, "error": "порт не открыт — Старт"})
+            except Exception as e: self._json({"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/peek"):
+            try:
+                a = int(data.get("addr", 0)) & 0xFFFF
+                s = CTRL.get("ser")
+                if s: s.write(bytes([0xC6, a >> 8, a & 0xFF])); self._json({"ok": True})
+                else: self._json({"ok": False, "error": "порт не открыт — Старт"})
+            except Exception as e: self._json({"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/ramprobe"):
+            s = CTRL.get("ser")
+            if not s: self._json({"ok": False, "error": "порт не открыт — Старт"}); return
+            res = []
+            for a in data.get("addrs", []):
+                a &= 0xFFFF
+                if a < 0x40 or (0x1000 <= a <= 0x106F):   # регистры/UPP — не трогаем
+                    res.append({"addr": a, "ram": None, "skip": "регистр/UPP"}); continue
+                s.write(bytes([0xC6, a >> 8, a & 0xFF])); orig = _probe_wait(0x1600)
+                s.write(bytes([0xC5, a >> 8, a & 0xFF, 0xAA])); v1 = _probe_wait(0x1600)
+                s.write(bytes([0xC5, a >> 8, a & 0xFF, 0x55])); v2 = _probe_wait(0x1600)
+                s.write(bytes([0xC5, a >> 8, a & 0xFF, orig if orig is not None else 0]))  # restore
+                res.append({"addr": a, "ram": (v1 == 0xAA and v2 == 0x55), "orig": orig})
+            self._json({"ok": True, "res": res})
+            return
+        if self.path.startswith("/api/tx/hold"):
+            # непрерывный поток (для замера просадки на ноге). Байт 0 = линия внизу 90% времени
+            v = int(data.get("byte", 0)) & 0xFF
+            on = bool(data.get("on", False))
+            TXFLOOD["byte"] = v; TXFLOOD["on"] = on
+            if on and not TXFLOOD["thread_alive"] and CTRL.get("ser"):
+                TXFLOOD["thread_alive"] = True
+                threading.Thread(target=tx_flood_loop, daemon=True).start()
+            self._json({"ok": bool(CTRL.get("ser")), "error": "" if CTRL.get("ser") else "порт не открыт — Старт"})
+            return
         if self.path.startswith("/api/tx"):
             # RX-тест: шлём байт в ЭБУ по тому же порту (FTDI TX → Rx блока)
             try:
