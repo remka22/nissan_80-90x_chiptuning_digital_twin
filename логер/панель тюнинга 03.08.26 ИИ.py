@@ -26,7 +26,8 @@ LABELS = [
     (0x1482, "Нагрузка (сглаж.)",     8, "сырьё (/8=TP)",      None),
     (0x1413, "Расход мгновенный",     8, "сырьё (гэп→транзит)", None),  # $1413−$1482 = газовка
     (0x1431, "ALPHA",                 8, "× (100=1.0)",        0.01),
-    (0x1411, "Впрыск факт",          16, "мс",                 0.005),  # $142A×$1413+deadtime
+    (0x1411, "Впрыск расчёт",        16, "мс(до UPP)",         0.005),  # $142A×$1413+deadtime, ДО масштаба
+    (0x004D, "Впрыск РЕАЛ (форс)",   16, "мс",                 0.005),  # $004D→UPP-каналы, тик 5мкс (датащит)
     # --- ДРОССЕЛЬ (TPS) ---
     (0x1492, "TPS дроссель",         16, "сырьё 10б",          None),   # аналог. дроссель, ch6
     (0x14A2, "TPS открытие",          8, "%",                  0.581395),  # 172=100% (span 344/2)
@@ -67,6 +68,7 @@ NARROW_MAP = [
     0x0015, 0x0054, 0x142C,
     0x14A2, 0x14DE, 0x14DF, 0x00B9, 0x00AE,
     0x00F8, 0x00F9,
+    0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.005=мс, тик 5мкс датащит)
     0x1600,   # RX-тест: последний принятый по SCI байт
 ]
 
@@ -202,6 +204,8 @@ def load_tables(path):
         "fuel": rd(0x7D00, 256), "fuel_rax": rd(0x7B00, 16), "fuel_cax": rd(0x7AF0, 16),
         "ign":  rd(0x7C00, 256), "ign_rax":  rd(0x7B20, 16), "ign_cax":  rd(0x7B10, 16),
     }
+    kk = rd(0x7F2B, 2); t["k"] = (kk[0] << 8) | kk[1]   # форсуночная K ($7F2B)
+    t["km"] = rd(0x4A12, 1)[0]                          # КМ ($4A12, ДАД масштаб уровня)
     # ДАД speed-density: хук 89D8 = JSR C700 (файл 0x09D8). VE @ C900, ось давл @ CA00.
     dad = (b[0x09D8] == 0xBD and b[0x09D9] == 0xC7 and b[0x09DA] == 0x00)
     t["dad"] = dad
@@ -253,7 +257,8 @@ def nearest_idx(val, axis):   # индекс ближайшей точки ос�
 LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": None, "t0": 0}
 # колонки = ВСЁ: время + все декодированные сигналы (LABELS) + вычисленные (производные)
 LOG_HEADER = (["время_с"] + [nm for (_a, nm, _f, _u, _m) in LABELS] +
-              ["УОЗ_°BTDC", "TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа"])
+              ["УОЗ_°BTDC", "TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа",
+               "Загрузка_форс_%", "K_форс", "КМ"])
 
 
 def _log_row():
@@ -265,9 +270,14 @@ def _log_row():
         row.append(v["real"] if v["real"] is not None else g(v["val"]))
     # вычисленные производные
     tp = d["top"]
+    tb = load_tables(SEL["bin"]) or {}
+    # K/КМ: из ОЗУ если известны (онлайн-тюн), иначе из активного бина ($7F2B/$4A12)
+    k = STATE.get("k_ram") if STATE.get("k_ram") is not None else tb.get("k", "")
+    km = STATE.get("km_ram") if STATE.get("km_ram") is not None else tb.get("km", "")
     row += [g(tp["uoz_deg"]),
             round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
-            g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["ve_corr"]), g(tp["press"])]
+            g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["ve_corr"]), g(tp["press"]),
+            g(tp.get("inj_duty")), g(k), g(km)]
     return row
 
 
@@ -528,6 +538,11 @@ def snapshot():
         "uoz_deg": (70 - ram[0x140F]) if 0x140F in ram else None,
         "afr_fact": wbl["afr"], "press": None, "ve_corr": None,
     }
+    # ТОЧНАЯ загрузка форсунок: РЕАЛЬНЫЙ впрыск $004D (в UPP) × 0.005мс (тик 5мкс, датащит HD63140) × об / 1200
+    inj_raw = w(0x004D)
+    inj_ms = inj_raw * 0.005 if inj_raw is not None else None
+    top["inj_ms"] = round(inj_ms, 2) if inj_ms is not None else None
+    top["inj_duty"] = round(inj_ms * top["rpm"] / 1200, 1) if (inj_ms is not None and top["rpm"]) else None
     t = load_tables(SEL["bin"])
     fuel_out = ign_out = ve_out = ktps_out = None
     top["is_dad"] = bool(t and t.get("dad"))
@@ -789,7 +804,8 @@ function setHL(prefix,hr,hc){
 // ---- левая таблица логируемых (стики в топе, значение+ед./у.е./сырьё) ----
 // СТИКИ-ТОП = HUD из d.top (человеческие значения), не сырые АЦП
 const TOP=[['Обороты','rpm',''],['Нагрузка','tp',''],['Темп ОЖ','temp',''],['ALPHA','alpha',''],
-           ['AFR цель','afr_target',''],['AFR факт','afr_fact',''],['УОЗ','uoz_deg','°'],['Поправка VE','ve_corr','×']];
+           ['AFR цель','afr_target',''],['AFR факт','afr_fact',''],['УОЗ','uoz_deg','°'],
+           ['Впрыск мс','inj_ms',''],['Загрузка форс','inj_duty','%'],['Поправка VE','ve_corr','×']];
 let varsBuilt=0;
 function renderVars(vars,top){
  const tb=document.getElementById('vars');
