@@ -100,9 +100,17 @@ PROG = [
     (None,   "STABd", 0xF4),
     (None,   "BRA",   "RXCOPY"),
     ("RXCK6","CMPA#", 0xC6),          # маркер PEEK?
-    (None,   "BNE",   "RXCOPY"),      # не команда → игнор байта
+    (None,   "BNE",   "RXCK7"),       # не C6 → проверить C7/C8
     (None,   "LDAB#", 4),
     (None,   "STABd", 0xF4),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXCK7","CMPA#", 0xC7),          # C7 = выгрузить всё в тень (сток), карты→тень
+    (None,   "BNE",   "RXCK8"),
+    (None,   "JSR",   "DOC7"),
+    (None,   "BRA",   "RXCOPY"),
+    ("RXCK8","CMPA#", 0xC8),          # C8 = карты назад на ROM (A/B сравнение)
+    (None,   "BNE",   "RXCOPY"),      # неизвестный байт → игнор
+    (None,   "JSR",   "DOC8"),
     (None,   "BRA",   "RXCOPY"),
     ("RXS1", "CMPB#", 1),
     (None,   "BNE",   "RXS2"),
@@ -184,35 +192,118 @@ PROG = [
     ("DONE", "RTS",   None),
 ]
 
+# ---- v4 ТЕНЬ: раскладка ($1800-$1FFF, keep-alive, reset не чистит) ----
+SH_SS, SH_UOZ, SH_K, SH_GATE = 0x1800, 0x1900, 0x1A00, 0x1A02
+PTR_SS, PTR_UOZ = 0x1A10, 0x1A12
+MARKER = 0x1FFE                       # 2 байта: $1FFE=0xA5, $1FFF=0x5A
+ROM_SS, ROM_UOZ, ROM_K, ROM_GATE = 0xFD00, 0xFC00, 0xFF2B, 0xFF91
+
+# ---- Подпрограммы (ассемблируются за PROG): copy256, my_init, DOC7, DOC8 ----
+SUBS = [
+    # copy256: src=$F0:$F1, dst=$F2:$F3 → 256 байт (B=счётчик)
+    ("COPY256","CLRB", None),
+    ("C256L", "LDXd", 0xF0),
+    (None,    "ABX",  None),
+    (None,    "LDAAx",0x00),
+    (None,    "LDXd", 0xF2),
+    (None,    "ABX",  None),
+    (None,    "STAAx",0x00),
+    (None,    "INCB", None),
+    (None,    "BNE",  "C256L"),
+    (None,    "RTS",  None),
+    # my_init: reset-хук. cold(маркер нет) → указатели карт на ROM, скаляры сток, маркер
+    ("MYINIT","LDAAe",MARKER),
+    (None,    "CMPA#",0xA5),
+    (None,    "BNE",  "MICOLD"),
+    (None,    "LDAAe",MARKER + 1),
+    (None,    "CMPA#",0x5A),
+    (None,    "BEQ",  "MIWARM"),       # оба байта маркера совпали → warm, тюн держим
+    ("MICOLD","LDX#", ROM_SS),
+    (None,    "STXe", PTR_SS),         # ptr_сс = ROM
+    (None,    "LDX#", ROM_UOZ),
+    (None,    "STXe", PTR_UOZ),        # ptr_уоз = ROM
+    (None,    "LDDe", ROM_K),
+    (None,    "STDe", SH_K),           # K сток → тень
+    (None,    "LDAAe",ROM_GATE),
+    (None,    "STAAe",SH_GATE),        # гейт сток → тень
+    (None,    "LDAA#",0xA5),
+    (None,    "STAAe",MARKER),
+    (None,    "LDAA#",0x5A),
+    (None,    "STAAe",MARKER + 1),
+    ("MIWARM","JMPe", 0xB0E2),         # → главный цикл
+    # DOC7: выгрузить всё в тень (сток) + карты-указатели на тень
+    ("DOC7",  "LDX#", ROM_SS),
+    (None,    "STXd", 0xF0),
+    (None,    "LDX#", SH_SS),
+    (None,    "STXd", 0xF2),
+    (None,    "JSR",  "COPY256"),      # сс ROM→тень
+    (None,    "LDX#", SH_SS),
+    (None,    "STXe", PTR_SS),         # ptr_сс = тень
+    (None,    "LDX#", ROM_UOZ),
+    (None,    "STXd", 0xF0),
+    (None,    "LDX#", SH_UOZ),
+    (None,    "STXd", 0xF2),
+    (None,    "JSR",  "COPY256"),      # уоз ROM→тень
+    (None,    "LDX#", SH_UOZ),
+    (None,    "STXe", PTR_UOZ),        # ptr_уоз = тень
+    (None,    "LDDe", ROM_K),
+    (None,    "STDe", SH_K),
+    (None,    "LDAAe",ROM_GATE),
+    (None,    "STAAe",SH_GATE),
+    (None,    "RTS",  None),
+    # DOC8: карты-указатели назад на ROM (A/B сравнение)
+    ("DOC8",  "LDX#", ROM_SS),
+    (None,    "STXe", PTR_SS),
+    (None,    "LDX#", ROM_UOZ),
+    (None,    "STXe", PTR_UOZ),
+    (None,    "RTS",  None),
+]
+
+# ---- In-place патчи заводского кода (редиректы + reset-хуки) ----
+# (cpu_addr, ожидаемые_СТАРЫЕ_байты, новые_байты | "MYINIT")
+INPLACE = [
+    (0xB49E, [0xCE,0xFD,0x00], [0xFE, PTR_SS >> 8, PTR_SS & 0xFF]),   # сс: LDX #FD00 → LDX $1A10
+    (0xB728, [0xCE,0xFC,0x00], [0xFE, PTR_UOZ >> 8, PTR_UOZ & 0xFF]), # уоз: LDX #FC00 → LDX $1A12
+    (0x89BB, [0xFC,0xFF,0x2B], [0xFC, SH_K >> 8, SH_K & 0xFF]),       # K: LDD FF2B → LDD $1A00
+    (0xC330, [0xFC,0xFF,0x2B], [0xFC, SH_K >> 8, SH_K & 0xFF]),       # K (2-й сайт)
+    (0x966B, [0xB1,0xFF,0x91], [0xB1, SH_GATE >> 8, SH_GATE & 0xFF]), # гейт: CMPA FF91 → CMPA $1A02
+    (0xAE4E, [0x7E,0xB0,0xE2], "MYINIT"),                            # reset JMP b0e2 → JMP my_init
+    (0xAE5B, [0x7E,0xB0,0xE2], "MYINIT"),
+]
+
 LEN = {"JSR":3,"LDAAd":2,"LDAA#":2,"LDAAx":2,"LDABd":2,"LDXx":2,"LDX#":3,"BITA#":2,
        "CMPB#":2,"CMPA#":2,"LDAB#":2,"SUBB#":2,"ASLB":1,"ABX":1,"STAAd":2,"STAAe":3,"STABd":2,"STAAx":2,"LDXd":2,"EORAd":2,"CLRe":3,"INCe":3,
+       "CLRB":1,"INCB":1,"LDAAe":3,"STXe":3,"STXd":2,"LDDe":3,"STDe":3,"JMPe":3,
        "PSHA":1,"PULA":1,"OIMd":3,"RTS":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2}
 BR = {"BNE":0x26,"BEQ":0x27,"BCC":0x24,"BCS":0x25,"BRA":0x20}
 
 
 def assemble(org):
-    # длина кода
-    code_len = sum(LEN[op] for _, op, _ in PROG)
+    CODE = PROG + SUBS
+    code_len = sum(LEN[op] for _, op, _ in CODE)
     addrtbl = org + code_len
     const2t = addrtbl + 2 * len(ADDR_LIST)
     datalabels = {"ADDRTBL": addrtbl, "CONST2T": const2t}
-    # метки кода
+    # метки кода (PROG + подпрограммы SUBS)
     labels = {}; pc = org
-    for lab, op, arg in PROG:
+    for lab, op, arg in CODE:
         if lab: labels[lab] = pc
         pc += LEN[op]
+    alllab = dict(datalabels); alllab.update(labels)   # имена для JSR/LDX#
     # сборка кода
     out = bytearray(); pc = org
-    for lab, op, arg in PROG:
+    for lab, op, arg in CODE:
         nxt = pc + LEN[op]
-        if   op == "JSR":   out += bytes([0xBD, arg >> 8, arg & 0xFF])
+        if   op == "JSR":
+            a = alllab[arg] if isinstance(arg, str) else arg
+            out += bytes([0xBD, a >> 8, a & 0xFF])
         elif op == "LDAA#": out += bytes([0x86, arg & 0xFF])
         elif op == "LDAAd": out += bytes([0x96, arg & 0xFF])
         elif op == "LDAAx": out += bytes([0xA6, arg & 0xFF])
         elif op == "LDABd": out += bytes([0xD6, arg & 0xFF])
         elif op == "LDXx":  out += bytes([0xEE, arg & 0xFF])
         elif op == "LDX#":
-            a = datalabels[arg] if isinstance(arg, str) else arg
+            a = alllab[arg] if isinstance(arg, str) else arg
             out += bytes([0xCE, a >> 8, a & 0xFF])
         elif op == "BITA#": out += bytes([0x85, arg & 0xFF])
         elif op == "CMPB#": out += bytes([0xC1, arg & 0xFF])
@@ -229,6 +320,14 @@ def assemble(org):
         elif op == "EORAd": out += bytes([0x98, arg & 0xFF])
         elif op == "CLRe":  out += bytes([0x7F, arg >> 8, arg & 0xFF])
         elif op == "INCe":  out += bytes([0x7C, arg >> 8, arg & 0xFF])
+        elif op == "CLRB":  out += bytes([0x5F])
+        elif op == "INCB":  out += bytes([0x5C])
+        elif op == "LDAAe": out += bytes([0xB6, arg >> 8, arg & 0xFF])
+        elif op == "STXe":  out += bytes([0xFF, arg >> 8, arg & 0xFF])
+        elif op == "STXd":  out += bytes([0xDF, arg & 0xFF])
+        elif op == "LDDe":  out += bytes([0xFC, arg >> 8, arg & 0xFF])
+        elif op == "STDe":  out += bytes([0xFD, arg >> 8, arg & 0xFF])
+        elif op == "JMPe":  out += bytes([0x7E, arg >> 8, arg & 0xFF])
         elif op == "PSHA":  out += bytes([0x36])
         elif op == "PULA":  out += bytes([0x32])
         elif op == "OIMd":  out += bytes([0x72, arg[0], arg[1]])
@@ -245,19 +344,28 @@ def assemble(org):
     for a in ADDR_LIST:
         out += bytes([a >> 8, a & 0xFF])
     out += bytes(CONST2)
-    return out, addrtbl, const2t
+    return out, addrtbl, const2t, labels
 
 
 def main():
     rom = bytearray(open(SRC, "rb").read()); assert len(rom) == 32768
-    code, addrtbl, const2t = assemble(CODE_ORG)
+    code, addrtbl, const2t, labels = assemble(CODE_ORG)
     off = CODE_ORG - ROM_BASE
-    assert len(code) <= 0x180, "не влезает в C600-C77F"
+    assert len(code) <= 0x200, "не влезает в C600-C7FF"
     hoff = HOOK_CPU - ROM_BASE
     tgt = rom[hoff + 1] << 8 | rom[hoff + 2]
     assert rom[hoff] == 0xBD and tgt in (ORIG_CALL, CODE_ORG), "по 83F8 не JSR A99B/C600"
     rom[off:off + len(code)] = code
     rom[hoff + 1], rom[hoff + 2] = CODE_ORG >> 8, CODE_ORG & 0xFF
+    # in-place патчи заводского кода (редиректы + reset-хуки) с проверкой СТАРЫХ байт
+    myinit = labels["MYINIT"]
+    for cpu, oldb, newb in INPLACE:
+        o = cpu - ROM_BASE
+        cur = list(rom[o:o + len(oldb)])
+        assert cur == oldb, "in-place %04X: ожидал %s, в бине %s" % (cpu, [hex(b) for b in oldb], [hex(b) for b in cur])
+        nb = [0x7E, myinit >> 8, myinit & 0xFF] if newb == "MYINIT" else newb
+        rom[o:o + len(nb)] = bytes(nb)
+    print("  my_init @ %04X; in-place патчей: %d" % (myinit, len(INPLACE)))
     # чек-сумма
     s = x = 0
     for i in range(len(rom)):

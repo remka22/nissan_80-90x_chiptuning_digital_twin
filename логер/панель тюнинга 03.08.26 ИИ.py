@@ -228,6 +228,19 @@ def deg_of(x):        # значение карты угла → градусы 
     return x if x < 90 else None
 
 
+# ---- ОНЛАЙН-тюнинг: тень карт в ОЗУ (v4) ----
+SHADOW = {"fuel": 0x1800, "ign": 0x1900}   # адрес тени в ОЗУ (см. build_targeted_patch)
+BINOFF = {"fuel": 0x7D00, "ign": 0x7C00}   # смещение карты в файле бина
+
+
+def recalc_checksum(b):
+    s = x = 0
+    for i in range(len(b)):
+        if i in (0x7F7A, 0x7F7B): continue
+        s = (s + b[i]) & 0xFF; x ^= b[i]
+    b[0x7F7A], b[0x7F7B] = s, x
+
+
 def nearest_idx(val, axis):   # индекс ближайшей точки оси (сырьё vs сырьё)
     best, bd = 0, 1e18
     for i, a in enumerate(axis):
@@ -273,7 +286,8 @@ def log_start():
     if LOGST["on"]:
         return True, os.path.basename(LOGST["path"])
     d = os.path.join(HERE, "логи"); os.makedirs(d, exist_ok=True)
-    fn = os.path.join(d, "лог_" + datetime.now().strftime("%Y%m%d_%H%M%S") + " ИИ.csv")
+    bn = os.path.splitext(os.path.basename(SEL["bin"]))[0] if SEL.get("bin") else "нобин"
+    fn = os.path.join(d, "лог_" + bn + "_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv")
     f = open(fn, "w", encoding="utf-8-sig")
     f.write(";".join(LOG_HEADER) + "\n"); f.flush()
     LOGST.update(on=True, path=fn, n=0, f=f, t0=time.time())
@@ -442,6 +456,8 @@ def do_start(port, baud):
         th = threading.Thread(target=reader_loop, args=(ser, stop_ev, fname), daemon=True)
         CTRL["thread"] = th; CTRL["stop"] = stop_ev; CTRL["ser"] = ser
         th.start()
+        try: log_start()          # автолог стартует вместе с подключением ЭБУ
+        except Exception: pass
         return True, ""
 
 
@@ -450,6 +466,8 @@ def do_stop():
         if CTRL["stop"]: CTRL["stop"].set()
         if CTRL["thread"]: CTRL["thread"].join(timeout=1.0)
         CTRL["thread"] = None; CTRL["stop"] = None; CTRL["ser"] = None
+    try: log_stop()               # лог закрывается при отключении ЭБУ
+    except Exception: pass
     with LOCK: STATE["running"] = False
     return True
 
@@ -668,158 +686,93 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  body.light table.map td.flag{color:#8a5a10}
  .themebox{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
  header .themebox{float:right;color:inherit;font-weight:600}
+ /* ---- новая практическая страница ---- */
+ #ctrlbar{display:flex;gap:18px;align-items:center;flex-wrap:wrap;padding:8px 14px;border-bottom:2px solid #2a3340;position:sticky;top:0;z-index:20;background:inherit}
+ .cgrp{display:flex;gap:6px;align-items:center}
+ .clbl{font-size:13px;color:#8aa;font-weight:600}
+ .stat{font-size:16px;line-height:1}
+ .stat.ok{color:#2ecc40}.stat.warn{color:#ffcf33}.stat.err{color:#ff4136}.stat.none{color:#77808a}
+ #page.locked{opacity:.35;pointer-events:none;filter:grayscale(.6)}
+ .split{display:flex;gap:12px;padding:10px;align-items:flex-start}
+ .leftcol{width:30%;min-width:260px;max-height:calc(100vh - 70px);overflow:auto;border:1px solid #2a3340;border-radius:8px}
+ .rightcol{width:70%;flex:1;max-height:calc(100vh - 70px);overflow:auto}
+ .logtab{width:100%;border-collapse:collapse;font-size:14px}
+ .logtab th{position:sticky;top:0;background:#1b2129;text-align:left;padding:6px 8px;border-bottom:1px solid #2a3340}
+ .logtab td{padding:5px 8px;border-bottom:1px solid #222a33}
+ .logtab tr.sticky{background:#182028}.logtab tr.sticky td:first-child{font-weight:700}
+ .logtab .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+ .logtab .unit{color:#8aa;font-size:12px;margin-left:4px}
+ .onlinebar{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+ .tobin{font-size:12px;margin-left:8px}
+ .rightcol .mapbox{margin-bottom:26px}
+ .rightcol .mapbox h2{margin:0 0 10px}
+ .ec{padding:0}
+ .ec input{width:100%;box-sizing:border-box;border:none;background:transparent;text-align:center;font:inherit;color:inherit;padding:3px 0}
+ .ec.ok{background:#123d1a}.ec.err{background:#4d1414}.ec.pend{background:#4d4413}
+ body.light .ec.ok{background:#c8f0d0}body.light .ec.err{background:#f5c6c6}body.light .ec.pend{background:#f5ecc0}
+ body.light #ctrlbar{background:#fff}body.light .logtab th{background:#eef2f6}body.light .logtab tr.sticky{background:#eaf3ff}
 </style></head><body class=light>
-<header><span class=themebox><input type=checkbox id=darkbox onchange=toggletheme()> &#127769; Тёмная тема</span><h1>&#128225; Панель логгера ЭБУ — что рассказывает блок</h1></header>
-
-<!-- ЛИПКИЙ ВЕРХ: лог-кнопки + строка живых параметров -->
-<div class=topstick>
-<div class=logbar>
- <button class=start id=logStart onclick=logstart()>&#9679; Старт лог</button>
- <button class=stop id=logStop onclick=logstop() disabled>&#9632; Стоп лог</button>
- <span class=st id=logst>лог выключен</span>
- <a class=dl href="/api/log/download" download>&#11015; CSV</a>
- <span class=st style="margin-left:auto">CSV = интерпретированные значения (5 Гц)</span>
-</div>
-<div class=hud id=hud>
- <div class=cell><div class=lbl>Обороты</div><div class="num na" id=t_rpm>—</div></div>
- <div class=cell><div class=lbl>Нагрузка</div><div class="num na" id=t_load>—</div></div>
- <div class=cell><div class=lbl>Темп сырьё</div><div class="num na" id=t_temp>—</div></div>
- <div class=cell><div class=lbl>ALPHA</div><div class="num na" id=t_alpha>—</div></div>
- <div class="cell tgt"><div class=lbl>AFR цель</div><div class="num na" id=t_tgt>—</div></div>
- <div class="cell fact"><div class=lbl>AFR факт</div><div class="num na" id=t_fact>—</div></div>
- <div class="cell uoz"><div class=lbl>УОЗ °BTDC</div><div class="num na" id=t_uoz>—</div></div>
- <div class="cell vec" id=cell_vec style="display:none"><div class=lbl>Поправка VE</div><div class="num na" id=t_vecorr>—</div></div>
-</div>
-</div>
-
-<!-- ПАНЕЛЬ ШДК (AFR факт) — свой порт, 9600 8N1 -->
-<div class=wblbar>
- <div class=fld><label>Порт ШДК</label><select id=wport></select></div>
- <button class=ghost onclick=loadPorts()>&#8635;</button>
- <button class=start id=wStart onclick=wstart()>&#9654; ШДК</button>
- <button class=stop id=wStop onclick=wstop() disabled>&#9632;</button>
- <div class=fld><label>сырьё ШДК (9600 8N1)</label><div class=raw id=wraw>— (нет данных)</div></div>
-</div>
-
-<!-- КАРТЫ смеси и угла из выбираемого бина (по умолч. v8-дамп), подсветка ячейки -->
-<div class=maps>
- <div style="width:100%;display:flex;gap:10px;align-items:end;flex-wrap:wrap">
-   <div class=fld><label>Бин для карт</label><select id=binsel onchange=selbin()></select></div>
-   <span id=nobinlbl style="color:#f33;font-weight:800;font-size:15px;display:none">&#9888; НЕ ВЫБРАНА ПРОШИВКА</span>
-   <span style="font-size:12px;color:#8aa">зелёная рамка = текущая ячейка (обороты×нагрузка)</span>
- </div>
- <div class=mapbox><h2>&#9819; Карта смеси (AFR) &nbsp;<span id=binlbl style="color:#678;font-weight:400"></span></h2><div id=fuelmap>—</div></div>
- <div class=mapbox><h2>&#9889; Карта угла (УОЗ, град)</h2><div id=ignmap>—</div></div>
- <div class=mapbox id=vebox style="display:none"><h2>&#127777; Карта VE (наполнение ×, 1.0=номинал) — ДАД</h2><div id=vemap>—</div></div>
- <div class=mapbox id=ktpsbox style="display:none"><h2>&#127919; Карта Ktps (× дроссель, 1.0=номинал) — ДАД</h2><div id=ktpsmap>—</div></div>
-</div>
-
-<div class=panel>
- <div class=fld><label>Порт</label><select id=port></select></div>
+<div id=ctrlbar>
+ <div class=cgrp><span class=clbl>Файл</span><select id=binsel onchange=selbin()></select><span class="stat none" id=binicon>&#9679;</span></div>
+ <div class=cgrp><span class=clbl>ЭБУ</span><select id=port onchange=ecuAuto()></select><span class="stat none" id=ecuicon>&#9679;</span></div>
+ <div class=cgrp><span class=clbl>ШДК</span><select id=wport onchange=wblAuto()></select><span class="stat none" id=wblicon>&#9679;</span></div>
  <button class=ghost onclick=loadPorts()>&#8635; порты</button>
- <div class=fld><label>Скорость</label>
-   <select id=baudsel onchange="document.getElementById('baud').value=this.value">
-     <option value=2000>2000 (v7 E/1024)</option>
-     <option value=15625 selected>15625 (v6 E/128)</option>
-     <option value=128000>128000 (v5 E/16)</option>
-     <option value=9600>9600</option><option value=115200>115200</option><option value=250000>250000</option>
-   </select></div>
- <div class=fld><label>или своё</label><input class=baud id=baud value=15625></div>
- <button class=start id=btnStart onclick=start()>&#9654; Старт</button>
- <button class=stop id=btnStop onclick=stop() disabled>&#9632; Стоп</button>
+ <span class=themebox style="margin-left:auto"><input type=checkbox id=darkbox onchange=toggletheme()> &#127769;</span>
 </div>
-<div class=panel style="border:1px solid #f80;border-radius:6px;padding:8px">
- <b style="color:#fa0">RX-тест приёма</b>
- <div class=fld><label>байт 0-255</label><input id=txbyte type=number min=0 max=255 value=170 style="width:80px"></div>
- <button class=ghost onclick=txsend()>&#9654; Отправить в ЭБУ</button>
- <label style="font-size:13px"><input type=checkbox id=txspam onchange=txspamtog()> спам (для замера напряжения)</label>
- <span id=txstat style="font-size:13px;color:#8aa"></span>
-</div>
-<div class=panel style="border:1px solid #6cf;border-radius:6px;padding:8px;flex-wrap:wrap">
- <b style="color:#6cf">POKE / PEEK / проба ОЗУ</b>
- <div class=fld><label>адрес hex</label><input id=pkaddr value=1600 style="width:70px"></div>
- <div class=fld><label>значение</label><input id=pkval type=number min=0 max=255 value=170 style="width:70px"></div>
- <button class=ghost onclick=pokeAddr()>Записать (poke)</button>
- <button class=ghost onclick=peekAddr()>Читать (peek)</button>
- <button class=ghost onclick=ramProbe()>Проба ОЗУ $1600-$1FFF</button>
- <button class=ghost style="border-color:#0b0;color:#0f0" onclick="sendCmd(0xC7)">&#9654; Выгрузить карты в тень (сток)</button>
- <button class=ghost style="border-color:#b80;color:#fb0" onclick="sendCmd(0xC8)">Назад на ROM (A/B)</button>
- <span id=pkstat style="font-size:13px;color:#8aa"></span>
- <pre id=probeout style="width:100%;max-height:140px;overflow:auto;font-size:12px;margin:4px 0 0"></pre>
-</div>
-<div id=banner class=off>остановлено</div>
-<div class=stats>
- <span>всего: <b id=total>0</b> б</span><span><b id=rate>0</b> б/с</span>
- <span>кадров: <b id=frames>0</b></span><span>битых: <b id=bad>0</b></span>
- <span>адресов ОЗУ: <b id=ramc>0</b></span><span>файл: <b id=file>—</b></span>
-</div>
-<div class=wrap>
- <div class=col>
-   <h2>&#128202; Расшифровка (сырые значения)</h2>
-   <table><thead><tr><th>Переменная</th><th>Адрес</th><th>Сырьё</th><th>Ед.</th><th>Реал</th></tr></thead>
-   <tbody id=vars></tbody></table>
+
+<div id=page class=locked>
+<div class=split>
+ <div class=leftcol>
+  <table class=logtab><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody id=vars></tbody></table>
  </div>
- <div class=col>
-   <h2>&#128190; Образ ОЗУ</h2>
-   <pre id=ram>—</pre>
+ <div class=rightcol>
+  <div class=onlinebar>
+   <button class=start id=btnOnline onclick=goOnline()>&#128246; ОНЛАЙН</button>
+   <button class=ghost id=btnSaveBin onclick=saveBin() style="display:none">&#128190; СОХРАНИТЬ БИН</button>
+   <span id=onstat class=st style="font-size:13px;color:#8aa"></span>
+  </div>
+  <div class=mapbox><h2>&#9819; Смесь (AFR) <button class=tobin id=tobin_fuel onclick="applyBin('fuel')" style="display:none">привести к бин</button></h2><div id=fuelmap>—</div></div>
+  <div class=mapbox><h2>&#9889; Угол (УОЗ, град) <button class=tobin id=tobin_ign onclick="applyBin('ign')" style="display:none">привести к бин</button></h2><div id=ignmap>—</div></div>
  </div>
 </div>
-<div class=foot><a class=dl href="/api/log/download" download>&#11015; Скачать CSV-лог</a></div>
+</div>
 <script>
+// ==== практическая страница тюнинга ====
+function setStat(id,st){const e=document.getElementById(id);if(e)e.className='stat '+st;}
 async function loadPorts(){
  try{const r=await fetch('/api/ports');const d=await r.json();
   for(const sid of ['port','wport']){
-    const busy = (sid==='port') ? d.wbl_port : d.ecu_port;  // исключить порт ДРУГОГО ридера
+    const busy=(sid==='port')?d.wbl_port:d.ecu_port;
     const s=document.getElementById(sid);const cur=s.value;s.innerHTML='';
-    d.ports.forEach(p=>{if(busy&&p.device===busy)return;   // занят другим — не показываем
-      const o=document.createElement('option');o.value=p.device;
-      o.textContent=p.device+(p.ftdi?' (FTDI)':'');s.appendChild(o);});
-    if(cur&&cur!==busy)s.value=cur; else if(sid==='port'&&d.suggested&&d.suggested!==busy)s.value=d.suggested;
+    const ph=document.createElement('option');ph.value='';ph.textContent='— порт —';s.appendChild(ph);
+    d.ports.forEach(p=>{if(busy&&p.device===busy)return;
+      const o=document.createElement('option');o.value=p.device;o.textContent=p.device+(p.ftdi?' (FTDI)':'');s.appendChild(o);});
+    if(cur&&cur!==busy)s.value=cur;
+    else if(sid==='port'&&d.suggested&&d.suggested!==busy&&!s.value)s.value=d.suggested;
   }}catch(e){}
 }
 async function loadBins(){
  try{const r=await fetch('/api/bins');const d=await r.json();
   const s=document.getElementById('binsel');s.innerHTML='';
-  const ph=document.createElement('option');ph.value='';ph.textContent='— выберите прошивку —';s.appendChild(ph);
+  const ph=document.createElement('option');ph.value='';ph.textContent='— выбери бин —';s.appendChild(ph);
   d.bins.forEach(b=>{const o=document.createElement('option');o.value=b.path;o.textContent=b.name;s.appendChild(o);});
-  s.value=d.selected||'';
-  updBinLbl(s.value);}catch(e){}
+  s.value=d.selected||'';binLock();}catch(e){}
 }
-function updBinLbl(v){const l=document.getElementById('nobinlbl');if(l)l.style.display=v?'none':'';}
+function binLock(){const has=!!document.getElementById('binsel').value;
+ document.getElementById('page').classList.toggle('locked',!has);
+ setStat('binicon',has?'ok':'none');}
 async function selbin(){const p=document.getElementById('binsel').value;
- await fetch('/api/selectbin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bin:p})});mapBin=null;updBinLbl(p);}
-async function txsend(){const v=parseInt(document.getElementById('txbyte').value)||0;
- try{const r=await fetch('/api/tx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({byte:v})});
-  const d=await r.json();
-  document.getElementById('txstat').textContent=d.ok?('отправлен '+v+' → жди в «RX-тест приём»'):('ошибка: '+d.error);
- }catch(e){document.getElementById('txstat').textContent='ошибка сети';}}
-function txspamtog(){const on=document.getElementById('txspam').checked;
- const v=parseInt(document.getElementById('txbyte').value)||0;
- fetch('/api/tx/hold',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:on,byte:v})});
- document.getElementById('txstat').textContent=on?('ПОТОК '+v+' → мерь ногу Rx (байт 0 = должна упасть до ~0.5-1В)'):'поток стоп';}
-function hx(v){return parseInt(v,16)||0;}
-async function sendCmd(b){const r=await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({byte:b})});const d=await r.json();
- document.getElementById('pkstat').textContent=d.ok?('команда 0x'+b.toString(16)+' отправлена ✓'):('ошибка: '+d.error);}
-async function pokeAddr(){const a=hx(document.getElementById('pkaddr').value),v=parseInt(document.getElementById('pkval').value)||0;
- const r=await fetch('/api/poke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addr:a,val:v})});const d=await r.json();
- document.getElementById('pkstat').textContent=d.ok?('poke $'+a.toString(16)+' = '+v):('ошибка: '+d.error);}
-async function peekAddr(){const a=hx(document.getElementById('pkaddr').value);
- const r=await fetch('/api/peek',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addr:a})});const d=await r.json();
- document.getElementById('pkstat').textContent=d.ok?('peek $'+a.toString(16)+' → смотри «peek ($1600)» в таблице'):('ошибка: '+d.error);}
-async function ramProbe(){const addrs=[];for(let a=0x1600;a<=0x1FFF;a+=64)addrs.push(a);
- document.getElementById('pkstat').textContent='проба... ~20с, МОТОР ЗАГЛУШЁН!';
- const r=await fetch('/api/ramprobe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({addrs:addrs})});const d=await r.json();
- if(!d.ok){document.getElementById('pkstat').textContent='ошибка: '+d.error;return;}
- let top=null,out='';d.res.forEach(x=>{let st=x.skip?('SKIP '+x.skip):(x.ram?'ОЗУ ✓':'—');if(x.ram)top=x.addr;out+='$'+x.addr.toString(16)+': '+st+'\n';});
- document.getElementById('probeout').textContent=out;
- document.getElementById('pkstat').textContent=top?('верх живого ОЗУ ≈ $'+top.toString(16)):'ОЗУ в диапазоне не найдено';}
-async function wstart(){const port=document.getElementById('wport').value;
- if(!port){alert('Порт ШДК не выбран');return;}
- const r=await fetch('/api/wbl/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port})});
- const d=await r.json();if(!d.ok)alert('ШДК не удалось: '+d.error);loadPorts();}
-async function wstop(){await fetch('/api/wbl/stop',{method:'POST'});loadPorts();}
-async function logstart(){await fetch('/api/log/start',{method:'POST'});}
-async function logstop(){await fetch('/api/log/stop',{method:'POST'});}
+ await fetch('/api/selectbin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bin:p})});
+ mapBin=null;binLock();
+ if(p&&document.getElementById('port').value)ecuAuto();}
+// автоподключение по выбору порта (бод известен = 15625)
+async function ecuAuto(){const port=document.getElementById('port').value;
+ if(!port){await fetch('/api/stop',{method:'POST'});return;}
+ await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:port,baud:15625})});}
+async function wblAuto(){const port=document.getElementById('wport').value;
+ if(!port){await fetch('/api/wbl/stop',{method:'POST'});return;}
+ await fetch('/api/wbl/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:port})});}
+// ---- карты + бегунок ----
 let mapBin=null,hlIds={fuel:null,ign:null};
 function renderMap(m,prefix){
  let h='<table class=map><tr><th class=corner>об\\нагр</th>';
@@ -833,90 +786,115 @@ function renderMap(m,prefix){
 function setHL(prefix,hr,hc){
  if(hlIds[prefix]){const e=document.getElementById(hlIds[prefix]);if(e)e.classList.remove('hl');hlIds[prefix]=null;}
  if(hr>=0&&hc>=0){const id=prefix+'_'+hr+'_'+hc;const e=document.getElementById(id);if(e){e.classList.add('hl');hlIds[prefix]=id;}}}
-function setNum(id,val,suf){const e=document.getElementById(id);
- const t=(val===null||val===undefined)?'—':(val+(suf||''));
- if(e.textContent!==t)e.textContent=t;
- e.classList.toggle('na',val===null||val===undefined);}
+// ---- левая таблица логируемых (стики в топе, значение+ед./у.е./сырьё) ----
+// СТИКИ-ТОП = HUD из d.top (человеческие значения), не сырые АЦП
+const TOP=[['Обороты','rpm',''],['Нагрузка','tp',''],['Темп ОЖ','temp',''],['ALPHA','alpha',''],
+           ['AFR цель','afr_target',''],['AFR факт','afr_fact',''],['УОЗ','uoz_deg','°'],['Поправка VE','ve_corr','×']];
 let varsBuilt=0;
-function renderVars(vars){
+function renderVars(vars,top){
  const tb=document.getElementById('vars');
- if(varsBuilt!==vars.length){  // строим скелет ОДИН раз (имя/адрес/ед. статичны — копируй свободно)
+ if(varsBuilt!==vars.length){
   let h='';
-  for(let i=0;i<vars.length;i++){const v=vars[i];
-   h+='<tr><td>'+v.name+'</td><td class=a>'+v.addr+'</td><td id=vv'+i+'></td><td class=u>'+v.unit+'</td><td id=vr'+i+'></td></tr>';}
-  tb.innerHTML=h;varsBuilt=vars.length;
- }
- for(let i=0;i<vars.length;i++){const v=vars[i];  // обновляем ТОЛЬКО значения, и только если изменились
-  const cv=document.getElementById('vv'+i),cr=document.getElementById('vr'+i);
-  const sv=(v.val===null)?'—':(''+v.val), sr=(v.real===null)?'—':(''+v.real);
-  if(cv.textContent!==sv){cv.textContent=sv;cv.className=(v.val===null)?'na':'v';}
-  if(cr.textContent!==sr){cr.textContent=sr;cr.className=(v.real===null)?'na':'r';}
+  TOP.forEach((t,j)=>{h+='<tr class=sticky><td>'+t[0]+'</td><td class=val id=tv'+j+'></td></tr>';});
+  for(let i=0;i<vars.length;i++){h+='<tr><td>'+vars[i].name+'</td><td class=val id=vv'+i+'></td></tr>';}
+  tb.innerHTML=h;varsBuilt=vars.length;}
+ TOP.forEach((t,j)=>{const c=document.getElementById('tv'+j);
+  const v=(top&&top[t[1]]!=null)?(top[t[1]]+t[2]):'—';
+  if(c.textContent!==v)c.textContent=v;});
+ for(let i=0;i<vars.length;i++){const v=vars[i];const c=document.getElementById('vv'+i);
+  let disp;
+  if(v.val===null)disp='—';
+  else if(v.real!==null)disp=v.real+' <span class=unit>'+(v.unit||'у.е.')+'</span>';
+  else disp=v.val+' <span class=unit>('+(v.unit||'у.е.')+', сырьё)</span>';
+  if(c.dataset.d!==disp){c.innerHTML=disp;c.dataset.d=disp;}
  }}
-async function start(){const port=document.getElementById('port').value;const baud=document.getElementById('baud').value;
- if(!port){alert('Порт не выбран');return;}
- const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port,baud})});
- const d=await r.json();if(!d.ok)alert('Не удалось: '+d.error);loadPorts();}
-async function stop(){await fetch('/api/stop',{method:'POST'});loadPorts();}
+// ---- ОНЛАЙН: вычит теней из проца, правка ячеек → poke, сохранение ----
+let online=false,editRendered=false;const ONLINE={fuel:null,ign:null},AX={};
+// защита от потери прогресса: состояние онлайна в память браузера
+function saveProg(){try{localStorage.setItem('j30online',JSON.stringify({on:online,fuel:ONLINE.fuel,ign:ONLINE.ign}));}catch(_){}}
+function loadProg(){try{const s=JSON.parse(localStorage.getItem('j30online')||'null');
+ if(s&&s.on&&s.fuel){online=true;ONLINE.fuel=s.fuel;ONLINE.ign=s.ign;editRendered=false;
+  const b=document.getElementById('btnOnline');if(b)b.classList.add('on');
+  document.getElementById('btnSaveBin').style.display='';
+  document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+  document.getElementById('onstat').textContent='ОНЛАЙН восстановлен из памяти браузера — прогресс не потерян';}}catch(_){}}
+// байт↔физика (как в редакторе). Смесь: 2 кластера AFR; угол: байт=градусы
+function afrOf(x){return (x>=128)?Math.round(188160/(x-64))/100:Math.round(188160/(x+128))/100;}
+function afrToByte(afr,cur){  // остаёмся в кластере текущего байта, чтоб не прыгать кодировку
+ let b=(cur>=128)?Math.round(1881.6/afr+64):Math.round(1881.6/afr-128);
+ return Math.max(0,Math.min(255,b));}
+function physOf(which,b){return (which==='fuel')?afrOf(b):b;}   // угол: байт=градусы
+function renderEdit(which){
+ const arr=ONLINE[which],ax=AX[which];if(!arr||!ax)return;
+ let h='<table class=map><tr><th class=corner>об\\нагр</th>';
+ for(const c of ax.cols)h+='<th>'+c+'</th>';h+='</tr>';
+ for(let r=0;r<16;r++){h+='<tr><th>'+ax.rows[r]+'</th>';
+  for(let c=0;c<16;c++){const idx=r*16+c,b=arr[idx];
+   h+='<td id='+which+'_'+r+'_'+c+' class=ec title="байт '+b+'"><input value="'+physOf(which,b)+'" onchange="cellEdit(\''+which+'\','+idx+',this)"></td>';}
+  h+='</tr>';}
+ document.getElementById(which==='fuel'?'fuelmap':'ignmap').innerHTML=h+'</table>';}
+async function cellEdit(which,idx,el){
+ let val=parseFloat(el.value);
+ if(isNaN(val)){el.value=physOf(which,ONLINE[which][idx]);return;}
+ // ФИЗИКА → БАЙТ (смесь=AFR, угол=градусы)
+ let byte=(which==='fuel')?afrToByte(val,ONLINE[which][idx]):Math.max(0,Math.min(255,Math.round(val)));
+ const td=el.parentNode;td.classList.remove('ok','err');td.classList.add('pend');
+ const r=await fetch('/api/pokecell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:which,idx:idx,val:byte})});
+ const d=await r.json();td.classList.remove('pend');
+ if(d.ok&&d.applied){ONLINE[which][idx]=byte;saveProg();td.classList.add('ok');td.title='байт '+byte;el.value=physOf(which,byte);}
+ else{td.classList.add('err');td.title='НЕ применилось: в проце '+d.readback;}}
+async function goOnline(){
+ const o=document.getElementById('onstat');
+ if(!online){o.textContent='выгрузка карт в тень (C7, стоком)...';
+  await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({byte:0xC7})});}
+ else o.textContent='перечитываю тени из проца (БЕЗ сброса тюна)...';
+ online=true;document.getElementById('btnOnline').classList.add('on');editRendered=true;
+ for(const w of ['fuel','ign']){
+  o.textContent='вычит '+(w==='fuel'?'смеси':'угла')+' из проца, ~90с...';
+  const r=await fetch('/api/readtable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
+  const d=await r.json();
+  if(d.ok){ONLINE[w]=d.cells;renderEdit(w);}else{o.textContent='ошибка вычита: '+d.error;return;}
+ }
+ document.getElementById('btnSaveBin').style.display='';
+ document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+ saveProg();
+ o.textContent='ОНЛАЙН: правь ячейку → уходит в прошивку сразу (зелёная=применилось, красная=нет)';}
+async function saveBin(){
+ const r=await fetch('/api/savebin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fuel:ONLINE.fuel,ign:ONLINE.ign})});
+ const d=await r.json();
+ document.getElementById('onstat').textContent=d.ok?('сохранено: '+d.name):('ошибка: '+(d.error||''));}
+async function applyBin(which){
+ const o=document.getElementById('onstat');o.textContent='привожу '+which+' к бину...';
+ const r=await fetch('/api/applybin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:which})});
+ const d=await r.json();
+ if(d.ok){ONLINE[which]=d.cells;saveProg();renderEdit(which);o.textContent=which+' приведён к бину ✓';}
+ else o.textContent='ошибка: '+d.error;}
+// ---- тик ----
 function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
- // блокировка ПАР кнопок ПЕРВЫМ делом (до отрисовки, чтоб не сорвалось при ошибке ниже)
- const _wb=d.wbl||{}, _lg=d.log||{};
- document.getElementById('btnStart').disabled=!!d.running; document.getElementById('btnStop').disabled=!d.running;
- document.getElementById('wStart').disabled=!!_wb.running;  document.getElementById('wStop').disabled=!_wb.running;
- document.getElementById('logStart').disabled=!!_lg.on;     document.getElementById('logStop').disabled=!_lg.on;
- const b=document.getElementById('banner');
- if(d.error){b.className='err';b.textContent='ОШИБКА: '+d.error;}
- else if(d.running&&d.rate>0){b.className='live';b.textContent='● ПОТОК ИДЁТ ('+d.port+' @ '+d.baud+')';}
- else if(d.running){b.className='quiet';b.textContent='порт открыт, байт нет';}
- else{b.className='off';b.textContent='остановлено';}
- document.getElementById('total').textContent=d.total;document.getElementById('rate').textContent=d.rate;
- document.getElementById('frames').textContent=d.frames;document.getElementById('bad').textContent=d.bad;
- document.getElementById('ramc').textContent=d.ram_count;document.getElementById('file').textContent=d.file_short||'—';
- renderVars(d.vars);
- const rt=(d.ram_lines&&d.ram_lines.length)?d.ram_lines.join('\n'):'— (ждём кадры)';
- const re=document.getElementById('ram'); if(re.textContent!==rt)re.textContent=rt;
- document.getElementById('btnStart').disabled=d.running;document.getElementById('btnStop').disabled=!d.running;
- // верхняя строка
- const tp=d.top||{};
- setNum('t_rpm',tp.rpm);setNum('t_load',tp.tp);setNum('t_temp',tp.temp);setNum('t_alpha',tp.alpha);
- setNum('t_tgt',tp.afr_target);setNum('t_fact',tp.afr_fact);setNum('t_uoz',tp.uoz_deg,'°');
- // сырьё ШДК
+ const portSel=document.getElementById('port').value, wportSel=document.getElementById('wport').value;
+ setStat('ecuicon', d.error?'err':(!portSel?'none':(d.running&&d.rate>0?'ok':'warn')));
  const wb=d.wbl||{};
- document.getElementById('wraw').textContent=(wb.raw&&wb.raw.length)?(wb.raw+'   ['+(wb.hex||'')+']'):(wb.error?('ошибка: '+wb.error):(wb.running?'порт открыт, байт нет':'— (нет данных)'));
- document.getElementById('wStart').disabled=wb.running;document.getElementById('wStop').disabled=!wb.running;
- // карты (перестраиваем при смене бина, подсветку двигаем каждый тик)
+ setStat('wblicon', wb.error?'err':(!wportSel?'none':(wb.running&&(wb.afr!=null||(wb.raw&&wb.raw.length>2))?'ok':'warn')));
+ // ОНЛАЙН доступен только когда ЭБУ реально стримит
+ const conn=d.running&&d.rate>0;
+ const bo=document.getElementById('btnOnline'); if(bo)bo.disabled=!conn&&!online;
+ renderVars(d.vars||[], d.top||{});
  if(d.fuel&&d.ign){
-  if(mapBin!==d.bin){
+  AX.fuel={rows:d.fuel.rows,cols:d.fuel.cols};AX.ign={rows:d.ign.rows,cols:d.ign.cols};
+  if(!online&&mapBin!==d.bin){  // в онлайне карты редактируемые — не затираем
    document.getElementById('fuelmap').innerHTML=renderMap(d.fuel,'fuel');
    document.getElementById('ignmap').innerHTML=renderMap(d.ign,'ign');
-   document.getElementById('binlbl').textContent=d.bin||'';
-   const vb=document.getElementById('vebox');
-   if(d.ve){document.getElementById('vemap').innerHTML=renderMap(d.ve,'ve');vb.style.display='';}
-   else vb.style.display='none';
-   const kb=document.getElementById('ktpsbox');
-   if(d.ktps){document.getElementById('ktpsmap').innerHTML=renderMap(d.ktps,'ktps');kb.style.display='';}
-   else kb.style.display='none';
-   mapBin=d.bin;hlIds={fuel:null,ign:null,ve:null,ktps:null};
-  }
+   mapBin=d.bin;hlIds={fuel:null,ign:null};}
+  // восстановление онлайна из памяти браузера: отрисовать редактируемые таблицы когда оси готовы
+  if(online&&ONLINE.fuel&&AX.fuel&&!editRendered){renderEdit('fuel');renderEdit('ign');editRendered=true;}
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
-  if(d.ve)setHL('ve',d.ve.hr,d.ve.hc);
-  if(d.ktps)setHL('ktps',d.ktps.hr,d.ktps.hc);
  }
- // ДАД: ячейка «Поправка VE»
- const cv=document.getElementById('cell_vec');
- if(tp.is_dad){cv.style.display='';setNum('t_vecorr',tp.ve_corr,'×');}else cv.style.display='none';
- // статус лога
- const lg=d.log||{};
- const ls=document.getElementById('logst');
- if(lg.on){ls.className='rec';ls.textContent='● ЗАПИСЬ ИДЁТ — '+(lg.file||'')+' ('+lg.n+' строк)';}
- else{ls.className='st';ls.textContent=lg.file?('остановлен: '+lg.file+' ('+lg.n+')'):'лог выключен';}
- document.getElementById('logStart').disabled=lg.on;document.getElementById('logStop').disabled=!lg.on;
 }).catch(e=>{}).finally(()=>setTimeout(tick,400));}
 function toggletheme(){const dark=document.getElementById('darkbox').checked;
  document.body.classList.toggle('light',!dark);
  try{localStorage.setItem('j30theme',dark?'dark':'light');}catch(_){}}
-// по умолчанию СВЕТЛАЯ (тёмная только если явно сохранена)
 try{if(localStorage.getItem('j30theme')=='dark'){document.body.classList.remove('light');document.getElementById('darkbox').checked=true;}}catch(_){}
-loadPorts();loadBins();tick();
+loadProg();loadPorts();loadBins();tick();
 </script></body></html>"""
 
 
@@ -995,6 +973,52 @@ class H(BaseHTTPRequestHandler):
                 if s: _send_cmd(s, [b]); self._json({"ok": True})
                 else: self._json({"ok": False, "error": "порт не открыт — Старт"})
             except Exception as e: self._json({"ok": False, "error": str(e)})
+            return
+        if self.path.startswith("/api/readtable"):
+            # ВЫЧИТ всей таблицы из проца через peek (256 ячеек, ~90с) — раз на вход в онлайн
+            which = data.get("which", "fuel"); s = CTRL.get("ser"); base = SHADOW.get(which)
+            if not s or base is None: self._json({"ok": False, "error": "нет ЭБУ/таблицы"}); return
+            cells = []
+            for i in range(256):
+                a = base + i
+                _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); v = _probe_wait(0x1600)
+                cells.append(v if v is not None else 0)
+            self._json({"ok": True, "which": which, "cells": cells}); return
+        if self.path.startswith("/api/pokecell"):
+            which = data.get("which", "fuel"); idx = int(data.get("idx", 0)) & 0xFF; val = int(data.get("val", 0)) & 0xFF
+            s = CTRL.get("ser"); base = SHADOW.get(which)
+            if not s or base is None: self._json({"ok": False, "error": "нет ЭБУ"}); return
+            a = base + idx
+            _send_cmd(s, [0xC5, a >> 8, a & 0xFF, val])
+            _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); rb = _probe_wait(0x1600)
+            self._json({"ok": True, "applied": rb == val, "readback": rb}); return
+        if self.path.startswith("/api/applybin"):
+            # привести всю таблицу к значениям бина (poke каждой ячейки)
+            which = data.get("which", "fuel"); s = CTRL.get("ser"); base = SHADOW.get(which)
+            t = load_tables(SEL["bin"])
+            if not s or base is None or not t: self._json({"ok": False, "error": "нет ЭБУ/бина"}); return
+            arr = t[which]
+            for i in range(256):
+                a = base + i
+                _send_cmd(s, [0xC5, a >> 8, a & 0xFF, arr[i] & 0xFF])
+            self._json({"ok": True, "cells": arr}); return
+        if self.path.startswith("/api/savebin"):
+            # запечь текущие таблицы (с фронта) в копию бина → логи/<бин>_лог_дата.bin
+            if not SEL.get("bin"): self._json({"ok": False, "error": "бин не выбран"}); return
+            try:
+                rom = bytearray(open(SEL["bin"], "rb").read()); assert len(rom) == 32768
+                for which, off in BINOFF.items():
+                    arr = data.get(which)
+                    if arr and len(arr) == 256:
+                        rom[off:off + 256] = bytes(b & 0xFF for b in arr)
+                recalc_checksum(rom)
+                d = os.path.join(HERE, "логи"); os.makedirs(d, exist_ok=True)
+                bn = os.path.splitext(os.path.basename(SEL["bin"]))[0]
+                fn = os.path.join(d, bn + "_лог_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
+                open(fn, "wb").write(rom)
+                self._json({"ok": True, "name": os.path.basename(fn)})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
             return
         if self.path.startswith("/api/peek"):
             try:
