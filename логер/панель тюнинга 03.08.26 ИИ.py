@@ -30,7 +30,7 @@ LABELS = [
     (0x004D, "Впрыск РЕАЛ (форс)",   16, "мс",                 0.005),  # $004D→UPP-каналы, тик 5мкс (датащит)
     # --- ДРОССЕЛЬ (TPS) ---
     (0x1492, "TPS дроссель",         16, "сырьё 10б",          None),   # аналог. дроссель, ch6
-    (0x14A2, "TPS открытие",          8, "%",                  0.581395),  # 172=100% (span 344/2)
+    (0x14A2, "TPS открытие",          8, "сырьё (от нуля)",    None),  # % считается отдельно из $1492: (ацп−мин)/344
     (0x14DE, "Обогащ. ускорения",    16, "добавка в форсунку", None),   # >0 = было обогащение
     (0x00B9, "Флаг TPS",              8, "0x20=ХХ/WOT/обрыв",  None),
     # --- ДАД: выбранные из ОЗУ (на MAF-бине = мусор) ---
@@ -258,7 +258,7 @@ LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": Non
 # колонки = ВСЁ: время + все декодированные сигналы (LABELS) + вычисленные (производные)
 LOG_HEADER = (["время_с"] + [nm for (_a, nm, _f, _u, _m) in LABELS] +
               ["УОЗ_°BTDC", "TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа",
-               "Загрузка_форс_%", "K_форс", "КМ"])
+               "Загрузка_форс_%", "Газ_%", "K_форс", "КМ"])
 
 
 def _log_row():
@@ -277,7 +277,7 @@ def _log_row():
     row += [g(tp["uoz_deg"]),
             round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
             g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["ve_corr"]), g(tp["press"]),
-            g(tp.get("inj_duty")), g(k), g(km)]
+            g(tp.get("inj_duty")), g(tp.get("tps_pct")), g(k), g(km)]
     return row
 
 
@@ -543,6 +543,15 @@ def snapshot():
     inj_ms = inj_raw * 0.005 if inj_raw is not None else None
     top["inj_ms"] = round(inj_ms, 2) if inj_ms is not None else None
     top["inj_duty"] = round(inj_ms * top["rpm"] / 1200, 1) if (inj_ms is not None and top["rpm"]) else None
+    # ГАЗ %: (TPS_ацп $1492 − наблюдаемый минимум) / 344 × 100, обрезка 0-100.
+    # минимум из ОЗУ (выученный ноль) не логируется → берём минимум самого АЦП
+    tps_raw = w(0x1492)
+    if tps_raw is not None:
+        m = STATE.get("tps_min")
+        if m is None or tps_raw < m: STATE["tps_min"] = tps_raw; m = tps_raw
+        top["tps_pct"] = max(0.0, min(100.0, round((tps_raw - m) / 344.0 * 100, 1)))
+    else:
+        top["tps_pct"] = None
     t = load_tables(SEL["bin"])
     fuel_out = ign_out = ve_out = ktps_out = None
     top["is_dad"] = bool(t and t.get("dad"))
@@ -803,7 +812,7 @@ function setHL(prefix,hr,hc){
  if(hr>=0&&hc>=0){const id=prefix+'_'+hr+'_'+hc;const e=document.getElementById(id);if(e){e.classList.add('hl');hlIds[prefix]=id;}}}
 // ---- левая таблица логируемых (стики в топе, значение+ед./у.е./сырьё) ----
 // СТИКИ-ТОП = HUD из d.top (человеческие значения), не сырые АЦП
-const TOP=[['Обороты','rpm',''],['Нагрузка','tp',''],['Темп ОЖ','temp',''],['ALPHA','alpha',''],
+const TOP=[['Обороты','rpm',''],['Нагрузка','tp',''],['Газ %','tps_pct','%'],['Темп ОЖ','temp',''],['ALPHA','alpha',''],
            ['AFR цель','afr_target',''],['AFR факт','afr_fact',''],['УОЗ','uoz_deg','°'],
            ['Впрыск мс','inj_ms',''],['Загрузка форс','inj_duty','%'],['Поправка VE','ve_corr','×']];
 let varsBuilt=0;
