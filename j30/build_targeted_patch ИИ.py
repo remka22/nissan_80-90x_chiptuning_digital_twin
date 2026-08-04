@@ -68,9 +68,49 @@ ADDR_LIST = [
     0x004D, 0x004E,   # $004D:$004E = длит. впрыска в отсчётах UPP; мс = ×0.005 (тик 5мкс, датащит HD63140)
     # --- RX-ТЕСТ: последний принятый по SCI байт (патч кладёт сюда) ---
     0x1600,           # RX-тест: приём SCI. Буфер загрузчика — на ЗАГЛУШЁННОМ свободен
+    # --- ОБРАТНАЯ СВЯЗЬ: где реально стоят указатели карт (ЭБУ сам говорит, панель не гадает) ---
+    0x00F0,           # старший байт ptr_сс:  $18 = ТЕНЬ, $FD = ПЗУ  (= PTR_SS,  см. раскладку ниже)
+    0x00F2,           # старший байт ptr_уоз: $19 = ТЕНЬ, $FC = ПЗУ  (= PTR_UOZ, см. раскладку ниже)
 ]
 CONST2 = [0xFF, 0xF0, len(ADDR_LIST)]   # FF F0 <len>
 assert len(ADDR_LIST) < 256
+assert len(ADDR_LIST) <= 32, "снимок кадра $1740 рассчитан на 32 байта — расширь SNAP до STAGE"
+
+# ---- РАСКЛАДКА ПАМЯТИ ----
+# ТЕНЬ: $1800-$1FFF — ЕДИНСТВЕННОЕ, куда guard разрешает poke (решение пользователя, вариант А).
+# Всё СЛУЖЕБНОЕ вынесено ЗА пределы этого окна, чтобы сбой протокола не мог его испортить:
+#   указатели карт → zero-page $FC:$FD / $FE:$FF   (poke туда физически не дотянется)
+#   кольцо приёма  → $1700-$173F                    (вне окна $18-$1F)
+#   снимок кадра   → $1740-$175F                    (вне окна)
+SH_SS, SH_UOZ = 0x1800, 0x1900
+# ⚠ ПОРЯДОК В ZERO-PAGE ВАЖЕН. Стек ставится `ae33: LDS #$013F` и растёт ВНИЗ; переполнив
+# 64 байта ($013F→$0100) он полезет в $00FF, $00FE... — то есть СВЕРХУ нашего блока.
+# Поэтому наверху лежит служебное протокола (порча = сбой связи, лечится ресинхроном),
+# а УКАЗАТЕЛИ КАРТ — в самом низу: до них стек доберётся последними.
+PTR_SS, PTR_UOZ = 0x00F0, 0x00F2      # hi по $F0/$F2 ($18/$19 = тень, $FD/$FC = ПЗУ)
+RB_HEAD, RB_TAIL = 0x00FC, 0x00FD     # кольцо: голова/хвост
+DMP_PRE, IDLE_CNT = 0x00FE, 0x00FF    # преамбула дампа / счётчик простоя приёма
+RING, RING_MASK = 0x1700, 0x3F        # кольцо приёма 64 б
+SNAP = 0x1740                         # снимок кадра 32 б (одномоментная выборка всех значений)
+# --- БЛОЧНАЯ ЗАПИСЬ с контрольной суммой: [CA][hi][lo][len][данные][chk=XOR] ---
+# Данные копятся в ПРОМЕЖУТОЧНЫЙ буфер и попадают в тень ТОЛЬКО если сумма сошлась.
+# Потерялся байт → блок отброшен целиком, в живые карты не попадает НИЧЕГО.
+STAGE   = 0x1760                      # промежуточный буфер блока, 64 б
+BLK_DST = 0x17A0                      # адрес назначения (2 б)
+BLK_PTR = 0x17A2                      # текущий указатель записи в буфер (2 б)
+BLK_CNT = 0x17A4                      # осталось принять
+BLK_CHK = 0x17A5                      # накопленная XOR-сумма
+BLK_LEN = 0x17A6                      # длина блока (сохранена для копирования)
+ST_OK   = 0x17A7                      # счётчик ПРИНЯТЫХ блоков  (ПК читает дампом 2 б)
+ST_BAD  = 0x17A8                      # счётчик ОТВЕРГНУТЫХ блоков
+# Переменные дампа ЖИЛИ в zero-page $F7-$F9 — и это столкновение: $00F8/$00F9 идут в кадре
+# как «VE выбранное» / «Ktps выбранное» (их пишет ДАД-рутина C700). На MAF-бине рутины нет,
+# но лог показывал мою кухню под видом наполнения. Унесены во внешнее ОЗУ: колонки кадра
+# трогать не нужно ни сейчас, ни когда патч совместят с ДАД.
+DMP_SRC = 0x17A9                      # источник дампа (2 б)
+DMP_CNT = 0x17AB                      # осталось отдать байт
+BLK_MAX = 64                          # размер блока
+ROM_SS, ROM_UOZ = 0xFD00, 0xFC00
 
 # (метка|None, токен, операнд)
 PROG = [
@@ -82,78 +122,223 @@ PROG = [
     (None,   "LDAA#", 0x05),          # RMCR=0x05: E/128, внутр. клок, 8N async
     (None,   "STAAd", 0x10),
     (None,   "CLRe",  0x001E),        # TRCSR2=0 → 8N1
-    (None,   "OIMd",  (0x0A, 0x11)),  # TE=1 + RE=1 (приём включён)
+    (None,   "OIMd",  (0x1A, 0x11)),  # TE=1 + RE=1 + RIE=1 (приём + приёмное ПРЕРЫВАНИЕ)
     (None,   "LDAA#", 0x16),          # peek_ptr hi = 0x16
     (None,   "STAAd", 0xF5),
     (None,   "CLRe",  0x00F6),        # peek_ptr lo = 0 → указатель = $1600
     (None,   "CLRe",  0x00F4),        # rxsi = 0 (состояние приёма)
-    # --- RX: протокол команд. [C5 hi lo val]=POKE(запись), [C6 hi lo]=PEEK(указатель) ---
-    # состояние в $F4, указатель адреса в $F5(hi):$F6(lo). Значение $1600 = *(указатель).
-    ("DUMP", "LDAAd", 0x11),          # TRCSR
-    (None,   "BITA#", 0x80),          # RDRF? принят байт
-    (None,   "BEQ",   "RXCOPY"),      # нет байта → к чтению peek
-    (None,   "LDAAd", 0x12),          # A = принятый байт (сброс RDRF)
+    (None,   "CLRe",  RB_HEAD),       # ring head = 0
+    (None,   "CLRe",  RB_TAIL),       # ring tail = 0
+    (None,   "CLRe",  DMP_CNT),       # dump-счётчик = 0 (дамп неактивен)
+    (None,   "CLRe",  DMP_PRE),       # dump-преамбула = 0
+    (None,   "CLRe",  IDLE_CNT),      # счётчик простоя приёма = 0 (ресинхрон)
+    (None,   "CLRe",  ST_OK),         # счётчики блоков = 0 (ПК считает от нуля)
+    (None,   "CLRe",  ST_BAD),
+    # --- RX: дренаж кольца-буфера (наполняет MYRXISR по SCI-прерыванию). Тянем ВСЕ байты за проход. ---
+    # состояние $F4; POKE ptr $F5:$F6; DUMP src/счётчик — во ВНЕШНЕМ ОЗУ ($17A9/$17AB),
+    # чтобы не занимать $00F8/$00F9 — они идут в кадре как VE/Ktps (их пишет ДАД-рутина C700).
+    # маркеры: C5=POKE C6=PEEK C7=карты→тень C8=карты→ПЗУ C9=дамп-региона[hi lo len].
+    ("DUMP", "LDABd", RB_TAIL & 0xFF), # B = tail
+    (None,   "LDAAd", RB_HEAD & 0xFF), # A = head
+    (None,   "CBA",   None),          # A-B: Z=1 если tail==head (буфер пуст)
+    (None,   "BNE",   "RXGO"),        # есть байт → разбор
+    # --- пусто: РЕСИНХРОН. Молчание дольше ~1.1с посреди команды = протокол сбился → сброс автомата
+    (None,   "LDAAd", 0xF4),          # состояние != 0 (команда недобрана)?
+    (None,   "BEQ",   "RXCOPY2"),     # нет — просто тишина, ничего не делаем
+    (None,   "INCe",  IDLE_CNT),      # счётчик пустых проходов
+    (None,   "LDAAd", IDLE_CNT & 0xFF),
+    (None,   "CMPA#", 100),           # 100 × 11.4мс ≈ 1.1с
+    (None,   "BCS",   "RXCOPY2"),
+    (None,   "CLRe",  0x00F4),        # автомат в исходное
+    (None,   "CLRe",  IDLE_CNT),
+    ("RXCOPY2","JMPe", "RXCOPY"),     # → peek+TX
+    ("RXGO", "LDX#",  RING),          # база кольца ($1700, ВНЕ guard-окна)
+    (None,   "ABX",   None),          # X = база + tail
+    (None,   "LDAAx", 0x00),          # A = buf[tail] (принятый байт)
+    (None,   "INCB",  None),          # tail++
+    (None,   "ANDB#", RING_MASK),     # wrap 64
+    (None,   "STABd", RB_TAIL & 0xFF), # сохранить tail
+    (None,   "CLRe",  IDLE_CNT),      # байт пришёл → счётчик простоя сброшен
     (None,   "LDABd", 0xF4),          # B = rxsi
     (None,   "CMPB#", 0),
     (None,   "BNE",   "RXS1"),
-    (None,   "CMPA#", 0xC5),          # маркер POKE?
+    (None,   "CMPA#", 0xC5),          # POKE?
     (None,   "BNE",   "RXCK6"),
     (None,   "LDAB#", 1),
     (None,   "STABd", 0xF4),
-    (None,   "BRA",   "RXCOPY"),
-    ("RXCK6","CMPA#", 0xC6),          # маркер PEEK?
-    (None,   "BNE",   "RXCK7"),       # не C6 → проверить C7/C8
+    (None,   "JMPe",  "DUMP"),
+    ("RXCK6","CMPA#", 0xC6),          # PEEK?
+    (None,   "BNE",   "RXCK7"),
     (None,   "LDAB#", 4),
     (None,   "STABd", 0xF4),
-    (None,   "BRA",   "RXCOPY"),
-    ("RXCK7","CMPA#", 0xC7),          # C7 = выгрузить всё в тень (сток), карты→тень
+    (None,   "JMPe",  "DUMP"),
+    ("RXCK7","CMPA#", 0xC7),          # C7 = карты→тень (флип, копии НЕТ)
     (None,   "BNE",   "RXCK8"),
     (None,   "JSR",   "DOC7"),
-    (None,   "BRA",   "RXCOPY"),
-    ("RXCK8","CMPA#", 0xC8),          # C8 = карты назад на ROM (A/B сравнение)
-    (None,   "BNE",   "RXCOPY"),      # неизвестный байт → игнор
+    (None,   "JMPe",  "DUMP"),
+    ("RXCK8","CMPA#", 0xC8),          # C8 = карты→ПЗУ (A/B)
+    (None,   "BNE",   "RXCK9"),
     (None,   "JSR",   "DOC8"),
-    (None,   "BRA",   "RXCOPY"),
+    (None,   "JMPe",  "DUMP"),
+    ("RXCK9","CMPA#", 0xC9),          # C9 = дамп региона [hi lo len]
+    (None,   "BNE",   "RXCKA"),
+    (None,   "LDAB#", 6),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("RXCKA","CMPA#", 0xCA),          # CA = БЛОК с контрольной суммой [hi lo len данные chk]
+    (None,   "BNE",   "DUMP"),        # неизвестный → тянуть дальше
+    (None,   "LDAB#", 9),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
     ("RXS1", "CMPB#", 1),
     (None,   "BNE",   "RXS2"),
     (None,   "STAAd", 0xF5),          # POKE: адрес hi
     (None,   "LDAB#", 2),
     (None,   "STABd", 0xF4),
-    (None,   "BRA",   "RXCOPY"),
+    (None,   "JMPe",  "DUMP"),
     ("RXS2", "CMPB#", 2),
     (None,   "BNE",   "RXS3"),
     (None,   "STAAd", 0xF6),          # POKE: адрес lo
     (None,   "LDAB#", 3),
     (None,   "STABd", 0xF4),
-    (None,   "BRA",   "RXCOPY"),
+    (None,   "JMPe",  "DUMP"),
     ("RXS3", "CMPB#", 3),
     (None,   "BNE",   "RXS4"),
+    # GUARD АДРЕСА: писать МОЖНО только в тень $1800-$1FFF. Всё остальное — молча игнор.
+    # Без этого сбой протокола (потерянный байт → сдвиг автомата) пишет в UPP $1000-$106F
+    # (форсунки!), zero-page и живые переменные $1400-$15FF. Это тот класс, что убил машину.
+    (None,   "LDABd", 0xF5),          # B = старший байт адреса
+    (None,   "CMPB#", 0x18),
+    (None,   "BCS",   "RXPKEND"),     # < $18 → не тень, НЕ писать
+    (None,   "CMPB#", 0x20),
+    (None,   "BCC",   "RXPKEND"),     # >= $20 → не тень, НЕ писать
     (None,   "LDXd",  0xF5),          # X = адрес ($F5:$F6)
-    (None,   "STAAx", 0x00),          # [X] = значение  → ЗАПИСЬ
-    (None,   "CLRe",  0x00F4),        # rxsi = 0
-    (None,   "BRA",   "RXCOPY"),
+    (None,   "STAAx", 0x00),          # [X] = значение → ЗАПИСЬ (только $1800-$1FFF)
+    ("RXPKEND","CLRe", 0x00F4),       # rxsi = 0
+    (None,   "JMPe",  "DUMP"),
     ("RXS4", "CMPB#", 4),
     (None,   "BNE",   "RXS5"),
     (None,   "STAAd", 0xF5),          # PEEK: адрес hi
     (None,   "LDAB#", 5),
     (None,   "STABd", 0xF4),
-    (None,   "BRA",   "RXCOPY"),
-    ("RXS5", "STAAd", 0xF6),          # PEEK: адрес lo (rxsi==5)
+    (None,   "JMPe",  "DUMP"),
+    ("RXS5", "CMPB#", 5),
+    (None,   "BNE",   "RXS6"),
+    (None,   "STAAd", 0xF6),          # PEEK: адрес lo
     (None,   "CLRe",  0x00F4),        # rxsi = 0
+    (None,   "JMPe",  "DUMP"),
+    ("RXS6", "CMPB#", 6),
+    (None,   "BNE",   "RXS7"),
+    (None,   "STAAe", DMP_SRC),       # DUMP: src hi
+    (None,   "LDAB#", 7),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("RXS7", "CMPB#", 7),
+    (None,   "BNE",   "RXS8"),
+    (None,   "STAAe", DMP_SRC + 1),   # DUMP: src lo
+    (None,   "LDAB#", 8),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("RXS8", "CMPB#", 8),
+    (None,   "BNE",   "RXS9"),
+    (None,   "STAAe", DMP_CNT),       # DUMP: len → активирует стрим
+    (None,   "LDAB#", 2),
+    (None,   "STABd", DMP_PRE & 0xFF), # преамбула 5A A5 (2 байта) перед данными → ПК синхронизируется
+    (None,   "CLRe",  0x00F4),        # rxsi = 0
+    (None,   "JMPe",  "DUMP"),
+    # --- БЛОК [CA][hi][lo][len][данные...][chk] : пишем в буфер, в тень — только при сошедшейся сумме ---
+    ("RXS9", "CMPB#", 9),
+    (None,   "BNE",   "RXS10"),
+    (None,   "STAAe", BLK_DST),       # адрес назначения hi
+    (None,   "LDAB#", 10),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("RXS10","CMPB#", 10),
+    (None,   "BNE",   "RXS11"),
+    (None,   "STAAe", BLK_DST + 1),   # адрес назначения lo
+    (None,   "LDAB#", 11),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("RXS11","CMPB#", 11),
+    (None,   "BNE",   "RXS12"),
+    (None,   "CMPA#", BLK_MAX),       # длина > буфера? отбросить команду
+    (None,   "BHI",   "BLKRST"),
+    (None,   "CMPA#", 0),             # длина 0? иначе счётчик уйдёт в 255 и съест 256 байт
+    (None,   "BEQ",   "BLKRST"),
+    (None,   "STAAe", BLK_CNT),       # осталось принять
+    (None,   "STAAe", BLK_LEN),       # длина (для копирования)
+    (None,   "CLRe",  BLK_CHK),       # сумма = 0
+    (None,   "LDX#",  STAGE),
+    (None,   "STXe",  BLK_PTR),       # указатель записи = начало буфера
+    (None,   "LDAB#", 12),
+    (None,   "STABd", 0xF4),
+    (None,   "JMPe",  "DUMP"),
+    ("BLKRST","CLRe", 0x00F4),        # длина не влезает → сброс автомата
+    (None,   "JMPe",  "DUMP"),
+    ("RXS12","CMPB#", 12),
+    (None,   "BNE",   "RXS13"),
+    (None,   "LDXe",  BLK_PTR),       # данные → в ПРОМЕЖУТОЧНЫЙ буфер (не в карту!)
+    (None,   "STAAx", 0x00),
+    (None,   "INX",   None),
+    (None,   "STXe",  BLK_PTR),
+    (None,   "EORAe", BLK_CHK),       # сумма ^= байт
+    (None,   "STAAe", BLK_CHK),
+    (None,   "DECe",  BLK_CNT),
+    (None,   "BNE",   "BLKMORE"),     # ещё не всё → ждём дальше
+    (None,   "LDAB#", 13),            # всё принято → следующий байт = сумма
+    (None,   "STABd", 0xF4),
+    ("BLKMORE","JMPe","DUMP"),
+    ("RXS13","CMPAe", BLK_CHK),       # принятая сумма == посчитанной?
+    (None,   "BNE",   "BLKBAD"),
+    (None,   "JSR",   "BLKCOPY"),     # ДА → применить блок в тень
+    (None,   "INCe",  ST_OK),
+    (None,   "CLRe",  0x00F4),
+    (None,   "JMPe",  "DUMP"),
+    ("BLKBAD","INCe", ST_BAD),        # НЕТ → блок отброшен целиком, в карты не попало ничего
+    (None,   "CLRe",  0x00F4),
+    (None,   "JMPe",  "DUMP"),
     # --- читаем *(указатель) → $1600 (видно в кадре как peek) ---
     ("RXCOPY","LDXd", 0xF5),          # X = указатель
     (None,   "LDAAx", 0x00),          # A = *(указатель)
     (None,   "STAAe", 0x1600),        # $1600 = прочитанный байт
-    # --- TX: передать следующий байт кадра ---
+    # --- TX: дамп-стрим (если активен) ИЛИ следующий байт кадра ---
     ("TXCHK","LDAAd", 0x11),
     (None,   "BITA#", 0x20),          # TDRE?
-    (None,   "BNE",   "CONT"),
+    (None,   "BNE",   "TXRDY"),
+    (None,   "RTS",   None),           # TX занят → выход
+    ("TXRDY","LDABe", DMP_CNT),       # dump-счётчик активен?
+    (None,   "BEQ",   "CONT"),        # 0 → обычный кадр
+    (None,   "LDABd", DMP_PRE & 0xFF), # преамбула осталась?
+    (None,   "BEQ",   "TXDATA"),      # 0 → шлём данные
+    (None,   "CMPB#", 2),
+    (None,   "BNE",   "TXPA5"),
+    (None,   "LDAA#", 0x5A),          # F2==2 → первый байт преамбулы
+    (None,   "BRA",   "TXPEM"),
+    ("TXPA5","LDAA#", 0xA5),          # F2==1 → второй байт
+    ("TXPEM","STAAd", 0x13),          # TDR = байт преамбулы
+    (None,   "DECB",  None),
+    (None,   "STABd", DMP_PRE & 0xFF),
     (None,   "RTS",   None),
+    ("TXDATA","LDXe", DMP_SRC),       # X = dump src
+    (None,   "LDAAx", 0x00),          # A = *src
+    (None,   "STAAd", 0x13),          # TDR = байт
+    (None,   "INX",   None),          # src++
+    (None,   "STXe",  DMP_SRC),
+    (None,   "LDABe", DMP_CNT),
+    (None,   "DECB",  None),          # len--
+    (None,   "STABe", DMP_CNT),
+    (None,   "BNE",   "TXDEND"),      # дамп ещё идёт
+    # Дамп кончился. Кадр был оборван на середине, и его хвост ушёл бы из СТАРОГО снимка
+    # (до 3 секунд давности), а ПК принял бы его за свежие данные. Начинаем кадр заново.
+    (None,   "CLRe",  0x00FA),        # si = 0 → следующий проход снимет новый снимок
+    ("TXDEND","RTS",  None),
     ("CONT", "LDABd", 0xFA),          # B = si
     (None,   "CMPB#", 0),
     (None,   "BNE",   "S1"),
-    # si==0: chk=0, послать AE (без chk)
-    (None,   "CLRe",  0x00FB),
+    # si==0: НАЧАЛО КАДРА → снять ВСЕ значения в буфер ОДНОМОМЕНТНО (убирает разрыв 16-бит
+    # и размазку: раньше каждый байт читался в момент своей отправки, врозь на 11.4мс).
+    (None,   "JSR",   "SNAPSHOT"),
+    (None,   "CLRe",  0x00FB),        # chk = 0
     (None,   "LDAA#", 0xAE),
     (None,   "BRA",   "EMITNC"),
     ("S1",   "CMPB#", 1),
@@ -169,13 +354,11 @@ PROG = [
     (None,   "BRA",   "DONE"),
     ("MID",  "CMPB#", 5),
     (None,   "BCS",   "CONST"),       # si 2..4 → константа
-    # si 5..17: значение = *(ADDR[si-5])
+    # si 5..: значение из СНИМКА (снят целиком в начале кадра), а не чтение памяти на лету
     (None,   "SUBB#", 5),
-    (None,   "ASLB",  None),          # ×2 (16-бит записи)
-    (None,   "LDX#",  "ADDRTBL"),
+    (None,   "LDX#",  SNAP),
     (None,   "ABX",   None),
-    (None,   "LDXx",  0x00),          # X = адрес из таблицы
-    (None,   "LDAAx", 0x00),          # A = байт по адресу
+    (None,   "LDAAx", 0x00),          # A = снимок[si-5]
     (None,   "BRA",   "EMITC"),
     ("CONST","SUBB#", 2),             # si 2,3,4 → CONST2[si-2] = FF,F0,len
     (None,   "LDX#",  "CONST2T"),
@@ -194,90 +377,123 @@ PROG = [
     ("DONE", "RTS",   None),
 ]
 
-# ---- v4 ТЕНЬ: раскладка ($1800-$1FFF, keep-alive, reset не чистит) ----
-SH_SS, SH_UOZ, SH_K, SH_GATE = 0x1800, 0x1900, 0x1A00, 0x1A02
-PTR_SS, PTR_UOZ = 0x1A10, 0x1A12
-MARKER = 0x1FFE                       # 2 байта: $1FFE=0xA5, $1FFF=0x5A
-ROM_SS, ROM_UOZ, ROM_K, ROM_GATE = 0xFD00, 0xFC00, 0xFF2B, 0xFF91
-
-# ---- Подпрограммы (ассемблируются за PROG): copy256, my_init, DOC7, DOC8 ----
+# ---- Подпрограммы (ассемблируются за PROG): MYRXISR, my_init, DOC7, DOC8 ----
 SUBS = [
-    # copy256: src=$F0:$F1, dst=$F2:$F3 → 256 байт (B=счётчик)
-    ("COPY256","CLRB", None),
-    ("C256L", "LDXd", 0xF0),
-    (None,    "ABX",  None),
-    (None,    "LDAAx",0x00),
-    (None,    "LDXd", 0xF2),
-    (None,    "ABX",  None),
-    (None,    "STAAx",0x00),
-    (None,    "INCB", None),
-    (None,    "BNE",  "C256L"),
-    (None,    "RTS",  None),
-    # my_init: reset-хук. cold(маркер нет) → указатели карт на ROM, скаляры сток, маркер
-    ("MYINIT","LDAAe",MARKER),
-    (None,    "CMPA#",0xA5),
-    (None,    "BNE",  "MICOLD"),
-    (None,    "LDAAe",MARKER + 1),
-    (None,    "CMPA#",0x5A),
-    (None,    "BEQ",  "MIWARM"),       # оба байта маркера совпали → warm, тюн держим
-    ("MICOLD","LDX#", ROM_SS),
-    (None,    "STXe", PTR_SS),         # ptr_сс = ROM
+    # MYRXISR: приёмное SCI-прерывание (вектор $FFF0). Хватает каждый байт СРАЗУ (не раз за проход),
+    # кладёт в кольцо $1B00 (head $F0). Короткий — не блокирует крэнк/впрыск (в отличие от copy256).
+    # Регистры A/B/X авто-сохранены аппаратно при входе в прерывание, RTI их вернёт.
+    ("MYRXISR","LDAAd", 0x11),        # A = TRCSR (статус)
+    (None,     "BITA#", 0x40),        # ORFE? переполнение/ошибка кадра
+    (None,     "BNE",   "RXFLUSH"),   # да → байт битый: RDR прочитать, в кольцо НЕ класть
+    (None,     "BITA#", 0x80),        # RDRF? байт реально принят
+    (None,     "BNE",   "RXPUSH"),
+    (None,     "RTI",   None),        # ни байта, ни ошибки → выход (не мусорить в кольцо)
+    ("RXFLUSH","LDAAd", 0x12),        # чтение RDR снимает ORFE+RDRF
+    (None,     "RTI",   None),
+    ("RXPUSH", "LDAAd", 0x12),        # A = RDR (принятый байт, снимает RDRF)
+    (None,     "LDABd", RB_HEAD & 0xFF), # B = head
+    (None,     "LDX#",  RING),        # база кольца ($1700, ВНЕ guard-окна)
+    (None,     "ABX",   None),        # X = база + head
+    (None,     "STAAx", 0x00),        # buf[head] = байт
+    (None,     "INCB",  None),        # head++
+    (None,     "ANDB#", RING_MASK),   # wrap 64
+    (None,     "CMPBd", RB_TAIL & 0xFF), # догнали tail? кольцо ПОЛНО
+    (None,     "BEQ",   "RXFULL"),    # да → head НЕ двигаем: честная потеря вместо тихой порчи
+    (None,     "STABd", RB_HEAD & 0xFF), # сохранить head
+    ("RXFULL", "RTI",   None),
+    # BLKCOPY: перенести принятый блок из буфера в тень. Зовётся ТОЛЬКО при сошедшейся сумме.
+    # Guard: старший байт назначения $18..$1E (блок ≤64 б не может вылезти за $1FFF и задеть $2000,
+    # куда завод пишет железо). Одиночный poke по-прежнему $18..$1F.
+    ("BLKCOPY","LDAAe", BLK_DST),
+    (None,     "CMPA#", 0x18),
+    (None,     "BCS",   "BLKEND"),    # ниже тени → не копировать
+    (None,     "CMPA#", 0x1F),
+    (None,     "BCC",   "BLKEND"),    # $1F и выше → не копировать (защита хвоста)
+    (None,     "LDX#",  STAGE),
+    (None,     "STXe",  BLK_PTR),     # источник = начало буфера
+    (None,     "LDAAe", BLK_LEN),
+    (None,     "STAAe", BLK_CNT),     # счётчик копирования
+    ("BLKLP",  "LDXe",  BLK_PTR),
+    (None,     "LDAAx", 0x00),        # A = буфер[i]
+    (None,     "INX",   None),
+    (None,     "STXe",  BLK_PTR),
+    (None,     "LDXe",  BLK_DST),
+    (None,     "STAAx", 0x00),        # тень[i] = A
+    (None,     "INX",   None),
+    (None,     "STXe",  BLK_DST),
+    (None,     "DECe",  BLK_CNT),
+    (None,     "BNE",   "BLKLP"),
+    ("BLKEND", "RTS",   None),
+    # SNAPSHOT: снять все значения по таблице адресов в буфер $1740 ОДНОМОМЕНТНО.
+    # Зовётся раз в кадр (раз в 38 проходов). 32 итерации, ~130 мкс, только ЧТЕНИЕ заводского ОЗУ.
+    ("SNAPSHOT","CLRB", None),        # B = i
+    ("SNAPLP", "PSHB",  None),        # сохранить i
+    (None,     "ASLB",  None),        # ×2 (таблица 16-битная)
+    (None,     "LDX#",  "ADDRTBL"),
+    (None,     "ABX",   None),        # X = &ADDRTBL[i]
+    (None,     "LDXx",  0x00),        # X = адрес значения
+    (None,     "LDAAx", 0x00),        # A = значение
+    (None,     "PULB",  None),        # B = i
+    (None,     "LDX#",  SNAP),
+    (None,     "ABX",   None),        # X = снимок + i
+    (None,     "STAAx", 0x00),        # снимок[i] = значение
+    (None,     "INCB",  None),
+    (None,     "CMPB#", len(ADDR_LIST)),
+    (None,     "BNE",   "SNAPLP"),
+    (None,     "RTS",   None),
+    # my_init: reset-хук. ВСЕГДА указатели карт = ПЗУ (безопасный дефолт, НЕ копия, без маркера).
+    # Тень НЕ инициализируется на чипе — её заливает ПК poke'ом. Мотор всегда стартует стоково.
+    # MYPTR: РАННЯЯ установка указателей — ДО того как завод сделает CLI.
+    # Зачем: сброс обнуляет $0040-$013F (ae17..ae31), т.е. и наши указатели. Дальше завод
+    # включает прерывания (ae44 / ae5a) и ТОЛЬКО потом доходит до my_init. В это окно
+    # периодическая задача уже работает и читала бы карты по указателю $0000 — топливо и
+    # угол из нулевой страницы. Встраиваемся в JSR $B00D (зовётся обоими путями ДО CLI).
+    ("MYPTR", "LDX#", ROM_SS),
+    (None,    "STXd", PTR_SS),
     (None,    "LDX#", ROM_UOZ),
-    (None,    "STXe", PTR_UOZ),        # ptr_уоз = ROM
-    (None,    "LDDe", ROM_K),
-    (None,    "STDe", SH_K),           # K сток → тень
-    (None,    "LDAAe",ROM_GATE),
-    (None,    "STAAe",SH_GATE),        # гейт сток → тень
-    (None,    "LDAA#",0xA5),
-    (None,    "STAAe",MARKER),
-    (None,    "LDAA#",0x5A),
-    (None,    "STAAe",MARKER + 1),
-    ("MIWARM","JMPe", 0xB0E2),         # → главный цикл
-    # DOC7: выгрузить всё в тень (сток) + карты-указатели на тень
-    ("DOC7",  "LDX#", ROM_SS),
-    (None,    "STXd", 0xF0),
-    (None,    "LDX#", SH_SS),
-    (None,    "STXd", 0xF2),
-    (None,    "JSR",  "COPY256"),      # сс ROM→тень
-    (None,    "LDX#", SH_SS),
-    (None,    "STXe", PTR_SS),         # ptr_сс = тень
+    (None,    "STXd", PTR_UOZ),
+    (None,    "JMPe", 0xB00D),         # → заводская рутина, её RTS вернёт куда надо
+    ("MYINIT","LDX#", ROM_SS),
+    (None,    "STXd", PTR_SS),         # ptr_сс = ПЗУ  (zero-page $FC)
     (None,    "LDX#", ROM_UOZ),
-    (None,    "STXd", 0xF0),
+    (None,    "STXd", PTR_UOZ),        # ptr_уоз = ПЗУ (zero-page $FE)
+    (None,    "JMPe", 0xB0E2),         # → главный цикл
+    # DOC7: флип указателей карт на ТЕНЬ (КОПИИ НЕТ — тень залил ПК poke'ом заранее)
+    ("DOC7",  "LDX#", SH_SS),
+    (None,    "STXd", PTR_SS),         # ptr_сс = тень
     (None,    "LDX#", SH_UOZ),
-    (None,    "STXd", 0xF2),
-    (None,    "JSR",  "COPY256"),      # уоз ROM→тень
-    (None,    "LDX#", SH_UOZ),
-    (None,    "STXe", PTR_UOZ),        # ptr_уоз = тень
-    (None,    "LDDe", ROM_K),
-    (None,    "STDe", SH_K),
-    (None,    "LDAAe",ROM_GATE),
-    (None,    "STAAe",SH_GATE),
+    (None,    "STXd", PTR_UOZ),        # ptr_уоз = тень
     (None,    "RTS",  None),
-    # DOC8: карты-указатели назад на ROM (A/B сравнение)
+    # DOC8: флип указателей карт назад на ПЗУ (A/B, сброс к стоку)
     ("DOC8",  "LDX#", ROM_SS),
-    (None,    "STXe", PTR_SS),
+    (None,    "STXd", PTR_SS),
     (None,    "LDX#", ROM_UOZ),
-    (None,    "STXe", PTR_UOZ),
+    (None,    "STXd", PTR_UOZ),
     (None,    "RTS",  None),
 ]
 
 # ---- In-place патчи заводского кода (редиректы + reset-хуки) ----
 # (cpu_addr, ожидаемые_СТАРЫЕ_байты, новые_байты | "MYINIT")
 INPLACE = [
-    (0xB49E, [0xCE,0xFD,0x00], [0xFE, PTR_SS >> 8, PTR_SS & 0xFF]),   # сс: LDX #FD00 → LDX $1A10
-    (0xB728, [0xCE,0xFC,0x00], [0xFE, PTR_UOZ >> 8, PTR_UOZ & 0xFF]), # уоз: LDX #FC00 → LDX $1A12
-    (0x89BB, [0xFC,0xFF,0x2B], [0xFC, SH_K >> 8, SH_K & 0xFF]),       # K: LDD FF2B → LDD $1A00
-    (0xC330, [0xFC,0xFF,0x2B], [0xFC, SH_K >> 8, SH_K & 0xFF]),       # K (2-й сайт)
-    (0x966B, [0xB1,0xFF,0x91], [0xB1, SH_GATE >> 8, SH_GATE & 0xFF]), # гейт: CMPA FF91 → CMPA $1A02
+    # LDX #imm (3 б) → LDX прямая (2 б) + NOP-заполнитель, длина та же. Указатели в zero-page = вне guard-окна
+    (0xB49E, [0xCE,0xFD,0x00], [0xDE, PTR_SS & 0xFF, 0x01]),          # сс:  LDX #FD00 → LDX $FC ; NOP
+    (0xB728, [0xCE,0xFC,0x00], [0xDE, PTR_UOZ & 0xFF, 0x01]),         # уоз: LDX #FC00 → LDX $FE ; NOP
+    # K/гейт больше НЕ тенятся — читают ПЗУ ($FF2B/$FF91), редирект убран (нет загрузочной копии скаляров)
     (0xAE4E, [0x7E,0xB0,0xE2], "MYINIT"),                            # reset JMP b0e2 → JMP my_init
     (0xAE5B, [0x7E,0xB0,0xE2], "MYINIT"),
+    # РАННИЙ хук: оба пути сброса зовут B00D ДО CLI → там и ставим указатели,
+    # чтобы в окне «прерывания уже включены, my_init ещё не дошёл» карты не читались с $0000
+    (0xAE41, [0xBD,0xB0,0x0D], "MYPTR"),                             # путь A (ae44 CLI)
+    (0xAE57, [0xBD,0xB0,0x0D], "MYPTR"),                             # путь B (ae5a CLI)
 ]
 
 LEN = {"JSR":3,"LDAAd":2,"LDAA#":2,"LDAAx":2,"LDABd":2,"LDXx":2,"LDX#":3,"BITA#":2,
        "CMPB#":2,"CMPA#":2,"LDAB#":2,"SUBB#":2,"ASLB":1,"ABX":1,"STAAd":2,"STAAe":3,"STABd":2,"STAAx":2,"LDXd":2,"EORAd":2,"CLRe":3,"INCe":3,
        "CLRB":1,"INCB":1,"LDAAe":3,"STXe":3,"STXd":2,"LDDe":3,"STDe":3,"JMPe":3,
-       "PSHA":1,"PULA":1,"OIMd":3,"RTS":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2}
-BR = {"BNE":0x26,"BEQ":0x27,"BCC":0x24,"BCS":0x25,"BRA":0x20}
+       "LDXe":3,"DECe":3,"EORAe":3,"CMPAe":3,"LDABe":3,"STABe":3,
+       "PSHA":1,"PULA":1,"PSHB":1,"PULB":1,"CMPBd":2,"BHI":2,
+       "OIMd":3,"RTS":1,"RTI":1,"CBA":1,"ANDB#":2,"DECB":1,"INX":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2}
+BR = {"BNE":0x26,"BEQ":0x27,"BCC":0x24,"BCS":0x25,"BRA":0x20,"BHI":0x22}
 
 
 def assemble(org):
@@ -329,11 +545,27 @@ def assemble(org):
         elif op == "STXd":  out += bytes([0xDF, arg & 0xFF])
         elif op == "LDDe":  out += bytes([0xFC, arg >> 8, arg & 0xFF])
         elif op == "STDe":  out += bytes([0xFD, arg >> 8, arg & 0xFF])
-        elif op == "JMPe":  out += bytes([0x7E, arg >> 8, arg & 0xFF])
+        elif op == "JMPe":
+            a = alllab[arg] if isinstance(arg, str) else arg
+            out += bytes([0x7E, a >> 8, a & 0xFF])
+        elif op == "LDXe":  out += bytes([0xFE, arg >> 8, arg & 0xFF])
+        elif op == "DECe":  out += bytes([0x7A, arg >> 8, arg & 0xFF])
+        elif op == "EORAe": out += bytes([0xB8, arg >> 8, arg & 0xFF])
+        elif op == "CMPAe": out += bytes([0xB1, arg >> 8, arg & 0xFF])
+        elif op == "LDABe": out += bytes([0xF6, arg >> 8, arg & 0xFF])
+        elif op == "STABe": out += bytes([0xF7, arg >> 8, arg & 0xFF])
         elif op == "PSHA":  out += bytes([0x36])
         elif op == "PULA":  out += bytes([0x32])
+        elif op == "PSHB":  out += bytes([0x37])
+        elif op == "PULB":  out += bytes([0x33])
+        elif op == "CMPBd": out += bytes([0xD1, arg & 0xFF])
         elif op == "OIMd":  out += bytes([0x72, arg[0], arg[1]])
         elif op == "RTS":   out += bytes([0x39])
+        elif op == "RTI":   out += bytes([0x3B])
+        elif op == "CBA":   out += bytes([0x11])
+        elif op == "ANDB#": out += bytes([0xC4, arg & 0xFF])
+        elif op == "DECB":  out += bytes([0x5A])
+        elif op == "INX":   out += bytes([0x08])
         elif op in BR:
             rel = labels[arg] - nxt
             assert -128 <= rel <= 127, "ветвление %s вне диапазона %d" % (arg, rel)
@@ -353,7 +585,10 @@ def main():
     rom = bytearray(open(SRC, "rb").read()); assert len(rom) == 32768
     code, addrtbl, const2t, labels = assemble(CODE_ORG)
     off = CODE_ORG - ROM_BASE
-    assert len(code) <= 0x200, "не влезает в C600-C7FF"
+    # Окно патча C600-C9FF (1 КБ). Обосновано: $C600-$EFFF — мёртвая зона ПЗУ, 9984 байта
+    # заполнителя 0x3F подряд; по дизассемблеру НИ ОДНА инструкция туда не адресуется
+    # (проверено 04.08.26: операнды всех инструкций 8000-C5E2 + разбор дыры 884E-88CF).
+    assert len(code) <= 0x400, "не влезает в C600-C9FF (%d байт)" % len(code)
     hoff = HOOK_CPU - ROM_BASE
     tgt = rom[hoff + 1] << 8 | rom[hoff + 2]
     assert rom[hoff] == 0xBD and tgt in (ORIG_CALL, CODE_ORG), "по 83F8 не JSR A99B/C600"
@@ -365,9 +600,20 @@ def main():
         o = cpu - ROM_BASE
         cur = list(rom[o:o + len(oldb)])
         assert cur == oldb, "in-place %04X: ожидал %s, в бине %s" % (cpu, [hex(b) for b in oldb], [hex(b) for b in cur])
-        nb = [0x7E, myinit >> 8, myinit & 0xFF] if newb == "MYINIT" else newb
+        if newb == "MYINIT":                       # JMP my_init (заменяет заводской JMP)
+            nb = [0x7E, myinit >> 8, myinit & 0xFF]
+        elif newb == "MYPTR":                      # JSR my_ptr (заменяет заводской JSR — вызов!)
+            mp = labels["MYPTR"]; nb = [0xBD, mp >> 8, mp & 0xFF]
+        else:
+            nb = newb
         rom[o:o + len(nb)] = bytes(nb)
     print("  my_init @ %04X; in-place патчей: %d" % (myinit, len(INPLACE)))
+    # хук SCI-вектора $FFF0 (был → $ADAA заводской SCI-загрузчик) → наш MYRXISR
+    rxisr = labels["MYRXISR"]
+    vo = 0xFFF0 - ROM_BASE
+    assert rom[vo] == 0xAD and rom[vo + 1] == 0xAA, "SCI-вектор $FFF0 не $ADAA (в бине %02X%02X)" % (rom[vo], rom[vo + 1])
+    rom[vo], rom[vo + 1] = rxisr >> 8, rxisr & 0xFF
+    print("  SCI-вектор $FFF0 → MYRXISR @ %04X" % rxisr)
     # чек-сумма
     s = x = 0
     for i in range(len(rom)):

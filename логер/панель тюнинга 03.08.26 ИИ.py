@@ -70,6 +70,8 @@ NARROW_MAP = [
     0x00F8, 0x00F9,
     0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.005=мс, тик 5мкс датащит)
     0x1600,   # RX-тест: последний принятый по SCI байт
+    0x00F0,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_сс  — $18 = ТЕНЬ, $FD = ПЗУ (zero-page, низ блока)
+    0x00F2,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_уоз — $19 = ТЕНЬ, $FC = ПЗУ (zero-page, низ блока)
 ]
 
 STATE = {
@@ -151,7 +153,11 @@ def wbl_stop():
     if WCTRL["stop"]: WCTRL["stop"].set()
     if WCTRL["thread"]: WCTRL["thread"].join(timeout=1.0)
     WCTRL["thread"] = None; WCTRL["stop"] = None; WCTRL["ser"] = None
-    with WLOCK: WBL["running"] = False
+    with WLOCK:
+        WBL["running"] = False
+        # отключили — значений БОЛЬШЕ НЕТ, а не «последние». Чистим и сырьё: значок ШДК
+        # смотрит в т.ч. на raw, и с непочищенным raw оставался бы зелёным после обрыва.
+        WBL["afr"] = None; WBL["last_t"] = 0; WBL["raw"] = ""; WBL["hex"] = ""
     return True
 
 
@@ -234,6 +240,7 @@ def deg_of(x):        # значение карты угла → градусы 
 
 # ---- ОНЛАЙН-тюнинг: тень карт в ОЗУ (v4) ----
 SHADOW = {"fuel": 0x1800, "ign": 0x1900}   # адрес тени в ОЗУ (см. build_targeted_patch)
+ROMMAP = {"fuel": 0xFD00, "ign": 0xFC00}   # адрес карты в ПЗУ (CPU) — для дампа «считать из ПЗУ»
 BINOFF = {"fuel": 0x7D00, "ign": 0x7C00}   # смещение карты в файле бина
 
 
@@ -282,14 +289,20 @@ def _log_row():
 
 
 def _log_sampler(stop_ev):
+    # ПИШЕМ ПО ПРИХОДУ КАДРА, а не по таймеру. Раньше таймер 200мс при кадре 410мс
+    # дублировал каждую строку дважды: файл выглядел как 5 Гц, данных в нём 2.4 Гц.
+    last = -1
     while not stop_ev.is_set():
-        try:
-            row = _log_row()
-            LOGST["f"].write(";".join(str(x) for x in row) + "\n"); LOGST["f"].flush()
-            LOGST["n"] += 1
-        except Exception:
-            pass
-        stop_ev.wait(0.2)
+        fr = STATE.get("frames", 0)
+        if fr != last and fr > 0:
+            last = fr
+            try:
+                row = _log_row()
+                LOGST["f"].write(";".join(str(x) for x in row) + "\n"); LOGST["f"].flush()
+                LOGST["n"] += 1
+            except Exception:
+                pass
+        stop_ev.wait(0.02)
 
 
 def log_start():
@@ -376,6 +389,11 @@ class Parser:
         return out
 
 
+# --- перехват C9-дамп-стрима: пока active, reader_loop кладёт сырые байты сюда, парсер кадров молчит ---
+DUMPST = {"active": False, "want": 0, "need": 0, "buf": bytearray(), "tail": b"", "until": 0.0}
+DUMP_LOCK = threading.Lock()
+
+
 def reader_loop(ser, stop_ev, fname):
     parser = Parser()   # сырьё НЕ пишем (не нужно, не захламляем папку) — только разбор для панели+CSV
     while not stop_ev.is_set():
@@ -384,6 +402,22 @@ def reader_loop(ser, stop_ev, fname):
         except Exception as e:
             with LOCK: STATE["error"] = f"чтение: {e}"
             break
+        if chunk:
+            with DUMP_LOCK:
+                dumping = DUMPST["active"]
+                if dumping:
+                    # режим дампа: копим сырьё, кадры не разбираем (ЭБУ кадры не шлёт, пока идёт стрим).
+                    # Завершаем СРАЗУ как пришли «преамбула + n», а не по сырому счётчику байт:
+                    # иначе ждём хвост возобновившегося кадра — лишние ~68мс на каждый дамп.
+                    DUMPST["buf"] += chunk
+                    j = DUMPST["buf"].find(b"\x5A\xA5")
+                    need = DUMPST["need"]
+                    if (j >= 0 and len(DUMPST["buf"]) >= j + 2 + need) or len(DUMPST["buf"]) >= DUMPST["want"]:
+                        DUMPST["active"] = False
+            if dumping: continue
+            with DUMP_LOCK:                       # хвост от дампа — это начало нового кадра
+                t = DUMPST["tail"]; DUMPST["tail"] = b""
+            if t: chunk = t + chunk
         if chunk:
             now = time.time()
             frames = parser.feed(chunk)
@@ -411,9 +445,14 @@ def reader_loop(ser, stop_ev, fname):
     with LOCK: STATE["running"] = False
 
 
-def _send_cmd(s, bs, gap=0.03):
-    # байты команды С ПАУЗОЙ — ЭБУ опрашивает RDRF раз в проход цикла (~6мс),
-    # подряд идущие байты теряет. gap>период цикла → каждый байт пойман.
+def _send_cmd(s, bs, gap=0.0):
+    # v7: приёмное прерывание SCI (MYRXISR) кладёт каждый байт в кольцо $1B00 сразу →
+    # шлём ВПЛОТНУЮ, без гэпа. Буфер сам сглаживает. (Прежний gap=30мс — для v3 без прерывания.)
+    if gap <= 0:
+        s.write(bytes(b & 0xFF for b in bs))
+        try: s.flush()
+        except Exception: pass
+        return
     for b in bs:
         s.write(bytes([b & 0xFF]))
         try: s.flush()
@@ -421,29 +460,189 @@ def _send_cmd(s, bs, gap=0.03):
         time.sleep(gap)
 
 
-def _probe_wait(addr, nframes=2, timeout=2.0):
-    # ждём nframes свежих кадров, возвращаем текущий байт по адресу из образа ОЗУ
-    start = STATE.get("frames", 0); t0 = time.time()
-    while STATE.get("frames", 0) - start < nframes:
-        if time.time() - t0 > timeout: break
-        time.sleep(0.02)
-    return STATE["ram"].get(addr)
+def _dump_read(s, base, count, timeout=6.0):
+    # C9-дамп: ЭБУ стримит [5A A5]+n байт из [base] (по 1 байту за проход задачи, ~10мс).
+    # 128 байт ≈ 1.3с → таймаут 6с (запас ×4). reader_loop копит сырьё в DUMPST (кадры молчат).
+    # Синхро-преамбула 5A A5 отсекает мусорный префикс от оборванного кадра → блок выровнен.
+    out = bytearray(); off = 0
+    while off < count:
+        n = min(128, count - off); a = base + off
+        with DUMP_LOCK:
+            DUMPST["buf"] = bytearray(); DUMPST["need"] = n; DUMPST["want"] = n + 48; DUMPST["active"] = True
+        _send_cmd(s, [0xC9, a >> 8, a & 0xFF, n])
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            with DUMP_LOCK:
+                if not DUMPST["active"]: break
+            time.sleep(0.01)
+        with DUMP_LOCK:
+            timed_out = DUMPST["active"]
+            DUMPST["active"] = False
+            DUMPST["until"] = time.time() + 0.3   # короткая пауза: правка ячейки теперь ~0.2с,
+            # секундная «занятость» замораживала бы индикатор указателей при правке подряд
+            raw = bytes(DUMPST["buf"])
+        if timed_out:
+            # ЭБУ ещё досылает остаток ($F9 не досчитан) — гасим стрим (len=0), иначе
+            # хвост утечёт в парсер кадров и в префикс следующего дампа
+            _send_cmd(s, [0xC9, a >> 8, a & 0xFF, 0])
+            time.sleep(0.3)
+        # перебираем ВСЕ вхождения преамбулы: первое может оказаться в мусорном префиксе
+        # от оборванного кадра телеметрии — берём то, после которого реально лежит n байт
+        blk = None; j = raw.find(b"\x5A\xA5")
+        while j >= 0:
+            if len(raw) >= j + 2 + n: blk = raw[j + 2: j + 2 + n]; break
+            j = raw.find(b"\x5A\xA5", j + 1)
+        # хвост после блока — это уже возобновившийся кадр телеметрии; вернём его парсеру,
+        # иначе кадр рвётся и счётчик ошибок растёт на каждой операции
+        if blk is not None and j >= 0:
+            tail = raw[j + 2 + n:]
+            if tail: DUMPST["tail"] = bytes(tail)
+        if blk is None:
+            return None                        # синхро не найдено / недобор → ошибка чтения
+        out += blk; off += n
+    return list(out)
 
 
-TXFLOOD = {"on": False, "byte": 0, "thread_alive": False}
-def tx_flood_loop():
-    # непрерывный поток байтов в ЭБУ — чтобы мультиметром увидеть просадку на ноге Rx
-    while TXFLOOD["on"]:
-        s = CTRL.get("ser")
-        if not s: break
-        try: s.write(bytes([TXFLOOD["byte"]]) * 128)
-        except Exception: break
-    TXFLOOD["thread_alive"] = False
+BLK_MAX = 64          # размер блока (равен буферу в прошивке STAGE)
+BLKC = {"ok": None, "bad": None}   # кэш счётчиков блоков ЭБУ (сбрасывается при переподключении)
+RESTART_SEEN = {"flag": False}     # ЭБУ перезапустился посреди обмена (счётчики блоков обнулились)
+# ВЕСЬ обмен с ЭБУ — под одним замком. Сервер многопоточный (ThreadingHTTPServer): без него
+# правка ячейки во время «привести к бин» шла бы вторым потоком — байты команд в порт
+# вперемешку, и оба потока делили бы один DUMPST, читая ответы друг друга.
+# /api/status замок НЕ берёт: HUD продолжает обновляться во время долгих операций.
+SER_LOCK = threading.RLock()
+ST_OK, ST_BAD = 0x17A7, 0x17A8   # счётчики принятых/отвергнутых блоков в ЭБУ
+
+
+def _blk_status(s):
+    # прочитать счётчики блоков (2 байта) — быстрый дамп, ~50мс
+    r = _dump_read(s, ST_OK, 2, timeout=3.0)
+    return (r[0], r[1]) if r else (None, None)
+
+
+def _send_block(s, addr, data):
+    # [CA][hi][lo][len][данные][chk=XOR данных]. ЭБУ применит блок ТОЛЬКО если сумма сошлась:
+    # потерялся байт → блок отброшен целиком, в живые карты не попадает НИЧЕГО.
+    chk = 0
+    for b in data: chk ^= (b & 0xFF)
+    # базовый счётчик берём из кэша — читать его перед КАЖДЫМ блоком это лишние ~100мс,
+    # а значение мы и так узнаём из подтверждения предыдущего блока
+    ok0, bad0 = BLKC.get("ok"), BLKC.get("bad")
+    if ok0 is None:
+        ok0, bad0 = _blk_status(s)
+        if ok0 is None: return False, "нет связи с ЭБУ"
+    _send_cmd(s, [0xCA, addr >> 8, addr & 0xFF, len(data)] + [b & 0xFF for b in data] + [chk])
+    want_ok = (ok0 + 1) & 0xFF               # принятый блок увеличивает счётчик РОВНО на 1
+    for _ in range(3):                       # ждём, пока ЭБУ дожуёт блок и обновит счётчик
+        ok1, bad1 = _blk_status(s)
+        if ok1 is None: BLKC["ok"] = None; return False, "нет связи"
+        BLKC["ok"], BLKC["bad"] = ok1, bad1
+        if ok1 == want_ok:  return True, ""                    # принят
+        if bad1 != bad0 and ok1 == ok0: return False, "сумма не сошлась"
+        if ok1 != ok0:                                          # ни то ни другое: ЭБУ сбросился
+            BLKC["ok"] = None                                   # (мои счётчики обнуляются при старте)
+            RESTART_SEEN["flag"] = True
+            return False, "счётчики разъехались — ЭБУ перезапустился"
+    BLKC["ok"] = None
+    return False, "ЭБУ не ответил на блок"
+
+
+def _fill_shadow_blocks(s, base, arr):
+    # залить 256 байт блоками по 64 с контролем суммы. Возвращает (ok, сколько блоков не прошло)
+    arr = [b & 0xFF for b in arr]; bad = 0
+    for off in range(0, len(arr), BLK_MAX):
+        chunk = arr[off:off + BLK_MAX]
+        for attempt in range(3):             # блок отвергнут — просто шлём заново
+            ok, err = _send_block(s, base + off, chunk)
+            if ok: break
+        else:
+            bad += 1
+    return bad == 0, bad
+
+
+PTR_SS_ADDR, PTR_UOZ_ADDR = 0x00F0, 0x00F2   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
+
+
+def _bake_bin(fuel, ign, suffix="_лог_"):
+    """Запечь показанные таблицы в копию выбранного бина. → (имя_файла, ошибка)."""
+    if not SEL.get("bin"): return "", "бин не выбран"
+    try:
+        rom = bytearray(open(SEL["bin"], "rb").read())
+        if len(rom) != 32768: return "", "бин не 32КБ"
+        for which, arr in (("fuel", fuel), ("ign", ign)):
+            if arr and len(arr) == 256:
+                off = BINOFF[which]; rom[off:off + 256] = bytes(b & 0xFF for b in arr)
+        recalc_checksum(rom)
+        d = os.path.join(HERE, "логи"); os.makedirs(d, exist_ok=True)
+        bn = os.path.splitext(os.path.basename(SEL["bin"]))[0]
+        fn = os.path.join(d, bn + suffix + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
+        open(fn, "wb").write(rom)
+        return os.path.basename(fn), ""
+    except Exception as e:
+        return "", str(e)
+
+
+def _is_online():
+    # для ПОКАЗА в панели: ЭБУ сообщает в кадре, где стоят указатели ($F0/$F2)
+    return STATE["ram"].get(PTR_SS_ADDR) == 0x18 and STATE["ram"].get(PTR_UOZ_ADDR) == 0x19
+
+
+def _read_ptr(s):
+    # АВТОРИТЕТНОЕ состояние указателя — спрашиваем сам ЭБУ (дамп 1 байта, ~50мс),
+    # а не гадаем по образу ОЗУ, который может быть пустым или устаревшим.
+    r = _dump_read(s, PTR_SS_ADDR, 1, timeout=3.0)
+    return r[0] if r else None
+
+
+def _flip_maps(s, to_shadow):
+    # переключить карты и УБЕДИТЬСЯ что переключилось: байт мог потеряться, а мы бы
+    # отрапортовали успех. Указатель читается дампом одного байта (~50мс).
+    want = 0x18 if to_shadow else 0xFD
+    for _ in range(3):
+        _send_cmd(s, [0xC7 if to_shadow else 0xC8])
+        time.sleep(0.15)
+        r = _dump_read(s, PTR_SS_ADDR, 1, timeout=3.0)
+        if r and r[0] == want:
+            return True
+    return False
+
+
+def _fill_shadow(s, base, arr):
+    # МАССОВАЯ заливка карты. Две защиты:
+    #  1) блоки с контрольной суммой — битый блок отвергается ЭБУ целиком (мусор в карты не попадает)
+    #  2) если сейчас ОНЛАЙН — на время заливки уводим карты на ПЗУ (C8) и возвращаем (C7):
+    #     мотор эти секунды работает стоково и промежуточных состояний карты не видит вообще.
+    RESTART_SEEN["flag"] = False          # признак «ЭБУ перезапустился» — только про ЭТУ заливку
+    # Спрашиваем ЭБУ напрямую. Гадать нельзя: при неизвестном состоянии обёртка вернула бы
+    # карты на тень после заливки ПЕРВОЙ карты, а вторая тень ещё пустая → мотор на мусоре.
+    st = _read_ptr(s)
+    if st is None:
+        return False, 256, "не читается состояние указателей — заливка отменена"
+    was_shadow = (st == 0x18)
+    if was_shadow and not _flip_maps(s, to_shadow=False):
+        return False, 256, "не удалось увести карты на ПЗУ — заливка отменена"
+    restarted = False
+    try:
+        ok, nbad = _fill_shadow_blocks(s, base, arr)
+        restarted = RESTART_SEEN.get("flag", False)
+    finally:
+        if was_shadow and not restarted:
+            _flip_maps(s, to_shadow=True)
+        # кадр идёт 433мс: тот, что был снят при ПЗУ, доедет уже после возврата на тень.
+        # Держим «занято» дольше кадра, иначе панель примет его за сброс блока.
+        DUMPST["until"] = time.time() + 0.9
+    if restarted:
+        # ЭБУ перезапустился посреди заливки: my_init увёл карты на ПЗУ — это безопасно.
+        # НЕ возвращаем на полузалитую тень молча, решение за пользователем.
+        return False, 256, "ЭБУ перезапустился во время заливки — карты оставлены на ПЗУ (сток)"
+    return ok, nbad, "" if ok else "часть блоков не подтвердилась"
 
 
 def do_start(port, baud):
     import serial
-    with CTRL_LOCK:
+    # SER_LOCK: смена порта посреди обмена подменила бы CTRL["ser"] под работающей
+    # транзакцией. Порядок захвата тот же, что в do_stop (SER→CTRL) — цикла нет.
+    with SER_LOCK, CTRL_LOCK:
         if CTRL["stop"]: CTRL["stop"].set()
         if CTRL["thread"]: CTRL["thread"].join(timeout=1.0)
         try:
@@ -456,6 +655,12 @@ def do_start(port, baud):
         time.sleep(0.2)
         try: ser.reset_input_buffer()
         except Exception: pass
+        BLKC["ok"] = BLKC["bad"] = None       # новое подключение → счётчики блоков перечитать
+        # Образ ОЗУ и обученный ноль дросселя — от ПРЕДЫДУЩЕГО блока/прошивки. Раньше не
+        # чистились: после переподключения HUD показывал старые значения как живые, а ноль
+        # газа оставался тем, что поймали в прошлой сессии (в т.ч. при нажатой педали).
+        with LOCK:
+            STATE["ram"].clear(); STATE["tps_min"] = None; STATE["last_frame_t"] = 0
         fname = os.path.join(HERE, "сырьё", "raw_вход_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
         with LOCK:
             STATE.update({"running": True, "port": port, "baud": int(baud),
@@ -472,7 +677,9 @@ def do_start(port, baud):
 
 
 def do_stop():
-    with CTRL_LOCK:
+    # SER_LOCK: не закрываем порт, пока идёт обмен с ЭБУ (заливка/дамп) — иначе поток
+    # транзакции падает на закрытом порту. Отключение подождёт окончания операции.
+    with SER_LOCK, CTRL_LOCK:
         if CTRL["stop"]: CTRL["stop"].set()
         if CTRL["thread"]: CTRL["thread"].join(timeout=1.0)
         CTRL["thread"] = None; CTRL["stop"] = None; CTRL["ser"] = None
@@ -522,9 +729,14 @@ def snapshot():
     temp_raw = ram.get(0x004C)
     alpha_raw = ram.get(0x1431)
     with WLOCK:
+        wfresh = (now - WBL["last_t"]) < 2.0 if WBL["last_t"] else False
         wbl = {"running": WBL["running"], "port": WBL["port"], "total": WBL["total"],
-               "raw": WBL["raw"], "hex": WBL["hex"], "afr": WBL["afr"], "error": WBL["error"],
-               "fresh": (now - WBL["last_t"]) < 2.0 if WBL["last_t"] else False}
+               "raw": WBL["raw"], "hex": WBL["hex"], "error": WBL["error"], "fresh": wfresh,
+               # ПРОТУХШИЙ AFR НЕ ОТДАЁМ. Раньше WBL["afr"] держал последнее значение вечно
+               # (при отключении не сбрасывался), и оно шло в лог и в поправку VE как текущее —
+               # карта правилась по цифре, которой уже нет.
+               "afr": WBL["afr"] if wfresh else None,
+               "afr_last": WBL["afr"], "stale": (WBL["afr"] is not None and not wfresh)}
     d["wbl"] = wbl
 
     top = {
@@ -608,6 +820,18 @@ def snapshot():
             if rpm_raw is not None and a2 is not None:
                 ktps_out["hr"] = nearest_idx(rpm_raw / 4.0, t["ktps_rax"])
                 ktps_out["hc"] = nearest_idx(a2, t["ktps_tax"])
+    # --- ОБРАТНАЯ СВЯЗЬ: где реально стоят указатели карт (говорит сам ЭБУ, не догадка панели) ---
+    ps, pu = ram.get(0x00F0), ram.get(0x00F2)
+    # во время дампа/заливки кадры не идут — это НОРМА, а не потеря связи. Гасим ложную тревогу.
+    d["busy"] = bool(DUMPST["active"] or time.time() < DUMPST.get("until", 0))
+    d["ptr"] = {
+        "fuel": ("shadow" if ps == 0x18 else "rom" if ps == 0xFD else None),
+        "ign":  ("shadow" if pu == 0x19 else "rom" if pu == 0xFC else None),
+        "raw": [ps, pu],
+        # ОНЛАЙН по-настоящему = обе карты читаются из тени
+        "online": (ps == 0x18 and pu == 0x19),
+        "known": (ps is not None and pu is not None),
+    }
     d["top"] = top
     d["fuel"] = fuel_out
     d["ign"] = ign_out
@@ -708,6 +932,10 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  body.light table.map th.corner{color:#567}
  body.light table.map td.hl{outline:2px solid #0a7a2a;background:#c6f0ce;color:#031;font-weight:700}
  body.light table.map td.flag{color:#8a5a10}
+ .estop{background:#8b1a1a;color:#fff;border:1px solid #c0392b;border-radius:6px;padding:6px 12px;
+        font-weight:700;font-size:13px;cursor:pointer;letter-spacing:.5px}
+ .estop:hover{background:#c0392b}
+ .estop:active{transform:translateY(1px)}
  .themebox{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
  header .themebox{float:right;color:inherit;font-weight:600}
  /* ---- новая практическая страница ---- */
@@ -727,6 +955,17 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  .logtab .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
  .logtab .unit{color:#8aa;font-size:12px;margin-left:4px}
  .onlinebar{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+ .ptr{font-size:12px;padding:4px 10px;border-radius:12px;border:1px solid;white-space:nowrap}
+ /* данные устарели: значения остаются видны, но спутать с живыми невозможно */
+ #vars.stale .val{opacity:.35;text-decoration:line-through}
+ .stalebar{display:none;padding:6px 12px;margin-bottom:8px;border-radius:6px;font-size:13px;
+           color:#e0b000;border:1px solid #b8860b;background:rgba(184,134,11,.12)}
+ .divbar{display:none;padding:6px 12px;margin-bottom:8px;border-radius:6px;font-size:13px;
+         color:#e74c3c;border:1px solid #e74c3c;background:rgba(231,76,60,.12)}
+ .ptr.none{color:#7b8794;border-color:#3a4350}
+ .ptr.on{color:#2ecc71;border-color:#2ecc71;background:rgba(46,204,113,.10)}
+ .ptr.off{color:#c9a227;border-color:#c9a227;background:rgba(201,162,39,.10)}
+ .ptr.warn{color:#e74c3c;border-color:#e74c3c;background:rgba(231,76,60,.12)}
  .tobin{font-size:12px;margin-left:8px}
  .rightcol .mapbox{margin-bottom:26px}
  .rightcol .mapbox h2{margin:0 0 10px}
@@ -737,7 +976,8 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  body.light #ctrlbar{background:#fff}body.light .logtab th{background:#eef2f6}body.light .logtab tr.sticky{background:#eaf3ff}
 </style></head><body class=light>
 <div id=ctrlbar>
- <div class=cgrp><span class=clbl>Файл</span><select id=binsel onchange=selbin()></select><span class="stat none" id=binicon>&#9679;</span></div>
+ <div class=cgrp><span class=clbl>Файл</span><select id=binsel onchange=selbin()></select><span class="stat none" id=binicon>&#9679;</span>
+   <button id=btnEstop class=estop onclick=eStop() title="Сохранить лог и бин, отключить ЭБУ и ШДК, заблокировать страницу">&#9632; СТОП</button></div>
  <div class=cgrp><span class=clbl>ЭБУ</span><select id=port onchange=ecuAuto()></select><span class="stat none" id=ecuicon>&#9679;</span></div>
  <div class=cgrp><span class=clbl>ШДК</span><select id=wport onchange=wblAuto()></select><span class="stat none" id=wblicon>&#9679;</span></div>
  <button class=ghost onclick=loadPorts()>&#8635; порты</button>
@@ -750,8 +990,12 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
   <table class=logtab><thead><tr><th>Параметр</th><th>Значение</th></tr></thead><tbody id=vars></tbody></table>
  </div>
  <div class=rightcol>
+  <div id=stalewarn class=stalebar>&#9888; НЕТ СВЕЖИХ ДАННЫХ — показано последнее, что пришло. Живыми не считать.</div>
+  <div id=divwarn class=divbar>&#9888; ПОКАЗ ПАНЕЛИ МОЖЕТ НЕ СОВПАДАТЬ С БЛОКОМ — сохранение бина заблокировано.</div>
   <div class=onlinebar>
    <button class=start id=btnOnline onclick=goOnline()>&#128246; ОНЛАЙН</button>
+   <span id=ptrstat class="ptr none">ЭБУ: связи нет</span>
+   <button class=ghost id=btnLoadRom onclick=readFromRom() style="display:none">&#128229; СЧИТАТЬ ИЗ ПЗУ</button>
    <button class=ghost id=btnSaveBin onclick=saveBin() style="display:none">&#128190; СОХРАНИТЬ БИН</button>
    <span id=onstat class=st style="font-size:13px;color:#8aa"></span>
   </div>
@@ -840,7 +1084,7 @@ function saveProg(){try{localStorage.setItem('j30online',JSON.stringify({on:onli
 function loadProg(){try{const s=JSON.parse(localStorage.getItem('j30online')||'null');
  if(s&&s.on&&s.fuel){online=true;ONLINE.fuel=s.fuel;ONLINE.ign=s.ign;editRendered=false;
   const b=document.getElementById('btnOnline');if(b)b.classList.add('on');
-  document.getElementById('btnSaveBin').style.display='';
+  document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
   document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
   document.getElementById('onstat').textContent='ОНЛАЙН восстановлен из памяти браузера — прогресс не потерян';}}catch(_){}}
 // байт↔физика (как в редакторе). Смесь: 2 кластера AFR; угол: байт=градусы
@@ -867,23 +1111,48 @@ async function cellEdit(which,idx,el){
  const r=await fetch('/api/pokecell',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:which,idx:idx,val:byte})});
  const d=await r.json();td.classList.remove('pend');
  if(d.ok&&d.applied){ONLINE[which][idx]=byte;saveProg();td.classList.add('ok');td.title='байт '+byte;el.value=physOf(which,byte);}
- else{td.classList.add('err');td.title='НЕ применилось: в проце '+d.readback;}}
+ else{td.classList.add('err');td.title='НЕ применилось: '+(d.error||'ЭБУ не подтвердил блок');}}
 async function goOnline(){
  const o=document.getElementById('onstat');
- if(!online){o.textContent='выгрузка карт в тень (C7, стоком)...';
-  await fetch('/api/cmd',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({byte:0xC7})});}
- else o.textContent='перечитываю тени из проца (БЕЗ сброса тюна)...';
  online=true;document.getElementById('btnOnline').classList.add('on');editRendered=true;
+ // 1. залить тень из БИНА poke'ом (указатель ещё на ПЗУ → мотор стоково, безопасно)
  for(const w of ['fuel','ign']){
-  o.textContent='вычит '+(w==='fuel'?'смеси':'угла')+' из проца, ~90с...';
-  const r=await fetch('/api/readtable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
+  o.textContent='заливаю '+(w==='fuel'?'смесь':'угол')+' из бина в тень (poke)...';
+  const r=await fetch('/api/applybin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
   const d=await r.json();
-  if(d.ok){ONLINE[w]=d.cells;renderEdit(w);}else{o.textContent='ошибка вычита: '+d.error;return;}
+  if(d.ok){ONLINE[w]=d.cells;renderEdit(w);}
+  else{o.textContent='ошибка заливки: '+d.error;online=false;editRendered=false;
+       document.getElementById('btnOnline').classList.remove('on');
+       await resyncFromEcu(w);   // в блоке могла осесть часть блоков — привести показ к факту
+       return;}
  }
- document.getElementById('btnSaveBin').style.display='';
+ // 2. флип указателя на ТЕНЬ — С ПОДТВЕРЖДЕНИЕМ. Раньше байт уходил вслепую и панель
+ //    рапортовала успех, даже если мотор остался на ПЗУ.
+ o.textContent='переключаю указатель на тень...';
+ const fr=await fetch('/api/flip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shadow:true})});
+ const fd=await fr.json();
+ if(!fd.ok){
+  o.textContent='НЕ переключилось на тень: '+(fd.error||'')+'. Мотор остался на ПЗУ (сток), правки не действуют.';
+  online=false;editRendered=false;
+  document.getElementById('btnOnline').classList.remove('on');
+  return;
+ }
+ document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
  document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+ setDiverged(false);   // обе карты залиты блоками с подтверждением → показ совпадает с блоком
  saveProg();
- o.textContent='ОНЛАЙН: правь ячейку → уходит в прошивку сразу (зелёная=применилось, красная=нет)';}
+ o.textContent='ОНЛАЙН: тень залита из бина, указатель на тень. Правь ячейку → уходит сразу.';}
+async function readFromRom(){
+ const o=document.getElementById('onstat');
+ for(const w of ['fuel','ign']){
+  o.textContent='читаю '+(w==='fuel'?'смесь':'угол')+' из ПЗУ (дамп)...';
+  const r=await fetch('/api/loadrom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
+  const d=await r.json();
+  if(d.ok){ONLINE[w]=d.cells;renderEdit(w);saveProg();}
+  else{o.textContent='ошибка чтения ПЗУ ('+w+'): '+(d.error||'')+(d.mismatch?(' — не сошлось '+d.mismatch):'');return;}
+ }
+ setDiverged(false);   // ПЗУ вычитано и залито в тень с подтверждением → показ совпадает
+ o.textContent='считано из ПЗУ (сток) → залито в тень. Показано на компе, живое совпадает.';}
 async function saveBin(){
  const r=await fetch('/api/savebin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fuel:ONLINE.fuel,ign:ONLINE.ign})});
  const d=await r.json();
@@ -892,17 +1161,144 @@ async function applyBin(which){
  const o=document.getElementById('onstat');o.textContent='привожу '+which+' к бину...';
  const r=await fetch('/api/applybin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:which})});
  const d=await r.json();
- if(d.ok){ONLINE[which]=d.cells;saveProg();renderEdit(which);o.textContent=which+' приведён к бину ✓';}
- else o.textContent='ошибка: '+d.error;}
+ if(d.ok){ONLINE[which]=d.cells;setDiverged(false);saveProg();renderEdit(which);o.textContent=which+' приведён к бину ✓';}
+ else{o.textContent='ошибка: '+d.error;await resyncFromEcu(which);}}
+// ---- РАСХОЖДЕНИЕ ПАНЕЛИ И БЛОКА ----
+// Заливка могла лечь наполовину: часть блоков в ЭБУ применилась, часть нет. Если оставить
+// показ как был, «СОХРАНИТЬ БИН» запечёт вид ПАНЕЛИ — файл, которого в машине не было.
+// Поэтому: перечитываем карту из блока. Не вышло — помечаем данные недостоверными
+// и запрещаем сохранение до успешного перечитывания.
+let diverged=false;
+function setDiverged(v){
+ diverged=v;
+ const b=document.getElementById('btnSaveBin');
+ if(b){b.disabled=v;b.title=v?'данные панели разошлись с блоком — сначала перечитай из блока':'';}
+ const w=document.getElementById('divwarn');
+ if(w)w.style.display=v?'':'none';
+}
+async function resyncFromEcu(which){
+ const o=document.getElementById('onstat');
+ o.textContent='заливка не прошла — перечитываю '+which+' из блока, чтобы показ совпал с фактом...';
+ try{
+  const r=await fetch('/api/readtable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:which,src:'shadow'})});
+  const d=await r.json();
+  if(d.ok){ONLINE[which]=d.cells;renderEdit(which);saveProg();setDiverged(false);
+           o.textContent='показ приведён к тому, что РЕАЛЬНО в блоке (заливка не прошла целиком)';return;}
+ }catch(_){}
+ setDiverged(true);
+ o.textContent='НЕ удалось перечитать блок. Данные панели могут не совпадать с ЭБУ — сохранение бина заблокировано.';
+}
+// ---- ОБРАТНАЯ СВЯЗЬ: панель показывает то, что говорит ЭБУ ($F0/$F2 в кадре) ----
+// Никакого автовозврата: если блок сбросился на ПЗУ — пишем правду и ждём твоего решения.
+let ptrWas=null;
+function syncPtr(p,conn){
+ const lab=document.getElementById('ptrstat'); if(!lab)return;
+ if(!conn||!p.known){lab.className='ptr none';lab.textContent='ЭБУ: связи нет';ptrWas=null;return;}
+ const on=!!p.online;
+ if(on){lab.className='ptr on';lab.textContent='ЭБУ: карты ИЗ ТЕНИ (правки живые)';}
+ else if(p.fuel==='rom'&&p.ign==='rom'){lab.className='ptr off';lab.textContent='ЭБУ: карты ИЗ ПЗУ (сток, правки НЕ действуют)';}
+ else{lab.className='ptr warn';lab.textContent='ЭБУ: смесь='+(p.fuel||'?')+' угол='+(p.ign||'?')+' — рассинхрон!';}
+ // блок сам ушёл с тени на ПЗУ (сброс питания/зажигания) — сказать явно, не молчать
+ if(ptrWas===true&&on===false){
+  online=false;editRendered=false;saveProg();
+  document.getElementById('btnOnline').classList.remove('on');
+  document.getElementById('onstat').textContent='ЭБУ СБРОСИЛСЯ: указатели вернулись на ПЗУ, мотор на стоке. Тень в ОЗУ цела — нажми ОНЛАЙН, чтобы вернуть.';
+ }
+ ptrWas=on;
+ if(on&&!online){   // блок в тени, а панель об этом не знала (перезагрузил страницу)
+  online=true;document.getElementById('btnOnline').classList.add('on');
+  document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
+  document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+  pullShadow();   // ВАЖНО: без этого показали бы бин вместо того, что реально в блоке
+ }
+}
+// вычитать живую тень из блока в панель (когда включились по факту, а данных на компе нет)
+let pulling=false,pullTries=0;
+async function pullShadow(){
+ if(pulling||ONLINE.fuel)return;
+ // ОГРАНИЧИТЕЛЬ: без него отказ вычита крутился бы вечно — каждая попытка это дамп 2.6с,
+ // канал был бы забит наглухо. 3 попытки, дальше ждём ручного нажатия.
+ if(pullTries>=3){
+  document.getElementById('onstat').textContent='тень не читается (3 попытки). Нажми ОНЛАЙН, чтобы попробовать снова.';
+  return;
+ }
+ pullTries++; pulling=true;
+ const o=document.getElementById('onstat');
+ try{
+  for(const w of ['fuel','ign']){
+   o.textContent='вычитываю живую '+(w==='fuel'?'смесь':'угол')+' из тени блока...';
+   const r=await fetch('/api/readtable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w,src:'shadow'})});
+   const d=await r.json();
+   if(!d.ok){
+    // НЕ оставляем панель в тупике: откатываем признак онлайна, чтобы попытка повторилась,
+    // иначе online=true без данных = карты не рисуются и выхода нет кроме перезагрузки
+    ONLINE.fuel=null;ONLINE.ign=null;online=false;editRendered=false;
+    document.getElementById('btnOnline').classList.remove('on');
+    o.textContent='не вычитал тень ('+w+'): '+(d.error||'')+' — повторю автоматически';
+    return;
+   }
+   ONLINE[w]=d.cells;
+  }
+  editRendered=false;pullTries=0;setDiverged(false);saveProg();   // прочитано ИЗ блока → совпадает
+  o.textContent='ОНЛАЙН восстановлен: показано то, что РЕАЛЬНО в блоке (вычитано из тени).';
+ }finally{pulling=false;}
+}
+// ---- АВАРИЙНЫЙ СТОП ----
+// Сохранить лог и бин, оборвать ЭБУ и ШДК, снять выбор прошивки → страница блокируется.
+// Карты в блоке НЕ трогаем: что в ЭБУ было (тень или ПЗУ) — то и остаётся.
+async function eStop(){
+ const b=document.getElementById('btnEstop');
+ b.disabled=true; b.textContent='СТОП...';
+ const o=document.getElementById('onstat'); if(o)o.textContent='аварийный стоп: сохраняю и отключаюсь...';
+ let d={};
+ try{
+  const r=await fetch('/api/estop',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({fuel:ONLINE.fuel,ign:ONLINE.ign})});
+  d=await r.json();
+ }catch(e){ d={errors:['связь с панелью: '+e]}; }
+ // локальное состояние — в исходное
+ online=false;editRendered=false;ONLINE.fuel=null;ONLINE.ign=null;mapBin=null;pullTries=0;
+ try{localStorage.removeItem('j30online');}catch(_){}
+ const bo=document.getElementById('btnOnline'); if(bo)bo.classList.remove('on');
+ for(const id of ['btnSaveBin','btnLoadRom','tobin_fuel','tobin_ign']){
+  const e=document.getElementById(id); if(e)e.style.display='none';
+ }
+ document.getElementById('binsel').value='';
+ document.getElementById('port').value='';
+ document.getElementById('wport').value='';
+ binLock();                       // нет прошивки → #page.locked → все действия выключены
+ setDiverged(false);
+ let msg='ОСТАНОВЛЕНО. ';
+ msg += d.bin ? ('бин сохранён: '+d.bin+'. ') : 'бин не сохранён (нет данных карт). ';
+ msg += d.log ? ('лог сохранён: '+d.log+'. ') : 'лог не писался. ';
+ msg += 'ЭБУ и ШДК отключены. Карты в блоке не тронуты.';
+ if(d.errors&&d.errors.length) msg += ' ОШИБКИ: '+d.errors.join('; ');
+ if(o)o.textContent=msg;
+ const sw=document.getElementById('stalewarn'); if(sw)sw.style.display='none';
+ b.disabled=false; b.innerHTML='&#9632; СТОП';
+}
 // ---- тик ----
 function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  const portSel=document.getElementById('port').value, wportSel=document.getElementById('wport').value;
- setStat('ecuicon', d.error?'err':(!portSel?'none':(d.running&&d.rate>0?'ok':'warn')));
+ // d.busy = идёт дамп/заливка: кадры молчат ШТАТНО, не мигаем «нет связи»
+ setStat('ecuicon', d.error?'err':(!portSel?'none':((d.running&&(d.rate>0||d.busy))?'ok':'warn')));
  const wb=d.wbl||{};
- setStat('wblicon', wb.error?'err':(!wportSel?'none':(wb.running&&(wb.afr!=null||(wb.raw&&wb.raw.length>2))?'ok':'warn')));
+ // зелёный ТОЛЬКО пока данные свежие: раньше хватало непочищенного raw, и значок
+ // оставался зелёным после выдернутого провода
+ setStat('wblicon', wb.error?'err':(!wportSel?'none':(wb.running&&wb.fresh?'ok':'warn')));
  // ОНЛАЙН доступен только когда ЭБУ реально стримит
- const conn=d.running&&d.rate>0;
+ const conn=d.running&&(d.rate>0||d.busy);
  const bo=document.getElementById('btnOnline'); if(bo)bo.disabled=!conn&&!online;
+ // --- ОБРАТНАЯ СВЯЗЬ: состояние берём ИЗ БЛОКА, а не из памяти браузера ---
+ // во время дампа кадры не идут → состояние указателей неизвестно, НЕ трогаем показания
+ if(!d.busy) syncPtr(d.ptr||{}, conn);
+ // B2: признак свежести считался и никем не использовался — образ ОЗУ не чистится,
+ // и после обрыва связи HUD продолжал показывать последние значения как живые.
+ // frames>0: до первого кадра «протухло» показывать не за что — иначе плашка мигает
+ // на каждом свежем подключении
+ const stale=d.running&&d.frames>0&&!d.fresh&&!d.busy;
+ const vt=document.getElementById('vars'); if(vt)vt.classList.toggle('stale',!!stale);
+ const sw=document.getElementById('stalewarn'); if(sw)sw.style.display=stale?'':'none';
  renderVars(d.vars||[], d.top||{});
  if(d.fuel&&d.ign){
   AX.fuel={rows:d.fuel.rows,cols:d.fuel.cols};AX.ign={rows:d.ign.rows,cols:d.ign.cols};
@@ -914,7 +1310,7 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
   if(online&&ONLINE.fuel&&AX.fuel&&!editRendered){renderEdit('fuel');renderEdit('ign');editRendered=true;}
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
  }
-}).catch(e=>{}).finally(()=>setTimeout(tick,400));}
+}).catch(e=>{}).finally(()=>setTimeout(tick,150));}   // 400→150мс: срезает до 250мс экранной задержки
 function toggletheme(){const dark=document.getElementById('darkbox').checked;
  document.body.classList.toggle('light',!dark);
  try{localStorage.setItem('j30theme',dark?'dark':'light');}catch(_){}}
@@ -982,112 +1378,85 @@ class H(BaseHTTPRequestHandler):
             if p == "": SEL["bin"] = ""            # сброс в «не выбрано»
             elif os.path.exists(p): SEL["bin"] = p
             self._json({"ok": True}); return
-        if self.path.startswith("/api/poke"):
-            try:
-                a = int(data.get("addr", 0)) & 0xFFFF; v = int(data.get("val", 0)) & 0xFF
-                s = CTRL.get("ser")
-                if s: _send_cmd(s, [0xC5, a >> 8, a & 0xFF, v]); self._json({"ok": True})
-                else: self._json({"ok": False, "error": "порт не открыт — Старт"})
-            except Exception as e: self._json({"ok": False, "error": str(e)})
-            return
-        if self.path.startswith("/api/cmd"):
-            # одиночная команда (C7=выгрузить в тень, C8=назад на ROM)
-            try:
-                b = int(data.get("byte", 0)) & 0xFF
-                s = CTRL.get("ser")
-                if s: _send_cmd(s, [b]); self._json({"ok": True})
-                else: self._json({"ok": False, "error": "порт не открыт — Старт"})
-            except Exception as e: self._json({"ok": False, "error": str(e)})
-            return
+        # УБРАН /api/poke (отладочный, произвольный адрес). ВАЖНО: он стоял ВЫШЕ /api/pokecell,
+        # а "/api/pokecell".startswith("/api/poke") == True — значит ВСЕ правки ячеек попадали
+        # сюда, где addr по умолчанию 0 → запись уходила в $0000 вместо карты. Правка ячейки
+        # не работала вообще. Теперь /api/pokecell обрабатывается сам.
+        # УБРАН /api/cmd (слал ПРОИЗВОЛЬНЫЙ байт — та же дыра, что /api/tx и /api/poke:
+        # прилетит C5 или CA и автомат приёма в ЭБУ уедет). Заменён на /api/flip.
+        if self.path.startswith("/api/flip"):
+            # переключить карты ТЕНЬ<->ПЗУ С ПОДТВЕРЖДЕНИЕМ (читаем указатель обратно).
+            # Раньше главный флип в ОНЛАЙН уходил вслепую: байт терялся — панель писала
+            # «указатель на тень», а мотор оставался на ПЗУ.
+            s = CTRL.get("ser")
+            if not s: self._json({"ok": False, "error": "порт не открыт"}); return
+            to_shadow = bool(data.get("shadow", True))
+            with SER_LOCK:
+                ok = _flip_maps(s, to_shadow=to_shadow)
+            self._json({"ok": ok, "shadow": to_shadow,
+                        "error": "" if ok else "ЭБУ не подтвердил переключение карт"}); return
         if self.path.startswith("/api/readtable"):
-            # ВЫЧИТ всей таблицы из проца через peek (256 ячеек, ~90с) — раз на вход в онлайн
-            which = data.get("which", "fuel"); s = CTRL.get("ser"); base = SHADOW.get(which)
+            # ВЫЧИТ таблицы через C9-дамп (~1-2с). src: shadow (живая тень) | rom (ПЗУ, «считать из ПЗУ»)
+            which = data.get("which", "fuel"); src = data.get("src", "shadow"); s = CTRL.get("ser")
+            base = (ROMMAP if src == "rom" else SHADOW).get(which)
             if not s or base is None: self._json({"ok": False, "error": "нет ЭБУ/таблицы"}); return
-            cells = []
-            for i in range(256):
-                a = base + i
-                _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); v = _probe_wait(0x1600)
-                cells.append(v if v is not None else 0)
-            self._json({"ok": True, "which": which, "cells": cells}); return
+            with SER_LOCK:
+                cells = _dump_read(s, base, 256)
+            if cells is None: self._json({"ok": False, "error": "дамп не синхронизировался — повтори"}); return
+            self._json({"ok": True, "which": which, "src": src, "cells": cells}); return
         if self.path.startswith("/api/pokecell"):
+            # ОДНА ячейка — блоком из 1 байта с контрольной суммой: ЭБУ подтверждает счётчиком.
+            # Раньше: poke + peek + ожидание 2 кадров ≈ 0.87с. Теперь ≈ 0.06с и с гарантией.
             which = data.get("which", "fuel"); idx = int(data.get("idx", 0)) & 0xFF; val = int(data.get("val", 0)) & 0xFF
             s = CTRL.get("ser"); base = SHADOW.get(which)
             if not s or base is None: self._json({"ok": False, "error": "нет ЭБУ"}); return
-            a = base + idx
-            _send_cmd(s, [0xC5, a >> 8, a & 0xFF, val])
-            _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); rb = _probe_wait(0x1600)
-            self._json({"ok": True, "applied": rb == val, "readback": rb}); return
+            with SER_LOCK:
+                ok, err = _send_block(s, base + idx, [val])
+            self._json({"ok": ok, "applied": ok, "readback": val if ok else None, "error": err}); return
         if self.path.startswith("/api/applybin"):
-            # привести всю таблицу к значениям бина (poke каждой ячейки)
+            # залить таблицу из бина в тень (poke вплотную → проверка дампом → до-poke расхождений)
             which = data.get("which", "fuel"); s = CTRL.get("ser"); base = SHADOW.get(which)
             t = load_tables(SEL["bin"])
             if not s or base is None or not t: self._json({"ok": False, "error": "нет ЭБУ/бина"}); return
-            arr = t[which]
-            for i in range(256):
-                a = base + i
-                _send_cmd(s, [0xC5, a >> 8, a & 0xFF, arr[i] & 0xFF])
-            self._json({"ok": True, "cells": arr}); return
+            arr = [b & 0xFF for b in t[which]]
+            with SER_LOCK:
+                ok, nbad, err = _fill_shadow(s, base, arr)
+            self._json({"ok": ok, "cells": arr, "mismatch": nbad, "error": err}); return
+        if self.path.startswith("/api/loadrom"):
+            # «считать из ПЗУ»: C9-дамп стоковой карты из ПЗУ → залить в тень (чтобы живое = показанному) → вернуть
+            which = data.get("which", "fuel"); s = CTRL.get("ser")
+            sbase = SHADOW.get(which); rbase = ROMMAP.get(which)
+            if not s or sbase is None or rbase is None: self._json({"ok": False, "error": "нет ЭБУ/таблицы"}); return
+            with SER_LOCK:
+                cells = _dump_read(s, rbase, 256)
+                if cells is None: self._json({"ok": False, "error": "дамп ПЗУ не синхронизировался — повтори"}); return
+                ok, nbad, err = _fill_shadow(s, sbase, cells)
+            self._json({"ok": ok, "which": which, "cells": cells, "mismatch": nbad, "error": err}); return
         if self.path.startswith("/api/savebin"):
             # запечь текущие таблицы (с фронта) в копию бина → логи/<бин>_лог_дата.bin
-            if not SEL.get("bin"): self._json({"ok": False, "error": "бин не выбран"}); return
+            name, err = _bake_bin(data.get("fuel"), data.get("ign"))
+            self._json({"ok": not err, "name": name, "error": err}); return
+        if self.path.startswith("/api/estop"):
+            # АВАРИЙНЫЙ СТОП. Порядок важен: сначала СОХРАНИТЬ, потом рвать связь.
+            # Карты в ЭБУ НЕ трогаем — блок остаётся с тем, что в нём было (тень или ПЗУ).
+            res = {"bin": "", "log": "", "errors": []}
+            name, err = _bake_bin(data.get("fuel"), data.get("ign"), suffix="_СТОП_")
+            res["bin"] = name
+            if err and err != "бин не выбран": res["errors"].append("бин: " + err)
             try:
-                rom = bytearray(open(SEL["bin"], "rb").read()); assert len(rom) == 32768
-                for which, off in BINOFF.items():
-                    arr = data.get(which)
-                    if arr and len(arr) == 256:
-                        rom[off:off + 256] = bytes(b & 0xFF for b in arr)
-                recalc_checksum(rom)
-                d = os.path.join(HERE, "логи"); os.makedirs(d, exist_ok=True)
-                bn = os.path.splitext(os.path.basename(SEL["bin"]))[0]
-                fn = os.path.join(d, bn + "_лог_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".bin")
-                open(fn, "wb").write(rom)
-                self._json({"ok": True, "name": os.path.basename(fn)})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)})
-            return
-        if self.path.startswith("/api/peek"):
-            try:
-                a = int(data.get("addr", 0)) & 0xFFFF
-                s = CTRL.get("ser")
-                if s: _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); self._json({"ok": True})
-                else: self._json({"ok": False, "error": "порт не открыт — Старт"})
-            except Exception as e: self._json({"ok": False, "error": str(e)})
-            return
-        if self.path.startswith("/api/ramprobe"):
-            s = CTRL.get("ser")
-            if not s: self._json({"ok": False, "error": "порт не открыт — Старт"}); return
-            res = []
-            for a in data.get("addrs", []):
-                a &= 0xFFFF
-                if a < 0x40 or (0x1000 <= a <= 0x106F):   # регистры/UPP — не трогаем
-                    res.append({"addr": a, "ram": None, "skip": "регистр/UPP"}); continue
-                _send_cmd(s, [0xC6, a >> 8, a & 0xFF]); orig = _probe_wait(0x1600)
-                _send_cmd(s, [0xC5, a >> 8, a & 0xFF, 0xAA]); v1 = _probe_wait(0x1600)
-                _send_cmd(s, [0xC5, a >> 8, a & 0xFF, 0x55]); v2 = _probe_wait(0x1600)
-                _send_cmd(s, [0xC5, a >> 8, a & 0xFF, orig if orig is not None else 0])  # restore
-                res.append({"addr": a, "ram": (v1 == 0xAA and v2 == 0x55), "orig": orig})
-            self._json({"ok": True, "res": res})
-            return
-        if self.path.startswith("/api/tx/hold"):
-            # непрерывный поток (для замера просадки на ноге). Байт 0 = линия внизу 90% времени
-            v = int(data.get("byte", 0)) & 0xFF
-            on = bool(data.get("on", False))
-            TXFLOOD["byte"] = v; TXFLOOD["on"] = on
-            if on and not TXFLOOD["thread_alive"] and CTRL.get("ser"):
-                TXFLOOD["thread_alive"] = True
-                threading.Thread(target=tx_flood_loop, daemon=True).start()
-            self._json({"ok": bool(CTRL.get("ser")), "error": "" if CTRL.get("ser") else "порт не открыт — Старт"})
-            return
-        if self.path.startswith("/api/tx"):
-            # RX-тест: шлём байт в ЭБУ по тому же порту (FTDI TX → Rx блока)
-            try:
-                v = int(data.get("byte", 0)) & 0xFF
-                s = CTRL.get("ser")
-                if s: s.write(bytes([v])); self._json({"ok": True, "error": ""})
-                else: self._json({"ok": False, "error": "порт не открыт — нажми Старт"})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e)})
-            return
+                res["log"] = os.path.basename(LOGST["path"]) if LOGST.get("on") else ""
+            except Exception: pass
+            for fn_, tag in ((log_stop, "лог"), (do_stop, "ЭБУ"), (wbl_stop, "ШДК")):
+                try: fn_()
+                except Exception as e: res["errors"].append("%s: %s" % (tag, e))
+            SEL["bin"] = ""                      # снять выбор прошивки → страница блокируется
+            res["ok"] = True
+            self._json(res); return
+        # УБРАНЫ отладочные эндпоинты /api/peek, /api/ramprobe, /api/tx, /api/tx/hold.
+        # Пока приём был опросным, произвольные байты в основном терялись. С приёмным
+        # ПРЕРЫВАНИЕМ ловится каждый — флуд байтом 0xC5 запускал бы бесконечные POKE,
+        # а guard разрешает запись ровно в $1800-$1FFF, т.е. В ЖИВЫЕ КАРТЫ на ходу.
+        # Карта ОЗУ промерена, отладка больше не нужна.
         if self.path.startswith("/api/wbl/start"):
             ok, err = wbl_start(data.get("port", "")); self._json({"ok": ok, "error": err}); return
         if self.path.startswith("/api/wbl/stop"):
