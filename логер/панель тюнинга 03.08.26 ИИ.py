@@ -70,8 +70,8 @@ NARROW_MAP = [
     0x00F8, 0x00F9,
     0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.005=мс, тик 5мкс датащит)
     0x1AAC,   # результат peek (PEEK_OUT). БЫЛ $1600 — там заводская контрольная сумма
-    0x00F0,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_сс  — $18 = ТЕНЬ, $FD = ПЗУ (zero-page, низ блока)
-    0x00F2,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_уоз — $19 = ТЕНЬ, $FC = ПЗУ (zero-page, низ блока)
+    0x1AB0,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_сс  — $18 = ТЕНЬ, $FD = ПЗУ
+    0x1AB2,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_уоз — $19 = ТЕНЬ, $FC = ПЗУ
 ]
 
 STATE = {
@@ -560,7 +560,7 @@ def _fill_shadow_blocks(s, base, arr):
     return bad == 0, bad
 
 
-PTR_SS_ADDR, PTR_UOZ_ADDR = 0x00F0, 0x00F2   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
+PTR_SS_ADDR, PTR_UOZ_ADDR = 0x1AB0, 0x1AB2   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
 
 
 def _bake_bin(fuel, ign, suffix="_лог_"):
