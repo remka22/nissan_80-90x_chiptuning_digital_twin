@@ -69,9 +69,8 @@ NARROW_MAP = [
     0x14A2, 0x14DE, 0x14DF, 0x00B9, 0x00AE,
     0x00F8, 0x00F9,
     0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.005=мс, тик 5мкс датащит)
-    0x1AAC,   # результат peek (PEEK_OUT). БЫЛ $1600 — там заводская контрольная сумма
-    0x1AB0,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_сс  — $18 = ТЕНЬ, $FD = ПЗУ
-    0x1AB2,   # ОБРАТНАЯ СВЯЗЬ: старший байт ptr_уоз — $19 = ТЕНЬ, $FC = ПЗУ
+    0x17F7,   # результат peek (PEEK_OUT)
+    0x17E0,   # ОБРАТНАЯ СВЯЗЬ: указатель карты смеси — $16 = ТЕНЬ, $FD = ПЗУ
 ]
 
 STATE = {
@@ -239,9 +238,10 @@ def deg_of(x):        # значение карты угла → градусы 
 
 
 # ---- ОНЛАЙН-тюнинг: тень карт в ОЗУ (v4) ----
-SHADOW = {"fuel": 0x1800, "ign": 0x1900}   # адрес тени в ОЗУ (см. build_targeted_patch)
-ROMMAP = {"fuel": 0xFD00, "ign": 0xFC00}   # адрес карты в ПЗУ (CPU) — для дампа «считать из ПЗУ»
-BINOFF = {"fuel": 0x7D00, "ign": 0x7C00}   # смещение карты в файле бина
+# ⚠ ОЗУ в блоке 1280 б, $1800+ НЕ СУЩЕСТВУЕТ (измерено 04.08.26). Тень помещается только одна.
+SHADOW = {"fuel": 0x1600}                  # тень карты смеси, 256 б — единственная
+ROMMAP = {"fuel": 0xFD00}                  # карта смеси в ПЗУ — для «считать из ПЗУ»
+BINOFF = {"fuel": 0x7D00}                  # смещение карты смеси в бине (угол — только перепрошивкой)
 
 
 def recalc_checksum(b):
@@ -503,7 +503,7 @@ def _dump_read(s, base, count, timeout=6.0):
     return list(out)
 
 
-BLK_MAX = 64          # размер блока (равен буферу в прошивке STAGE)
+BLK_MAX = 32          # размер блока (равен буферу в прошивке STAGE)
 BLKC = {"ok": None, "bad": None}   # кэш счётчиков блоков ЭБУ (сбрасывается при переподключении)
 RESTART_SEEN = {"flag": False}     # ЭБУ перезапустился посреди обмена (счётчики блоков обнулились)
 # ВЕСЬ обмен с ЭБУ — под одним замком. Сервер многопоточный (ThreadingHTTPServer): без него
@@ -511,7 +511,7 @@ RESTART_SEEN = {"flag": False}     # ЭБУ перезапустился пос�
 # вперемешку, и оба потока делили бы один DUMPST, читая ответы друг друга.
 # /api/status замок НЕ берёт: HUD продолжает обновляться во время долгих операций.
 SER_LOCK = threading.RLock()
-ST_OK, ST_BAD = 0x1AA7, 0x1AA8   # счётчики принятых/отвергнутых блоков в ЭБУ
+ST_OK, ST_BAD = 0x17F5, 0x17F6   # счётчики принятых/отвергнутых блоков в ЭБУ
 
 
 def _blk_status(s):
@@ -560,7 +560,7 @@ def _fill_shadow_blocks(s, base, arr):
     return bad == 0, bad
 
 
-PTR_SS_ADDR, PTR_UOZ_ADDR = 0x1AB0, 0x1AB2   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
+PTR_SS_ADDR = 0x17E0   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
 
 
 def _bake_bin(fuel, ign, suffix="_лог_"):
@@ -569,7 +569,7 @@ def _bake_bin(fuel, ign, suffix="_лог_"):
     try:
         rom = bytearray(open(SEL["bin"], "rb").read())
         if len(rom) != 32768: return "", "бин не 32КБ"
-        for which, arr in (("fuel", fuel), ("ign", ign)):
+        for which, arr in (("fuel", fuel),):
             if arr and len(arr) == 256:
                 off = BINOFF[which]; rom[off:off + 256] = bytes(b & 0xFF for b in arr)
         recalc_checksum(rom)
@@ -583,8 +583,8 @@ def _bake_bin(fuel, ign, suffix="_лог_"):
 
 
 def _is_online():
-    # для ПОКАЗА в панели: ЭБУ сообщает в кадре, где стоят указатели ($F0/$F2)
-    return STATE["ram"].get(PTR_SS_ADDR) == 0x18 and STATE["ram"].get(PTR_UOZ_ADDR) == 0x19
+    # для ПОКАЗА в панели: ЭБУ сообщает в кадре, где стоит указатель карты смеси
+    return STATE["ram"].get(PTR_SS_ADDR) == 0x16
 
 
 def _read_ptr(s):
@@ -597,7 +597,7 @@ def _read_ptr(s):
 def _flip_maps(s, to_shadow):
     # переключить карты и УБЕДИТЬСЯ что переключилось: байт мог потеряться, а мы бы
     # отрапортовали успех. Указатель читается дампом одного байта (~50мс).
-    want = 0x18 if to_shadow else 0xFD
+    want = 0x16 if to_shadow else 0xFD
     for _ in range(3):
         _send_cmd(s, [0xC7 if to_shadow else 0xC8])
         time.sleep(0.15)
@@ -617,8 +617,8 @@ def _fill_shadow(s, base, arr):
     # карты на тень после заливки ПЕРВОЙ карты, а вторая тень ещё пустая → мотор на мусоре.
     st = _read_ptr(s)
     if st is None:
-        return False, 256, "не читается состояние указателей — заливка отменена"
-    was_shadow = (st == 0x18)
+        return False, 256, "не читается состояние указателя — заливка отменена"
+    was_shadow = (st == 0x16)
     if was_shadow and not _flip_maps(s, to_shadow=False):
         return False, 256, "не удалось увести карты на ПЗУ — заливка отменена"
     restarted = False
@@ -821,16 +821,15 @@ def snapshot():
                 ktps_out["hr"] = nearest_idx(rpm_raw / 4.0, t["ktps_rax"])
                 ktps_out["hc"] = nearest_idx(a2, t["ktps_tax"])
     # --- ОБРАТНАЯ СВЯЗЬ: где реально стоят указатели карт (говорит сам ЭБУ, не догадка панели) ---
-    ps, pu = ram.get(0x00F0), ram.get(0x00F2)
+    ps = ram.get(PTR_SS_ADDR)
     # во время дампа/заливки кадры не идут — это НОРМА, а не потеря связи. Гасим ложную тревогу.
     d["busy"] = bool(DUMPST["active"] or time.time() < DUMPST.get("until", 0))
+    # Тень только у карты СМЕСИ: в блоке 1280 байт ОЗУ, вторая карта не помещается.
     d["ptr"] = {
-        "fuel": ("shadow" if ps == 0x18 else "rom" if ps == 0xFD else None),
-        "ign":  ("shadow" if pu == 0x19 else "rom" if pu == 0xFC else None),
-        "raw": [ps, pu],
-        # ОНЛАЙН по-настоящему = обе карты читаются из тени
-        "online": (ps == 0x18 and pu == 0x19),
-        "known": (ps is not None and pu is not None),
+        "fuel": ("shadow" if ps == 0x16 else "rom" if ps == 0xFD else None),
+        "raw": [ps],
+        "online": (ps == 0x16),
+        "known": (ps is not None),
     }
     d["top"] = top
     d["fuel"] = fuel_out
@@ -1000,7 +999,7 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
    <span id=onstat class=st style="font-size:13px;color:#8aa"></span>
   </div>
   <div class=mapbox><h2>&#9819; Смесь (AFR) <button class=tobin id=tobin_fuel onclick="applyBin('fuel')" style="display:none">привести к бин</button></h2><div id=fuelmap>—</div></div>
-  <div class=mapbox><h2>&#9889; Угол (УОЗ, град) <button class=tobin id=tobin_ign onclick="applyBin('ign')" style="display:none">привести к бин</button></h2><div id=ignmap>—</div></div>
+  <div class=mapbox><h2>&#9889; Угол (УОЗ, град) <span style="font-size:11px;color:#8aa;font-weight:400">только чтение — тень в ОЗУ не помещается</span></h2><div id=ignmap>—</div></div>
  </div>
 </div>
 </div>
@@ -1085,7 +1084,7 @@ function loadProg(){try{const s=JSON.parse(localStorage.getItem('j30online')||'n
  if(s&&s.on&&s.fuel){online=true;ONLINE.fuel=s.fuel;ONLINE.ign=s.ign;editRendered=false;
   const b=document.getElementById('btnOnline');if(b)b.classList.add('on');
   document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
-  document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+  document.getElementById('tobin_fuel').style.display='';
   document.getElementById('onstat').textContent='ОНЛАЙН восстановлен из памяти браузера — прогресс не потерян';}}catch(_){}}
 // байт↔физика (как в редакторе). Смесь: 2 кластера AFR; угол: байт=градусы
 function afrOf(x){return (x>=128)?Math.round(188160/(x-64))/100:Math.round(188160/(x+128))/100;}
@@ -1116,8 +1115,8 @@ async function goOnline(){
  const o=document.getElementById('onstat');
  online=true;document.getElementById('btnOnline').classList.add('on');editRendered=true;
  // 1. залить тень из БИНА poke'ом (указатель ещё на ПЗУ → мотор стоково, безопасно)
- for(const w of ['fuel','ign']){
-  o.textContent='заливаю '+(w==='fuel'?'смесь':'угол')+' из бина в тень (poke)...';
+ for(const w of ['fuel']){
+  o.textContent='заливаю смесь из бина в тень...';
   const r=await fetch('/api/applybin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
   const d=await r.json();
   if(d.ok){ONLINE[w]=d.cells;renderEdit(w);}
@@ -1138,14 +1137,14 @@ async function goOnline(){
   return;
  }
  document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
- document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+ document.getElementById('tobin_fuel').style.display='';
  setDiverged(false);   // обе карты залиты блоками с подтверждением → показ совпадает с блоком
  saveProg();
  o.textContent='ОНЛАЙН: тень залита из бина, указатель на тень. Правь ячейку → уходит сразу.';}
 async function readFromRom(){
  const o=document.getElementById('onstat');
- for(const w of ['fuel','ign']){
-  o.textContent='читаю '+(w==='fuel'?'смесь':'угол')+' из ПЗУ (дамп)...';
+ for(const w of ['fuel']){
+  o.textContent='читаю смесь из ПЗУ (дамп)...';
   const r=await fetch('/api/loadrom',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w})});
   const d=await r.json();
   if(d.ok){ONLINE[w]=d.cells;renderEdit(w);saveProg();}
@@ -1208,7 +1207,7 @@ function syncPtr(p,conn){
  if(on&&!online){   // блок в тени, а панель об этом не знала (перезагрузил страницу)
   online=true;document.getElementById('btnOnline').classList.add('on');
   document.getElementById('btnSaveBin').style.display='';document.getElementById('btnLoadRom').style.display='';
-  document.getElementById('tobin_fuel').style.display='';document.getElementById('tobin_ign').style.display='';
+  document.getElementById('tobin_fuel').style.display='';
   pullShadow();   // ВАЖНО: без этого показали бы бин вместо того, что реально в блоке
  }
 }
@@ -1225,8 +1224,8 @@ async function pullShadow(){
  pullTries++; pulling=true;
  const o=document.getElementById('onstat');
  try{
-  for(const w of ['fuel','ign']){
-   o.textContent='вычитываю живую '+(w==='fuel'?'смесь':'угол')+' из тени блока...';
+  for(const w of ['fuel']){
+   o.textContent='вычитываю живую смесь из тени блока...';
    const r=await fetch('/api/readtable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({which:w,src:'shadow'})});
    const d=await r.json();
    if(!d.ok){
@@ -1260,7 +1259,7 @@ async function eStop(){
  online=false;editRendered=false;ONLINE.fuel=null;ONLINE.ign=null;mapBin=null;pullTries=0;
  try{localStorage.removeItem('j30online');}catch(_){}
  const bo=document.getElementById('btnOnline'); if(bo)bo.classList.remove('on');
- for(const id of ['btnSaveBin','btnLoadRom','tobin_fuel','tobin_ign']){
+ for(const id of ['btnSaveBin','btnLoadRom','tobin_fuel']){
   const e=document.getElementById(id); if(e)e.style.display='none';
  }
  document.getElementById('binsel').value='';
@@ -1302,12 +1301,13 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  renderVars(d.vars||[], d.top||{});
  if(d.fuel&&d.ign){
   AX.fuel={rows:d.fuel.rows,cols:d.fuel.cols};AX.ign={rows:d.ign.rows,cols:d.ign.cols};
-  if(!online&&mapBin!==d.bin){  // в онлайне карты редактируемые — не затираем
-   document.getElementById('fuelmap').innerHTML=renderMap(d.fuel,'fuel');
+  // угол всегда только для чтения — тень для него в ОЗУ не помещается
+  if(mapBin!==d.bin||!online){
+   if(!online)document.getElementById('fuelmap').innerHTML=renderMap(d.fuel,'fuel');
    document.getElementById('ignmap').innerHTML=renderMap(d.ign,'ign');
    mapBin=d.bin;hlIds={fuel:null,ign:null};}
   // восстановление онлайна из памяти браузера: отрисовать редактируемые таблицы когда оси готовы
-  if(online&&ONLINE.fuel&&AX.fuel&&!editRendered){renderEdit('fuel');renderEdit('ign');editRendered=true;}
+  if(online&&ONLINE.fuel&&AX.fuel&&!editRendered){renderEdit('fuel');editRendered=true;}
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
  }
 }).catch(e=>{}).finally(()=>setTimeout(tick,150));}   // 400→150мс: срезает до 250мс экранной задержки
