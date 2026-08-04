@@ -29,9 +29,12 @@ LABELS = [
     (0x1411, "Впрыск расчёт",        16, "мс(до UPP)",         0.005),  # $142A×$1413+deadtime, ДО масштаба
     (0x004D, "Впрыск РЕАЛ (форс)",   16, "мс",                 0.005),  # $004D→UPP-каналы, тик 5мкс (датащит)
     # --- ДРОССЕЛЬ (TPS) ---
+    (0x00CF, "Указатель карты hi",   8, "$FD=ПЗУ $16=тень",   None),
+    (0x00D0, "Указатель карты lo",   8, "должен быть 0",      None),
+    (0x141A, "Карта топлива вернула",8, "сырьё",              None),
     (0x1492, "TPS дроссель",         16, "сырьё 10б",          None),   # аналог. дроссель, ch6
     (0x14A2, "TPS открытие",          8, "сырьё (от нуля)",    None),  # % считается отдельно из $1492: (ацп−мин)/344
-    (0x14DE, "Обогащ. ускорения",    16, "добавка в форсунку", None),   # >0 = было обогащение
+    (0x14DE, "Обогащ. ускорения",     8, "добавка в форсунку", None),   # >0 = было обогащение
     (0x00B9, "Флаг TPS",              8, "0x20=ХХ/WOT/обрыв",  None),
     # --- ДАД: выбранные из ОЗУ (на MAF-бине = мусор) ---
     (0x00F8, "VE выбранное",          8, "×нап (128=1.0)",     0.0078125),  # карта 0x4900
@@ -66,11 +69,12 @@ NARROW_MAP = [
     0x1492, 0x1493,
     0x140F, 0x143B, 0x0053,
     0x0015, 0x0054, 0x142C,
-    0x14A2, 0x14DE, 0x14DF, 0x00B9, 0x00AE,
+    0x14A2, 0x14DE, 0x00B9, 0x00AE,   # обогащение — только старший байт (место в кадре)
     0x00F8, 0x00F9,
     0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.005=мс, тик 5мкс датащит)
     0x17F7,   # результат peek (PEEK_OUT)
-    0x17E0,   # ОБРАТНАЯ СВЯЗЬ: указатель карты смеси — $16 = ТЕНЬ, $FD = ПЗУ
+    0x00CF, 0x00D0,   # указатель карты смеси ЦЕЛИКОМ: $FD00 = ПЗУ, $1600 = тень
+    0x141A,   # ЧТО ВЕРНУЛА карта топлива (диагностика)
 ]
 
 STATE = {
@@ -560,7 +564,7 @@ def _fill_shadow_blocks(s, base, arr):
     return bad == 0, bad
 
 
-PTR_SS_ADDR = 0x17E0   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
+PTR_SS_ADDR = 0x00CF   # указатель карты смеси — в zero-page процессора   # указатели карт в ОЗУ ЭБУ (см. build_targeted_patch)
 
 
 def _bake_bin(fuel, ign, suffix="_лог_"):
@@ -1194,9 +1198,10 @@ function syncPtr(p,conn){
  const lab=document.getElementById('ptrstat'); if(!lab)return;
  if(!conn||!p.known){lab.className='ptr none';lab.textContent='ЭБУ: связи нет';ptrWas=null;return;}
  const on=!!p.online;
- if(on){lab.className='ptr on';lab.textContent='ЭБУ: карты ИЗ ТЕНИ (правки живые)';}
- else if(p.fuel==='rom'&&p.ign==='rom'){lab.className='ptr off';lab.textContent='ЭБУ: карты ИЗ ПЗУ (сток, правки НЕ действуют)';}
- else{lab.className='ptr warn';lab.textContent='ЭБУ: смесь='+(p.fuel||'?')+' угол='+(p.ign||'?')+' — рассинхрон!';}
+ // тень только у смеси: вторая карта в 1280 байт ОЗУ блока не помещается
+ if(on){lab.className='ptr on';lab.textContent='ЭБУ: смесь ИЗ ТЕНИ (правки живые)';}
+ else if(p.fuel==='rom'){lab.className='ptr off';lab.textContent='ЭБУ: смесь ИЗ ПЗУ (сток, правки НЕ действуют)';}
+ else{lab.className='ptr warn';lab.textContent='ЭБУ: указатель смеси = '+(p.raw&&p.raw[0]!=null?('$'+p.raw[0].toString(16).toUpperCase()):'?')+' — не ПЗУ и не тень';}
  // блок сам ушёл с тени на ПЗУ (сброс питания/зажигания) — сказать явно, не молчать
  if(ptrWas===true&&on===false){
   online=false;editRendered=false;saveProg();
