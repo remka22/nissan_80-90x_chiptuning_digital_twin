@@ -21,45 +21,67 @@ LOCK = threading.Lock()
 # Подписи под УЗКИЙ кадр v8+ (27 байт). Все адреса подтверждены дизасмом (трассы 01.08.26).
 # fmt: 8=байт, 16=слово. mul: множитель в реал или None (сырьё).
 LABELS = [
-    # --- основное ---
+    # ====================== ПАРАМЕТРЫ ======================
     (0x140A, "Обороты",              16, "об/мин",             12.807),
-    (0x1482, "Нагрузка (сглаж.)",     8, "сырьё (/8=TP)",      None),
-    (0x1413, "Расход мгновенный",     8, "сырьё (гэп→транзит)", None),  # $1413−$1482 = газовка
-    (0x1431, "ALPHA",                 8, "× (100=1.0)",        0.01),
-    (0x004D, "Впрыск РЕАЛ (форс)",   16, "мс",                 0.010),  # $004D→UPP-каналы, ТИК 10 мкс (испр. 04.08.26)
-    # --- СОСТОЯНИЕ ТЕНИ (v18): одна тень на все карты, поэтому в кадре не указатели, а состояние ---
-    (0x17F8, "Карта в тени",          8, "0 нет / 1 смесь / 2 угол", None),
-    (0x17F9, "Вердикт указателя",     8, "0 ПЗУ / 1 тень / 255 АВАРИЯ", None),
-    (0x17FA, "XOR тени",              8, "сверка содержимого",  None),
-    (0x17FB, "Сумма тени",            8, "сверка содержимого",  None),
-    # --- ДРОССЕЛЬ (TPS) ---
-    (0x141A, "Карта топлива вернула",8, "сырьё",              None),
-    (0x1492, "TPS дроссель",         16, "сырьё 10б",          None),   # аналог. дроссель, ch6
-    (0x14A2, "TPS открытие",          8, "сырьё (от нуля)",    None),  # % считается отдельно из $1492: (ацп−мин)/344
-    (0x14DE, "Обогащ. ускорения",     8, "добавка в форсунку", None),   # >0 = было обогащение
-    (0x00B9, "Флаг TPS",              8, "0x20=ХХ/WOT/обрыв",  None),
-    # --- ДАД: выбранные из ОЗУ (на MAF-бине = мусор) ---
-    (0x00F8, "VE выбранное",          8, "×нап (128=1.0)",     0.0078125),  # карта 0x4900
-    (0x00F9, "Ktps выбранное",        8, "× (128=1.0)",        0.0078125),  # карта 0x4B00
-    # --- концевики / флаги режима ---
-    (0x0054, "Флаг ХХ/газ",           8, "б0=ХХ",              None),
-    (0x0015, "Банк концевиков",       8, "0x80=СТАРТЕР(255=крутит) 0x20нейтр 0x10ХХ", None),
-    (0x0053, "Флаги угла",            8, "б0ХХ б1крэнк б2нейтр (какая карта)", None),
-    (0x00AE, "Замкнутый цикл",        8, "0x80=вошёл",         None),
-    # --- УОЗ (°BTDC = 70 − сырьё; см. колонку УОЗ_°BTDC) ---
-    (0x140F, "УОЗ финал сырьё",       8, "°=70−байт",          None),
-    (0x143B, "УОЗ карта",             8, "≈градусы (база)",    None),
-    # --- контур ХХ ---
-    (0x142C, "Цель ХХ",               8, "у.е.",               None),
-    # --- АЦП опознанные (рабочие) ---
-    (0x1408, "АЦП ch0 (МАФ/ДАД)",     8, "сырьё, старший байт", None),
-    (0x00F7, "Давление",              8, "кПа (считает рутина ДАД)", None),
-    (0x008F, "АЦП ch1 напряжение",    8, "сырьё",              None),
-    (0x004C, "АЦП ch2 темп ОЖ",       8, "сырьё",              None),
-    (0x1400, "АЦП ch3 O2",            8, "сырьё (лямбда титан)", None),
-    # --- RX-ТЕСТ приёма по SCI ---
-    (0x1600, "peek ($1600)",          8, "*(указатель) — poke/peek/проба", None),
+    (0x1482, "Нагрузка (ось карт)",   8, "сырьё (/8=TP)",      None),
+    (0x1413, "Наполнение мгновенное", 8, "до сглаживания",     None),  # $1413−$1482 = газовка
+    (0x14A2, "Дроссель открытие",     8, "от выученного нуля", None),  # % считается отдельно из $1492: (ацп−мин)/344
+    (0x004D, "Впрыск, мс",           16, "мс",                 0.010),  # $004D→UPP-каналы, ТИК 10 мкс (испр. 04.08.26)
+    (0x142C, "Мёртвое время форсунки",8, "в единицах впрыска", None),
+    (0x14DE, "Обогащение ускорения",  8, "добавка топлива",    None),   # >0 = было обогащение
+    (0x141A, "Смесь из карты (сырьё)",8,"что вернула выборка", None),
+    (0x140F, "УОЗ сырьё",             8, "°=70−байт",          None),
+    (0x143B, "УОЗ из карты",          8, "≈градусы, до коррекций", None),
+    (0x00F7, "Давление, кПа",         8, "считает рутина ДАД", None),
+    (0x00F8, "VE (ДАД)",    8, "× (1.00 = нет)",     0.0078125),  # карта 0x4900
+    (0x00F9, "Ktps (ДАД)",  8, "× (1.00 = нет)",     0.0078125),  # карта 0x4B00
+    (0x1431, "Коррекция по лямбде",   8, "× (1.00 = нет)",     0.01),
+    (0x17F8, "Живая карта",           8, "0 нет / 1 смесь / 2 угол / 3 VE / 4 Ktps", None),
+    (0x17F9, "Состояние указателя",    8, "0 ПЗУ / 1 тень / 255 АВАРИЯ", None),
+    # ======================== АЦП (сырьё) ===================
+    (0x1408, "АЦП Расходомер/ДАД", 16, "10 бит",             None),
+    (0x1492, "АЦП Дроссель", 16, "10 бит",             None),   # аналог. дроссель, ch6
+    (0x008F, "АЦП Напряжение борта",8,"175 ≈ 14 В",        None),
+    (0x004C, "АЦП Температура ОЖ",8, "меньше = горячее",   None),
+    (0x1400, "АЦП Лямбда",        8, "узкополосный датчик", None),
 ]
+
+
+# ---- УПАКОВАННЫЕ ФЛАГИ $17FF: восемь бит, которые прошивка собирает из пяти байт ----
+# Раньше эти байты ехали в кадр сырьём и занимали пять слотов, а полезных бит в них
+# было по одному-два — остальное кухня планировщика. Теперь один байт, и он
+# раскладывается здесь в понятные колонки 0/1. Подписаны ТОЛЬКО доказанные биты.
+FLAGBITS = [
+    (0x01, "ФЛАГ Отсечка"),          # $0054.01 — в этих строках впрыск ровно 0
+    (0x02, "ФЛАГ Впрыск разрешён"),  # $0054.04 — 8d4b: не стоит, расчёт пропускается
+    (0x04, "ФЛАГ Замкнутый цикл"),   # $00AE.80
+    (0x08, "ФЛАГ Крэнк"),            # $0053.02 — подтверждено веткой удвоения впрыска
+    (0x10, "ФЛАГ Нейтраль"),         # $0053.04 — сошлось с $0015.20 строка в строку
+    (0x20, "ФЛАГ Холостой ход"),     # $0053.01
+    (0x40, "ФЛАГ Стартер"),          # $0015.80
+    (0x80, "ФЛАГ Неисправность TPS"),# $00B9.20
+]
+# Оставшиеся биты $0053 — тоже по строке на бит. Смысл не доказан, поэтому в названии
+# стоит адрес и маска, а не выдуманная подпись. Биты 40 и 08 вместе решают, какую
+# таблицу порогов наката брать ($7F40 или $7F50) — это видно на 8c04-8c3c.
+RAWBITS_0053 = [
+    (0x08, "ФЛАГ $0053.08 гейт наката"),
+    (0x40, "ФЛАГ $0053.40 гейт наката"),
+    (0x80, "ФЛАГ $0053.80 не разобран"),
+]
+FLAGNAMES = [n for _b, n in FLAGBITS] + [n for _b, n in RAWBITS_0053]
+
+
+def flags_decode(ram):
+    """Байты $17FF и $0053 → {имя: 0/1}. Одна строка = один бит = одно понятие.
+    Нет байта — None, чтобы в логе была пустота, а не вводящие в заблуждение нули."""
+    out = {}
+    v = ram.get(0x17FF)
+    for b, n in FLAGBITS: out[n] = None if v is None else (1 if v & b else 0)
+    r = ram.get(0x0053)
+    for b, n in RAWBITS_0053: out[n] = None if r is None else (1 if r & b else 0)
+    return out
+
 
 # Узкий кадр v8: маркер $FFF0, 13 байт значений в фикс. порядке (декод по позиции).
 # Порядок = ADDR_LIST билдера build_targeted_patch: раскладываем на РЕАЛЬНЫЕ адреса.
@@ -68,19 +90,20 @@ NARROW_MARKER = 0xFFF0
 # Декод позиционный + панель адаптивна по длине — терпит старые бины (короче/длиннее).
 NARROW_MAP = [
     0x140A, 0x140B, 0x1482, 0x1413, 0x1431,
-    0x17FA, 0x17FB,   # v18: XOR и сумма тени (заняли слоты убранного $1411/$1412)
-    0x1408,           # сырьё канала 0 (МАФ, на ДАД-бине — датчик давления), старший байт
-    0x00F7,           # v19: ДАВЛЕНИЕ в кПа (заняло слот убранного $1409 — два бита, что ЭБУ и так выбрасывает)
+    0x17FA, 0x17FB,   # XOR и сумма тени
+    0x1408, 0x1409,   # ch0 сырьё 10 бит — ТОЛЬКО ПАРОЙ (значение прижато вправо)
+    0x00F7,           # давление в кПа (считает рутина ДАД)
     0x008F, 0x004C, 0x1400,
     0x1492, 0x1493,
-    0x140F, 0x143B, 0x0053,
-    0x0015, 0x0054, 0x142C,
-    0x14A2, 0x14DE, 0x00B9, 0x00AE,   # обогащение — только старший байт (место в кадре)
-    0x00F8, 0x00F9,   # VE/Ktps — под ДАД, НЕ занимать
-    0x004D, 0x004E,   # РЕАЛЬНЫЙ впрыск в UPP-отсчётах (×0.010=мс, ТИК 10 мкс, испр. 04.08.26)
-    0x17F7,   # результат peek (PEEK_OUT)
-    0x17F8, 0x17F9,   # v18: какая карта в тени / вердикт по её указателю
-    0x141A,   # ЧТО ВЕРНУЛА карта топлива (диагностика)
+    0x140F, 0x143B,
+    0x17FF,           # упакованные флаги
+    0x0053,           # сырьё флагов угла
+    0x142C,
+    0x14A2, 0x14DE,
+    0x00F8, 0x00F9,   # VE/Ktps выбранные (ДАД)
+    0x004D, 0x004E,   # реальный впрыск
+    0x17F8, 0x17F9,   # карта в тени / вердикт
+    0x141A,
 ]
 
 STATE = {
@@ -278,30 +301,38 @@ def nearest_idx(val, axis):   # индекс ближайшей точки ос�
 # ---------- лог ИНТЕРПРЕТИРОВАННЫХ данных в CSV (Старт/Стоп лог) ----------
 LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": None, "t0": 0}
 # колонки = ВСЁ: время + все декодированные сигналы (LABELS) + вычисленные (производные)
-LOG_HEADER = (["время_с"] + [nm for (_a, nm, _f, _u, _m) in LABELS] +
-              ["УОЗ_°BTDC", "TP_%8", "AFR_цель", "AFR_факт", "поправка_VE", "давление_кПа",
-               "Загрузка_форс_%", "Газ_%", "K_форс", "КМ", "Впрыск расчёт"])
+# Порядок колонок: сначала ПАРАМЕТРЫ (в т.ч. вычисленные), потом ФЛАГИ, потом АЦП сырьём.
+# Внутри параметров — смысловыми кучами: режим, топливо, зажигание, ДАД, лямбда, онлайн.
+ADC_NAMES = ["АЦП Расходомер/ДАД", "АЦП Дроссель", "АЦП Напряжение борта",
+             "АЦП Температура ОЖ", "АЦП Лямбда"]
+PARAM_NAMES = [nm for (_a, nm, _f, _u, _m) in LABELS if nm not in ADC_NAMES]
+CALC_NAMES = ["УОЗ, градусы", "Нагрузка TP", "Газ, %", "Впрыск расчётный, мс",
+              "Загрузка форсунок, %", "K форсунок", "КМ (ДАД)",
+              "AFR цель", "AFR факт (ШДК)", "Поправка VE (факт/цель)"]
+LOG_HEADER = ["Время, с"] + PARAM_NAMES + CALC_NAMES + FLAGNAMES + ADC_NAMES
 
 
 def _log_row():
     d = snapshot()
     g = lambda x: "" if x is None else x
-    row = [round(time.time() - LOGST["t0"], 2)]
-    # все декодированные: реал если есть, иначе сырьё
+    vals = {}
     for v in d["vars"]:
-        row.append(v["real"] if v["real"] is not None else g(v["val"]))
-    # вычисленные производные
+        vals[v["name"]] = v["real"] if v["real"] is not None else g(v["val"])
     tp = d["top"]
     tb = load_tables(SEL["bin"]) or {}
     # K/КМ: из ОЗУ если известны (онлайн-тюн), иначе из активного бина ($7F2B/$4A12)
-    k = STATE.get("k_ram") if STATE.get("k_ram") is not None else tb.get("k", "")
-    km = STATE.get("km_ram") if STATE.get("km_ram") is not None else tb.get("km", "")
-    row += [g(tp["uoz_deg"]),
-            round(tp["load"] / 8.0, 2) if tp["load"] is not None else "",
-            g(tp["afr_target"]), g(tp["afr_fact"]), g(tp["ve_corr"]), g(tp["press"]),
-            g(tp.get("inj_duty")), g(tp.get("tps_pct")), g(k), g(km),
-            g(tp.get("inj_calc"))]
-    return row
+    vals["K форсунок"] = STATE.get("k_ram") if STATE.get("k_ram") is not None else tb.get("k", "")
+    vals["КМ (ДАД)"] = STATE.get("km_ram") if STATE.get("km_ram") is not None else tb.get("km", "")
+    vals["УОЗ, градусы"] = g(tp["uoz_deg"])
+    vals["Нагрузка TP"] = round(tp["load"] / 8.0, 2) if tp["load"] is not None else ""
+    vals["Газ, %"] = g(tp.get("tps_pct"))
+    vals["Впрыск расчётный, мс"] = g(tp.get("inj_calc"))
+    vals["Загрузка форсунок, %"] = g(tp.get("inj_duty"))
+    vals["AFR цель"] = g(tp["afr_target"])
+    vals["AFR факт (ШДК)"] = g(tp["afr_fact"])
+    vals["Поправка VE (факт/цель)"] = g(tp["ve_corr"])
+    for n, v in (d.get("flags") or {}).items(): vals[n] = g(v)
+    return [round(time.time() - LOGST["t0"], 2)] + [vals.get(n, "") for n in LOG_HEADER[1:]]
 
 
 def _log_sampler(stop_ev):
@@ -732,6 +763,9 @@ def snapshot():
     d["fresh"] = (now - lft) < 2.0 if lft else False
     d["file_short"] = os.path.basename(d["file"]) if d["file"] else ""
     # расшифровка известных переменных
+    # Таблица на странице собирается в том же порядке, что и колонки лога:
+    # ПАРАМЕТРЫ → ФЛАГИ → АЦП. Флаги — не из LABELS, они считаются из упакованного
+    # байта, поэтому вставляются между группами отдельно.
     var = []
     for addr, name, fmt, unit, mul in LABELS:
         if fmt == 16:
@@ -743,7 +777,13 @@ def snapshot():
             r = v * mul
             real = int(round(r)) if abs(r) >= 10 else round(r, 2)
         var.append({"name": name, "addr": "$%04X" % addr, "val": v, "unit": unit, "real": real})
-    d["vars"] = var
+    # разложить: параметры, потом флаги, потом АЦП
+    _par = [v for v in var if v["name"] not in ADC_NAMES]
+    _adc = [v for v in var if v["name"] in ADC_NAMES]
+    _fl = flags_decode(ram)
+    _flv = [{"name": n, "addr": "$17FF" if n in [x[1] for x in FLAGBITS] else "$0053",
+             "val": _fl.get(n), "unit": "0/1", "real": None} for n in FLAGNAMES]
+    d["vars"] = _par + _flv + _adc
     # образ ОЗУ строками по 16 (только там где есть данные)
     lines = []
     for base in list(range(0x40, 0x100, 16)) + list(range(0x1400, 0x1800, 16)):
@@ -842,7 +882,7 @@ def snapshot():
             # ДАВЛЕНИЕ: с v19 его считает и кладёт в $00F7 сама рутина ДАД — берём готовое.
             # Пересчёт из сырья оставлен запасным путём для старых бинов, где $00F7 в кадре нет.
             press = ram.get(0x00F7)
-            maf_raw = ram.get(0x1408)
+            maf_raw = w(0x1408)   # 16 бит: значение прижато вправо, старший байт лишь 2 бита
             if press is None and maf_raw is not None:
                 praw = (maf_raw >> 2) - t["dad_ofs"]
                 if praw < 0: praw = 0
@@ -884,6 +924,7 @@ def snapshot():
     }
     for w in CBNUM:                                   # совместимость с фронтом: состояние по карте
         d["ptr"][w] = ("shadow" if (lm == w and verd == 1) else "rom") if sel_n is not None else None
+    d["flags"] = flags_decode(ram)
     d["top"] = top
     d["fuel"] = fuel_out
     d["ign"] = ign_out
@@ -947,8 +988,8 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  /* карты */
  .maps{display:flex;flex-direction:column;gap:18px;padding:12px 18px;background:#0f141b;border-bottom:1px solid #263040}
  .mapbox{width:100%;overflow:auto}
- table.map{border-collapse:collapse;font-size:11px;width:auto}
- table.map td,table.map th{width:34px;min-width:34px}
+ table.map{border-collapse:collapse;font-size:12.65px;width:auto}  /* +15% к масштабу */
+ table.map td,table.map th{width:39px;min-width:39px}
  table.map td,table.map th{border:1px solid #223040;padding:2px 5px;text-align:right;font-family:ui-monospace,Menlo,monospace}
  table.map th{background:#161e29;color:#9ab;position:sticky;top:0}
  table.map th.corner{color:#678}
@@ -1004,6 +1045,22 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
         font-weight:700;font-size:13px;cursor:pointer;letter-spacing:.5px}
  .estop:hover{background:#c0392b}
  .estop:active{transform:translateY(1px)}
+ .estop:disabled{opacity:.4;cursor:not-allowed;transform:none}
+ .estop:disabled:hover{background:#8b1a1a}
+ body.light .estop:disabled:hover{background:#b32020}
+ /* ПОЛОСА ДАТЧИКОВ: 30% высоты экрана, цифры во весь рост. Скрыта по умолчанию. */
+ #hud{display:none;height:30vh;gap:10px;padding:10px 14px;box-sizing:border-box;
+      border-bottom:2px solid #2a3340;background:#0d141c}
+ #hud.on{display:flex}
+ .hcell{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+        background:#151d2a;border:1px solid #22303f;border-radius:10px;min-width:0}
+ .hlbl{font-size:14px;letter-spacing:2px;color:#7b8794;font-weight:700}
+ .hval{font-size:min(15vh,15vw);line-height:1;font-weight:800;color:#7fd;
+       font-variant-numeric:tabular-nums;white-space:nowrap}
+ body.light #hud{background:#eef2f6;border-bottom:2px solid #c3ccd6}
+ body.light .hcell{background:#fff;border:1px solid #c3ccd6}
+ body.light .hlbl{color:#556}
+ body.light .hval{color:#0a4a6b}
  .themebox{display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;user-select:none}
  header .themebox{float:right;color:inherit;font-weight:600}
  /* ---- новая практическая страница ---- */
@@ -1014,13 +1071,15 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  .stat.ok{color:#2ecc40}.stat.warn{color:#ffcf33}.stat.err{color:#ff4136}.stat.none{color:#77808a}
  #page.locked{opacity:.35;pointer-events:none;filter:grayscale(.6)}
  .split{display:flex;gap:12px;padding:10px;align-items:flex-start}
- .leftcol{width:30%;min-width:260px;max-height:calc(100vh - 70px);overflow:auto;border:1px solid #2a3340;border-radius:8px}
- .rightcol{width:70%;flex:1;max-height:calc(100vh - 70px);overflow:auto}
+ .leftcol{width:25%;min-width:210px;max-height:calc(100vh - 70px);overflow:auto;border:1px solid #2a3340;border-radius:8px}
+ .rightcol{width:75%;flex:1;max-height:calc(100vh - 70px);overflow:auto}
  .logtab{width:100%;border-collapse:collapse;font-size:14px}
  .logtab th{position:sticky;top:0;background:#1b2129;text-align:left;padding:6px 8px;border-bottom:1px solid #2a3340}
  .logtab td{padding:5px 8px;border-bottom:1px solid #222a33}
  .logtab tr.sticky{background:#182028}.logtab tr.sticky td:first-child{font-weight:700}
- .logtab .val{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+ .logtab .val{text-align:left;font-variant-numeric:tabular-nums;font-weight:600}
+ /* имя параметра вдвое уже — вся таблица на треть тоньше */
+ .logtab th:first-child,.logtab td:first-child{width:52%;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
  .logtab .unit{color:#8aa;font-size:12px;margin-left:4px}
  .onlinebar{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
  td.ec.sel input{background:#2b4a6b;outline:1px solid #6cf}
@@ -1051,13 +1110,21 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  body.light .ec.ok{background:#c8f0d0}body.light .ec.err{background:#f5c6c6}body.light .ec.pend{background:#f5ecc0}
  body.light #ctrlbar{background:#fff}body.light .logtab th{background:#eef2f6}body.light .logtab tr.sticky{background:#eaf3ff}
 </style></head><body class=light>
+<div id=hud>
+ <div class=hcell><div class=hlbl>ОБОРОТЫ</div><div class=hval id=h_rpm>—</div></div>
+ <div class=hcell><div class=hlbl>ГАЗ, %</div><div class=hval id=h_tps>—</div></div>
+ <div class=hcell><div class=hlbl>СМЕСЬ ЦЕЛЬ</div><div class=hval id=h_tgt>—</div></div>
+ <div class=hcell><div class=hlbl>СМЕСЬ ФАКТ</div><div class=hval id=h_fact>—</div></div>
+</div>
+
 <div id=ctrlbar>
- <div class=cgrp><span class=clbl>Файл</span><select id=binsel onchange=selbin()></select><span class="stat none" id=binicon>&#9679;</span>
+ <div class=cgrp><span class=clbl>Файл</span><select id=binsel onchange=selbin() style="width:23.75vw;max-width:520px"></select><span class="stat none" id=binicon>&#9679;</span>
    <button id=btnEstop class=estop onclick=eStop() title="Сохранить лог и бин, отключить ЭБУ и ШДК, заблокировать страницу">&#9632; СТОП</button></div>
  <div class=cgrp><span class=clbl>ЭБУ</span><select id=port onchange=ecuAuto()></select><span class="stat none" id=ecuicon>&#9679;</span></div>
  <div class=cgrp><span class=clbl>ШДК</span><select id=wport onchange=wblAuto()></select><span class="stat none" id=wblicon>&#9679;</span></div>
  <button class=ghost onclick=loadPorts()>&#8635; порты</button>
- <span class=themebox style="margin-left:auto"><input type=checkbox id=darkbox onchange=toggletheme()> &#127769;</span>
+ <button class=ghost id=btnHud onclick=toggleHud() style="margin-left:auto">ДАТЧИКИ</button>
+ <span class=themebox><input type=checkbox id=darkbox onchange=toggletheme()> &#127769;</span>
 </div>
 
 <div id=page class=locked>
@@ -1517,6 +1584,9 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  const bo=document.getElementById('btnOnline'); if(bo)bo.disabled=!conn&&!online;
  // --- ОБРАТНАЯ СВЯЗЬ: состояние берём ИЗ БЛОКА, а не из памяти браузера ---
  // во время дампа кадры не идут → состояние указателей неизвестно, НЕ трогаем показания
+ // СТОП имеет смысл только когда есть что сохранять и что отключать
+ const es=document.getElementById('btnEstop');
+ if(es)es.disabled=!(d.bin&&d.running);
  if(!d.busy) syncPtr(d.ptr||{}, conn);
  // B2: признак свежести считался и никем не использовался — образ ОЗУ не чистится,
  // и после обрыва связи HUD продолжал показывать последние значения как живые.
@@ -1526,6 +1596,7 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
  const vt=document.getElementById('vars'); if(vt)vt.classList.toggle('stale',!!stale);
  const sw=document.getElementById('stalewarn'); if(sw)sw.style.display=stale?'':'none';
  renderVars(d.vars||[], d.top||{});
+ hudShow(d.top||{});
  // карты из бина для «свести к бину» — СЫРЫЕ байты, своя для каждой таблицы.
  // Именно raw, а не cells: в cells лежит физика (AFR/градусы/коэффициент), её запись в ОЗУ = мусор.
  for(const w of ['fuel','ign','ve','ktps']){if(d[w]&&d[w].raw)BINCELLS[w]=d[w].raw;}
@@ -1549,11 +1620,24 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
  }
 }).catch(e=>{}).finally(()=>setTimeout(tick,150));}   // 400→150мс: срезает до 250мс экранной задержки
+function toggleHud(){
+ const h=document.getElementById('hud');const on=h.classList.toggle('on');
+ document.getElementById('btnHud').classList.toggle('on',on);
+ try{localStorage.setItem('j30hud',on?'1':'0');}catch(_){}}
+function hudShow(top){
+ if(!document.getElementById('hud').classList.contains('on'))return;
+ const f=(v,d)=>(v===null||v===undefined||v==='')?'—':(typeof v==='number'?v.toFixed(d):v);
+ document.getElementById('h_rpm').textContent = f(top.rpm,0);
+ document.getElementById('h_tps').textContent = f(top.tps_pct,0);
+ document.getElementById('h_tgt').textContent = f(top.afr_target,1);
+ document.getElementById('h_fact').textContent= f(top.afr_fact,1);}
 function toggletheme(){const dark=document.getElementById('darkbox').checked;
  document.body.classList.toggle('light',!dark);
  try{localStorage.setItem('j30theme',dark?'dark':'light');}catch(_){}}
 try{if(localStorage.getItem('j30theme')=='dark'){document.body.classList.remove('light');document.getElementById('darkbox').checked=true;}}catch(_){}
-loadProg();wireBulk();loadPorts();loadBins();tick();
+loadProg();wireBulk();loadPorts();loadBins();
+try{if(localStorage.getItem('j30hud')==='1')toggleHud();}catch(_){}
+tick();
 </script></body></html>"""
 
 
