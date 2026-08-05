@@ -34,7 +34,7 @@ DUMP_CONV = {
     0x140A: ("об/мин", lambda v: round(v * 12.807)),
     0x008F: ("В~", lambda v: round(v * 0.0195, 2)),
     0x140D: ("В~", lambda v: round(v * 0.0195, 2)),
-    0x004D: ("мс", lambda v: round(v * 0.005, 3)),
+    0x004D: ("мс", lambda v: round(v * 0.010, 3)),   # тик UPP 10 мкс (испр. 04.08.26, было 5)
 }
 _dump_mode = False
 

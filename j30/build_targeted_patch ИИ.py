@@ -24,7 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = sys.argv[1] if len(sys.argv) >= 2 else os.path.join(HERE, "J30_vq_форсы_логер_20260731_1830.bin")
 DST = sys.argv[2] if len(sys.argv) >= 3 else os.path.join(HERE, "..", "логер", "J30_vq-форсы_v8-узкий_01.08.26 ИИ.bin")
 ROM_BASE = 0x8000
-CODE_ORG = 0xC600
+CODE_ORG = 0xCD00   # перенесено с $C600 05.08.26: там ДАД (рутина $C700, VE $C900, Ktps $CB00)
+CODE_WIN = 0x800    # сколько ПЗУ отдаём под код. Не граница железа, а наш ограничитель:
+                    # за $CD00 свободно 8704 байта подряд до $EF00. Занятость проверяется
+                    # побайтно при сборке, поэтому окно можно расширять без риска.
 HOOK_CPU = 0x83F8
 ORIG_CALL = 0xA99B
 
@@ -37,9 +40,14 @@ ADDR_LIST = [
     0x1482,           # нагрузка сглаж. (ось карт)
     0x1413,           # расход МГНОВЕННЫЙ (гэп к $1482 = транзит/газовка)
     0x1431,           # ALPHA (замкнутый цикл)
-    0x1411, 0x1412,   # ВПРЫСК факт (16б)
+    # УБРАН $1411/$1412 «впрыск расчёт» — избыточен: восстанавливается панелью как
+    # ($004D/1.25 + $142C)/2, оба входа в кадре остаются. Слоты отданы под сумму тени.
+    0x17FA, 0x17FB,   # XOR тени / сумма тени (= CSX, CSS)
     # --- АЦП: только рабочие ---
-    0x1408, 0x1409,   # ch0 MAF (16б)
+    0x1408,           # ch0 сырьё: МАФ, а на ДАД-бине — датчик давления (старший байт)
+    # УБРАН $1409 (младший байт того же АЦП): там два бита, которые сама рутина ДАД
+    # выбрасывает (читает 10 бит и делает LSRD LSRD). Слот отдан под готовые кПа.
+    0x00F7,           # ДАВЛЕНИЕ в кПа — его считает рутина ДАД ($C700), на MAF-бине мусор
     0x008F,           # ch1 напряжение борта
     0x004C,           # ch2 темп ОЖ
     0x1400,           # ch3 O2 (единственный рабочий из "плавающих"; лямбда, титан 0.4-1.5В)
@@ -65,11 +73,14 @@ ADDR_LIST = [
     0x00F8,           # VE выбранное (карта 0x4900, /128=1.0)
     0x00F9,           # Ktps выбранное (карта 0x4B00, /128=1.0)
     # --- РЕАЛЬНЫЙ впрыск в UPP (для ТОЧНОЙ загрузки форсунок) ---
-    0x004D, 0x004E,   # $004D:$004E = длит. впрыска в отсчётах UPP; мс = ×0.005 (тик 5мкс, датащит HD63140)
+    0x004D, 0x004E,   # $004D:$004E = длит. впрыска в отсчётах UPP; мс = ×0.010 (ТИК 10 мкс, испр. 04.08.26)
+                      # впрыск последовательный (раз за цикл) -> загрузка форсунок = мс × об / 1200
     # --- RX-ТЕСТ: последний принятый по SCI байт (патч кладёт сюда) ---
     0x17F7,           # результат peek (= PEEK_OUT, см. раскладку ниже)
-    # --- ОБРАТНАЯ СВЯЗЬ: где реально стоят указатели карт (ЭБУ сам говорит, панель не гадает) ---
-    0x00CF, 0x00D0,   # указатель карты смеси ЦЕЛИКОМ: $FD00 = ПЗУ, $1600 = тень
+    # --- ОБРАТНАЯ СВЯЗЬ: состояние тени (ЭБУ сам говорит, панель не гадает) ---
+    # Раньше тут лежал указатель смеси целиком ($00CF/$00D0). Карт стало две, а тень одна,
+    # поэтому в кадр идёт СОСТОЯНИЕ ТЕНИ — оно описывает любое число карт двумя байтами.
+    0x17F8, 0x17F9,   # какая карта в тени (0/1/2) / вердикт по её указателю (0 ПЗУ, 1 тень, FF авария)
     0x141A,           # ЧТО ВЕРНУЛА карта топлива (результат выборки, b4b0)
 ]
 CONST2 = [0xFF, 0xF0, len(ADDR_LIST)]   # FF F0 <len>
@@ -120,7 +131,24 @@ BLK_LEN  = 0x17F4                     # длина блока
 ST_OK    = 0x17F5                     # счётчик принятых блоков
 ST_BAD   = 0x17F6                     # счётчик отвергнутых блоков
 PEEK_OUT = 0x17F7                     # результат peek (виден в кадре)
-ROM_SS = 0xFD00
+# --- выбор карты для тени (v18) ---
+SEL      = 0x17F8                     # какая карта лежит в тени: 0 нет, 1 смесь, 2 угол
+VERD     = 0x17F9                     # вердикт по указателю живой карты: 0 ПЗУ, 1 тень, FF авария
+CSX      = 0x17FA                     # готовый XOR тени (публикуется раз в круг)
+CSS      = 0x17FB                     # готовая сумма тени
+CSI      = 0x17FC                     # индекс обхода тени, шаг 8
+CSXW     = 0x17FD                     # накопитель XOR (незаконченный круг)
+CSSW     = 0x17FE                     # накопитель суммы
+PTR_SS = 0x00CF                       # (повтор для читаемости) указатель карты смеси
+PTR_ADV  = 0x00D1                     # указатель карты УГЛА ($16 = тень, $FC = ПЗУ)
+PTR_VE   = 0x00D3                     # указатель карты VE   (ДАД) — ОБЩИЙ с build_dad_ktps
+PTR_KT   = 0x00D5                     # указатель карты Ktps (ДАД) — ОБЩИЙ с build_dad_ktps
+ROM_SS = 0xFD00                       # карта смеси в ПЗУ
+ROM_ADV  = 0xFC00                     # карта угла в ПЗУ
+ROM_VE   = 0xC900                     # карта VE в ПЗУ   (кладёт build_dad_ktps)
+ROM_KT   = 0xCB00                     # карта Ktps в ПЗУ (кладёт build_dad_ktps)
+# Номера карт в команде CB. 0 = отцепить всё.
+MAPS = ((1, PTR_SS, ROM_SS), (2, PTR_ADV, ROM_ADV), (3, PTR_VE, ROM_VE), (4, PTR_KT, ROM_KT))
 
 
 # (метка|None, токен, операнд)
@@ -129,7 +157,7 @@ PROG = [
     # --- одноразовый init SCI (если TE не стоит) ---
     (None,   "LDAAd", 0x11),
     (None,   "BITA#", 0x02),
-    (None,   "BNE",   "DUMP"),
+    (None,   "BNE",   "PASS"),
     (None,   "LDAA#", 0x05),          # RMCR=0x05: E/128, внутр. клок, 8N async
     (None,   "STAAd", 0x10),
     (None,   "CLRe",  0x001E),        # TRCSR2=0 → 8N1
@@ -146,6 +174,16 @@ PROG = [
     (None,   "CLRe",  IDLE_CNT),      # счётчик простоя приёма = 0 (ресинхрон)
     (None,   "CLRe",  ST_OK),         # счётчики блоков = 0 (ПК считает от нуля)
     (None,   "CLRe",  ST_BAD),
+    (None,   "CLRe",  SEL),           # в тени ничего, обе карты на ПЗУ
+    (None,   "CLRe",  VERD),
+    (None,   "CLRe",  CSX),           # суммы тени и обход — с нуля
+    (None,   "CLRe",  CSS),
+    (None,   "CLRe",  CSI),
+    (None,   "CLRe",  CSXW),
+    (None,   "CLRe",  CSSW),
+    # --- раз за проход: досчитать кусок суммы тени и переосвидетельствовать указатель ---
+    ("PASS", "JSR",   "CSUM"),
+    (None,   "JSR",   "VERDCALC"),
     # --- RX: дренаж кольца-буфера (наполняет MYRXISR по SCI-прерыванию). Тянем ВСЕ байты за проход. ---
     # состояние $F4; POKE ptr $F5:$F6; DUMP src/счётчик — во ВНЕШНЕМ ОЗУ ($17A9/$17AB),
     # чтобы не занимать $00F8/$00F9 — они идут в кадре как VE/Ktps (их пишет ДАД-рутина C700).
@@ -184,13 +222,11 @@ PROG = [
     (None,   "LDAB#", 4),
     (None,   "STABe", RXSI),
     (None,   "JMPe",  "DUMP"),
-    ("RXCK7","CMPA#", 0xC7),          # C7 = карты→тень (флип, копии НЕТ)
-    (None,   "BNE",   "RXCK8"),
-    (None,   "JSR",   "DOC7"),
-    (None,   "JMPe",  "DUMP"),
-    ("RXCK8","CMPA#", 0xC8),          # C8 = карты→ПЗУ (A/B)
+    # C7/C8 УБРАНЫ: они были прибиты к одной карте. Их место заняла CB с номером карты.
+    ("RXCK7","CMPA#", 0xCB),          # CB = выбрать карту для тени [N]: 0 нет, 1 смесь, 2 угол
     (None,   "BNE",   "RXCK9"),
-    (None,   "JSR",   "DOC8"),
+    (None,   "LDAB#", 14),
+    (None,   "STABe", RXSI),
     (None,   "JMPe",  "DUMP"),
     ("RXCK9","CMPA#", 0xC9),          # C9 = дамп региона [hi lo len]
     (None,   "BNE",   "RXCKA"),
@@ -300,13 +336,19 @@ PROG = [
     (None,   "LDAB#", 13),            # всё принято → следующий байт = сумма
     (None,   "STABe", RXSI),
     ("BLKMORE","JMPe","DUMP"),
-    ("RXS13","CMPAe", BLK_CHK),       # принятая сумма == посчитанной?
+    ("RXS13","CMPB#", 13),
+    (None,   "BNE",   "RXS14"),
+    (None,   "CMPAe", BLK_CHK),       # принятая сумма == посчитанной?
     (None,   "BNE",   "BLKBAD"),
     (None,   "JSR",   "BLKCOPY"),     # ДА → применить блок в тень
     (None,   "INCe",  ST_OK),
     (None,   "CLRe",  RXSI),
     (None,   "JMPe",  "DUMP"),
     ("BLKBAD","INCe", ST_BAD),        # НЕТ → блок отброшен целиком, в карты не попало ничего
+    (None,   "CLRe",  RXSI),
+    (None,   "JMPe",  "DUMP"),
+    # состояние 14: второй байт команды CB = номер карты. Разбирает DOCB (номер проверяется там).
+    ("RXS14","JSR",   "DOCB"),
     (None,   "CLRe",  RXSI),
     (None,   "JMPe",  "DUMP"),
     # --- читаем *(указатель) → $1600 (видно в кадре как peek) ---
@@ -460,27 +502,129 @@ SUBS = [
     # включает прерывания (ae44 / ae5a) и ТОЛЬКО потом доходит до my_init. В это окно
     # периодическая задача уже работает и читала бы карты по указателю $0000 — топливо и
     # угол из нулевой страницы. Встраиваемся в JSR $B00D (зовётся обоими путями ДО CLI).
-    ("MYPTR", "LDX#", ROM_SS),
-    (None,    "STXd", PTR_SS),
+    ("MYPTR", "JSR",  "ALLROM"),
     (None,    "JMPe", 0xB00D),         # → заводская рутина, её RTS вернёт куда надо
-    ("MYINIT","LDX#", ROM_SS),
-    (None,    "STXd", PTR_SS),         # ptr_сс = ПЗУ  (zero-page $FC)
+    ("MYINIT","JSR",  "ALLROM"),       # все карты = ПЗУ, безопасный дефолт
     (None,    "JMPe", 0xB0E2),         # → главный цикл
-    # DOC7: флип указателей карт на ТЕНЬ (КОПИИ НЕТ — тень залил ПК poke'ом заранее)
-    ("DOC7",  "LDX#", SH_SS),
-    (None,    "STXd", PTR_SS),         # ptr_сс = тень
-    (None,    "RTS",  None),
-    # DOC8: флип указателей карт назад на ПЗУ (A/B, сброс к стоку)
-    ("DOC8",  "LDX#", ROM_SS),
+    # ALLROM: развести ВСЕ указатели по их базам в ПЗУ. Одна точка правды — используется
+    # и при сбросе, и в начале каждой команды CB.
+    ("ALLROM","LDX#", ROM_SS),
     (None,    "STXd", PTR_SS),
+    (None,    "LDX#", ROM_ADV),
+    (None,    "STXd", PTR_ADV),
+    (None,    "LDX#", ROM_VE),
+    (None,    "STXd", PTR_VE),
+    (None,    "LDX#", ROM_KT),
+    (None,    "STXd", PTR_KT),
     (None,    "RTS",  None),
+    # DOCB: выбор карты для тени. A = номер (0 нет, 1 смесь, 2 угол).
+    # СНАЧАЛА безусловно обе на ПЗУ, ПОТОМ выбранную на тень — промежуточных состояний нет,
+    # накопленной ошибки нет, и чужой номер честно кладёт обе на ПЗУ.
+    # Адреса ПЗУ зашиты здесь: ПК их не присылает и подсунуть свой не может.
+    ("DOCB",  "PSHA", None),
+    (None,    "JSR",  "ALLROM"),       # СНАЧАЛА безусловно все на ПЗУ
+    (None,    "PULA", None),
+    (None,    "CMPA#", 1),
+    (None,    "BNE",  "CB2"),
+    (None,    "LDX#", SH_SS),
+    (None,    "STXd", PTR_SS),
+    (None,    "BRA",  "CBOK"),
+    ("CB2",   "CMPA#", 2),
+    (None,    "BNE",  "CB3"),
+    (None,    "LDX#", SH_SS),
+    (None,    "STXd", PTR_ADV),
+    (None,    "BRA",  "CBOK"),
+    ("CB3",   "CMPA#", 3),
+    (None,    "BNE",  "CB4"),
+    (None,    "LDX#", SH_SS),
+    (None,    "STXd", PTR_VE),
+    (None,    "BRA",  "CBOK"),
+    ("CB4",   "CMPA#", 4),
+    (None,    "BNE",  "CB0"),
+    (None,    "LDX#", SH_SS),
+    (None,    "STXd", PTR_KT),
+    (None,    "BRA",  "CBOK"),
+    ("CB0",   "LDAA#", 0),             # номер не наш → в тени ничего
+    ("CBOK",  "STAAe", SEL),
+    (None,    "RTS",  None),
+    # VERDCALC: раз за проход перечитать указатель ЖИВОЙ карты целиком и вынести вердикт.
+    # Проверяются ОБА байта (порча младшего уводит базу карты незаметно — на это напоролись
+    # на v16) и заодно что вторая карта стоит на ПЗУ (обе на тени = невозможное состояние).
+    # VERDCALC: раз за проход обойти ВСЕ четыре указателя и вынести один вердикт.
+    # Указатели лежат подряд ($00CF..$00D6), поэтому идём по ним индексом, а не веткой
+    # на каждую карту — с четырьмя картами цепочка сравнений уже не влезала бы в ветвления.
+    # Что проверяется у КАЖДОГО указателя:
+    #   младший байт обязан быть нулём (порча младшего уводит базу карты незаметно — v16);
+    #   старший = $16  -> карта смотрит в тень, и она ОБЯЗАНА быть той, что заявлена в SEL;
+    #   старший >= $C0 -> нормальная база в ПЗУ, идём дальше;
+    #   иначе          -> мусор, авария.
+    ("VERDCALC","CLRe", VERD),         # по умолчанию 0 = живых нет, всё на ПЗУ
+    (None,    "LDAB#", 0),             # B = смещение указателя (0,2,4,6)
+    ("VDLP",  "PSHB",  None),
+    (None,    "LDX#",  PTR_SS),
+    (None,    "ABX",   None),          # X = адрес указателя карты
+    (None,    "LDAAx", 1),             # младший байт
+    (None,    "BNE",   "VDBADP"),
+    (None,    "LDAAx", 0),             # старший байт
+    (None,    "CMPA#", SH_SS >> 8),
+    (None,    "BEQ",   "VDSH"),
+    (None,    "CMPA#", 0xC0),          # все базы карт в ПЗУ выше $C000
+    (None,    "BCS",   "VDBADP"),
+    (None,    "BRA",   "VDNXT"),
+    ("VDSH",  "PULB",  None),          # эта карта смотрит в тень
+    (None,    "PSHB",  None),
+    (None,    "LSRB",  None),          # B = индекс карты 0..3
+    (None,    "INCB",  None),          # B = номер карты 1..4
+    (None,    "CMPBe", SEL),
+    (None,    "BNE",   "VDBADP"),      # в тени лежит НЕ та карта, что заявлена
+    (None,    "LDAA#", 1),
+    (None,    "STAAe", VERD),
+    ("VDNXT", "PULB",  None),
+    (None,    "ADDB#", 2),
+    (None,    "CMPB#", 8),
+    (None,    "BNE",   "VDLP"),
+    (None,    "RTS",   None),
+    ("VDBADP","PULB",  None),          # снять счётчик со стека и объявить аварию
+    (None,    "LDAA#", 0xFF),
+    (None,    "STAAe", VERD),
+    (None,    "RTS",   None),
+    # CSUM: XOR и сумма содержимого тени. Считаем по 8 байт за проход — за 32 прохода полный
+    # круг, то есть свежая пара примерно раз в кадр. Индекс держим кратным 8 маской, иначе
+    # одна порча CSI и круг никогда не замкнётся. Публикуем только по замыканию круга,
+    # чтобы ПК не увидел половину старой и половину новой суммы.
+    ("CSUM",  "LDABe", CSI),
+    (None,    "LDX#",  SH_SS),
+    (None,    "ABX",   None),          # X = тень + индекс
+    (None,    "LDAB#", 8),
+    ("CSLP",  "LDAAe", CSXW),
+    (None,    "EORAx", 0x00),
+    (None,    "STAAe", CSXW),
+    (None,    "LDAAe", CSSW),
+    (None,    "ADDAx", 0x00),
+    (None,    "STAAe", CSSW),
+    (None,    "INX",   None),
+    (None,    "DECB",  None),
+    (None,    "BNE",   "CSLP"),
+    (None,    "LDAAe", CSI),
+    (None,    "ADDA#", 8),
+    (None,    "ANDA#", 0xF8),
+    (None,    "STAAe", CSI),
+    (None,    "BNE",   "CSEND"),       # круг не замкнулся
+    (None,    "LDAAe", CSXW),
+    (None,    "STAAe", CSX),
+    (None,    "LDAAe", CSSW),
+    (None,    "STAAe", CSS),
+    (None,    "CLRe",  CSXW),
+    (None,    "CLRe",  CSSW),
+    ("CSEND", "RTS",   None),
 ]
 
 # ---- In-place патчи заводского кода (редиректы + reset-хуки) ----
 # (cpu_addr, ожидаемые_СТАРЫЕ_байты, новые_байты | "MYINIT")
 INPLACE = [
     # LDX #imm → LDX расширенная: те же 3 байта, заполнитель не нужен. Форма проверена на v5 (мотор ехал).
-    (0xB49E, [0xCE,0xFD,0x00], [0xDE, PTR_SS & 0xFF, 0x01]),          # сс: LDX #FD00 → LDX $CF ; NOP
+    (0xB49E, [0xCE,0xFD,0x00], [0xDE, PTR_SS & 0xFF, 0x01]),          # сс:   LDX #FD00 → LDX $CF ; NOP
+    (0xB728, [0xCE,0xFC,0x00], [0xDE, PTR_ADV & 0xFF, 0x01]),         # угол: LDX #FC00 → LDX $D1 ; NOP
     # K/гейт больше НЕ тенятся — читают ПЗУ ($FF2B/$FF91), редирект убран (нет загрузочной копии скаляров)
     (0xAE4E, [0x7E,0xB0,0xE2], "MYINIT"),                            # reset JMP b0e2 → JMP my_init
     (0xAE5B, [0x7E,0xB0,0xE2], "MYINIT"),
@@ -495,7 +639,8 @@ LEN = {"JSR":3,"LDAAd":2,"LDAA#":2,"LDAAx":2,"LDABd":2,"LDXx":2,"LDX#":3,"BITA#"
        "CLRB":1,"INCB":1,"LDAAe":3,"STXe":3,"STXd":2,"LDDe":3,"STDe":3,"JMPe":3,
        "LDXe":3,"DECe":3,"EORAe":3,"CMPAe":3,"LDABe":3,"STABe":3,"CMPBe":3,
        "PSHA":1,"PULA":1,"PSHB":1,"PULB":1,"CMPBd":2,"BHI":2,
-       "OIMd":3,"RTS":1,"RTI":1,"CBA":1,"ANDB#":2,"DECB":1,"INX":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2}
+       "OIMd":3,"RTS":1,"RTI":1,"CBA":1,"ANDB#":2,"DECB":1,"INX":1,"BNE":2,"BEQ":2,"BCC":2,"BCS":2,"BRA":2,
+       "EORAx":2,"ADDAx":2,"ADDA#":2,"ANDA#":2,"LSRB":1,"ADDB#":2}
 BR = {"BNE":0x26,"BEQ":0x27,"BCC":0x24,"BCS":0x25,"BRA":0x20,"BHI":0x22}
 
 
@@ -570,6 +715,12 @@ def assemble(org):
         elif op == "ANDB#": out += bytes([0xC4, arg & 0xFF])
         elif op == "DECB":  out += bytes([0x5A])
         elif op == "INX":   out += bytes([0x08])
+        elif op == "EORAx": out += bytes([0xA8, arg & 0xFF])
+        elif op == "ADDAx": out += bytes([0xAB, arg & 0xFF])
+        elif op == "ADDA#": out += bytes([0x8B, arg & 0xFF])
+        elif op == "ANDA#": out += bytes([0x84, arg & 0xFF])
+        elif op == "LSRB":  out += bytes([0x54])
+        elif op == "ADDB#": out += bytes([0xCB, arg & 0xFF])
         elif op in BR:
             rel = labels[arg] - nxt
             assert -128 <= rel <= 127, "ветвление %s вне диапазона %d" % (arg, rel)
@@ -589,7 +740,17 @@ def assemble(org):
 _LIVE = [(0x0040, 0x013F), (0x1400, 0x17FF)]          # ВСЯ реальная память блока, замер 04.08.26
 def _alive(a): return any(lo <= a <= hi for lo, hi in _LIVE)
 assert PEEK_OUT in ADDR_LIST, "PEEK_OUT не попал в кадр — панель не увидит результат peek"
-assert PTR_SS in ADDR_LIST,   "указатель карты не попал в кадр — панель не узнает режим"
+assert SEL  in ADDR_LIST,     "номер карты в тени не попал в кадр — панель не узнает что живо"
+assert VERD in ADDR_LIST,     "вердикт по указателю не попал в кадр — порча указателя будет не видна"
+assert CSX  in ADDR_LIST and CSS in ADDR_LIST, "суммы тени не попали в кадр"
+# Указатели ОБЯЗАНЫ лежать подряд по 2 байта от PTR_SS — VERDCALC ходит по ним индексом.
+assert [p for _n, p, _r in MAPS] == [PTR_SS + 2 * i for i in range(len(MAPS))], \
+    "указатели карт должны идти подряд по 2 байта от $%04X" % PTR_SS
+assert PTR_SS >= 0x00CF and PTR_SS + 2 * len(MAPS) - 1 <= 0x00EE, \
+    "указатели вышли за безопасный кусок zero-page $CF-$EE (дальше запас под стек)"
+assert all(r >= 0xC000 for _n, _p, r in MAPS), \
+    "VERDCALC считает признаком ПЗУ старший байт >= $C0 — база карты ниже сломает вердикт"
+assert CSSW <= 0x17FF, "служебные байты выбора карты вышли за ОЗУ"
 for _n, _a, _sz in (("тень", SH_SS, 256), ("кольцо", RING, RING_MASK + 1), ("снимок", SNAP, len(ADDR_LIST)),
                     ("буфер блока", STAGE, BLK_MAX), ("переменные", RXSI, 0x1800 - RXSI),
                     ("указатель карты", PTR_SS, 2)):
@@ -601,17 +762,50 @@ assert PTR_SS + 1 < 0x00CF + 0x20 and PTR_SS >= 0x00CF, "указатель ка
 assert SH_SS + 256 <= 0x1700,          "тень залезает в таблицу самообучения завода"
 
 
+def _check_dad_agreement():
+    """Рутина ДАД читает базы VE/Ktps из НАШИХ указателей. Если адреса в двух билдерах
+    разойдутся, ДАД будет брать карту по чужому адресу — мотор поедет на мусоре, и
+    никакая проверка в бине этого не покажет. Поэтому сверяем исходники напрямую."""
+    import re
+    p = os.path.join(HERE, "..", "j30_дад", "build_dad_ktps ИИ.py")
+    if not os.path.exists(p):
+        return "билдер ДАД не найден, сверка адресов пропущена"
+    src = open(p, encoding="utf-8").read()
+    for name, want in (("PTR_VE", PTR_VE), ("PTR_KT", PTR_KT)):
+        m = re.search(r"^%s\s*=\s*(0x[0-9A-Fa-f]+)" % name, src, re.M)
+        assert m, "в билдере ДАД нет %s — он ещё не переведён на указатели" % name
+        got = int(m.group(1), 16)
+        assert got == want, "%s разъехался: тут $%04X, в билдере ДАД $%04X" % (name, want, got)
+    for name, want in (("VEMAP", ROM_VE), ("KTPS", ROM_KT)):
+        m = re.search(r"^%s\s*=\s*(0x[0-9A-Fa-f]+)" % name, src, re.M)
+        assert m and int(m.group(1), 16) == want, \
+            "%s в билдере ДАД не $%04X — база карты разъехалась" % (name, want)
+    return "адреса карт ДАД сверены с билдером ДАД: ОК"
+
+
 def main():
     rom = bytearray(open(SRC, "rb").read()); assert len(rom) == 32768
+    print(" ", _check_dad_agreement())
     code, addrtbl, const2t, labels = assemble(CODE_ORG)
     off = CODE_ORG - ROM_BASE
-    # Окно патча C600-C9FF (1 КБ). Обосновано: $C600-$EFFF — мёртвая зона ПЗУ, 9984 байта
-    # заполнителя 0x3F подряд; по дизассемблеру НИ ОДНА инструкция туда не адресуется
-    # (проверено 04.08.26: операнды всех инструкций 8000-C5E2 + разбор дыры 884E-88CF).
-    assert len(code) <= 0x400, "не влезает в C600-C9FF (%d байт)" % len(code)
+    # Окно патча — 1 КБ от CODE_ORG. Мёртвая зона ПЗУ $C600-$EFFF заполнена 0x3F, по
+    # дизассемблеру ни одна инструкция туда не адресуется (проверено 04.08.26).
+    # ПЕРЕНЕСЕНО с $C600 на $CD00 (05.08.26): на $C600 старый логгер, на $C700 рутина ДАД,
+    # на $C900 карта VE, на $CB00 Ktps. Раньше билдер писал поверх них МОЛЧА.
+    assert len(code) <= CODE_WIN, "не влезает в окно $%04X-$%04X (%d байт)" % (
+        CODE_ORG, CODE_ORG + CODE_WIN - 1, len(code))
     hoff = HOOK_CPU - ROM_BASE
     tgt = rom[hoff + 1] << 8 | rom[hoff + 2]
-    assert rom[hoff] == 0xBD and tgt in (ORIG_CALL, CODE_ORG), "по 83F8 не JSR A99B/C600"
+    assert rom[hoff] == 0xBD, "по 83F8 не JSR (в бине %02X)" % rom[hoff]
+    assert tgt == ORIG_CALL or 0xC600 <= tgt <= 0xEFFF, \
+        "по 83F8 JSR $%04X — это не заводской $A99B и не патч в мёртвой зоне" % tgt
+    # ЗАНЯТОСТЬ ОКНА. Если хук уже смотрит в наше окно — там наша прошлая сборка, её
+    # перезаписывать можно. Иначе окно обязано быть пустым (0x3F), иначе мы затрём
+    # чужой патч и узнаем об этом только по мотору.
+    if tgt != CODE_ORG:
+        busy = [a for a in range(CODE_ORG, CODE_ORG + len(code)) if rom[a - ROM_BASE] != 0x3F]
+        assert not busy, "окно $%04X занято: %d байт, первый $%04X — там чужой патч" % (
+            CODE_ORG, len(busy), busy[0])
     rom[off:off + len(code)] = code
     rom[hoff + 1], rom[hoff + 2] = CODE_ORG >> 8, CODE_ORG & 0xFF
     # in-place патчи заводского кода (редиректы + reset-хуки) с проверкой СТАРЫХ байт
@@ -642,7 +836,7 @@ def main():
     rom[0x7F7A], rom[0x7F7B] = s, x
     open(DST, "wb").write(rom)
     print("Готово:", os.path.basename(DST))
-    print("  код+таблицы %d байт @ C600..%04X" % (len(code), CODE_ORG + len(code) - 1))
+    print("  код+таблицы %d байт @ %04X..%04X" % (len(code), CODE_ORG, CODE_ORG + len(code) - 1))
     print("  ADDRTBL @ %04X, CONST2 @ %04X" % (addrtbl, const2t))
     print("  чек-сумма: %02X/%02X" % (s, x))
 

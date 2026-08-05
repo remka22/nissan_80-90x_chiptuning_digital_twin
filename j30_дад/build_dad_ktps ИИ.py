@@ -33,6 +33,14 @@ SPAN   = 0xCC10      # span дросселя закрыт→полный, в $14
 HOOK   = 0x89D8
 RPMGATE = 0x1F
 
+# УКАЗАТЕЛИ КАРТ в zero-page — общие с build_targeted_patch (живой тюнинг).
+# Рутина берёт базу карты НЕ константой, а из указателя: тогда панель может увести
+# карту на тень $1600 и править её на ходу. Значения в указатели кладёт живой патч
+# (MYPTR/MYINIT ставят ПЗУ, команда CB переключает). Адреса ОБЯЗАНЫ совпадать с
+# PTR_VE/PTR_KT в build_targeted_patch ИИ.py — там стоит встречная проверка.
+PTR_VE = 0x00D3        # указатель карты VE   ($C9 = ПЗУ, $16 = тень)
+PTR_KT = 0x00D5        # указатель карты Ktps ($CB = ПЗУ, $16 = тень)
+
 # январская ось дросселя, % (thr из pcn/dad): гуще на низах
 THR_PCT = [0, 2, 4, 6, 8, 10, 14, 18, 23, 29, 37, 46, 56, 66, 80, 100]
 # в единицах $14A2 (полный газ 100% = 172): %×1.72, монотонно
@@ -50,7 +58,7 @@ PROG = [
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
     (None,"CLRA",None),(None,"LDABd",0xF7),(None,"STDe",0x1482),
     (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
-    (None,"LDX#",VEMAP),(None,"STXd",0x74),
+    (None,"LDXd",PTR_VE),(None,"STXd",0x74),   # база VE — ИЗ УКАЗАТЕЛЯ (ПЗУ или тень)
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",PAXIS),(None,"STXd",0x78),
     (None,"JSRe",0x80CF),(None,"STAAd",0xF8),  # $F8 = VE
@@ -59,7 +67,7 @@ PROG = [
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
     (None,"CLRA",None),(None,"LDABe",0x14A2),(None,"STDe",0x1482),   # $1482 = 00:$14A2
     (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
-    (None,"LDX#",KTPS),(None,"STXd",0x74),
+    (None,"LDXd",PTR_KT),(None,"STXd",0x74),   # база Ktps — ИЗ УКАЗАТЕЛЯ (ПЗУ или тень)
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",TAXIS),(None,"STXd",0x78),
     (None,"JSRe",0x80CF),(None,"STAAd",0xF9),  # $F9 = Ktps
