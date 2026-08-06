@@ -30,6 +30,8 @@ KM     = 0xCA12
 KTPS   = 0xCB00      # карта Ktps 16×16
 TAXIS  = 0xCC00      # ось TPS (в единицах $14A2)
 SPAN   = 0xCC10      # span дросселя закрыт→полный, в $14A2 (172 = 344 в $1492); справочно/для осей
+MODE   = 0xCA13      # РЕЖИМ РАСЧЁТА: 0 = расходомер (заводской $8057), иначе = ДАД.
+                     # Одна прошивка на оба случая — переключается этим байтом.
 HOOK   = 0x89D8
 RPMGATE = 0x1F
 
@@ -47,7 +49,11 @@ THR_PCT = [0, 2, 4, 6, 8, 10, 14, 18, 23, 29, 37, 46, 56, 66, 80, 100]
 TAXIS_VAL = [min(255, round(p * 172 / 100)) for p in THR_PCT]
 
 PROG = [
-    (None,"LDDe",0x140A),(None,"SUBD#",RPMGATE),(None,"BCC","RUN"),
+    # РЕЖИМ: 0 -> отдать расчёт заводу и выйти. Ровно тот же приём, что уже используется
+    # гейтом по оборотам ниже, поэтому путь проверенный.
+    (None,"LDAAe",MODE),(None,"BNE","DADMODE"),
+    (None,"JSRe",0x8057),(None,"RTS",None),
+    ("DADMODE","LDDe",0x140A),(None,"SUBD#",RPMGATE),(None,"BCC","RUN"),
     (None,"JSRe",0x8057),(None,"RTS",None),
     # --- Д (давление) из MAF-канала ---
     ("RUN","LDAB#",0x00),(None,"JSRe",0xB209),(None,"LSRD",None),(None,"LSRD",None),
@@ -79,7 +85,7 @@ PROG = [
     (None,"TAB",None),(None,"CLRA",None),(None,"RTS",None),
 ]
 
-LEN={"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LSRD":1,"SUBBe":3,
+LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LSRD":1,"SUBBe":3,
      "CLRB":1,"STABd":2,"LDXe":3,"STXd":2,"LDAAd":2,"STAAd":2,"CLRA":1,"LDABd":2,
      "STDe":3,"ANDA#":2,"ORAA#":2,"LDX#":3,"LDXd":2,"STXe":3,"MUL":1,
      "LDABe":3,"ASLD":1,"TAB":1}
@@ -98,6 +104,8 @@ def asm(org):
         elif op=="SUBD#": out+=bytes([0x83,a>>8,a&0xFF])
         elif op=="BCC":
             r=lab[a]-nx; assert -128<=r<=127,("BCC %s %d"%(a,r)); out+=bytes([0x24,r&0xFF])
+        elif op=="BNE":
+            r=lab[a]-nx; assert -128<=r<=127,("BNE %s %d"%(a,r)); out+=bytes([0x26,r&0xFF])
         elif op=="JSRe":  out+=bytes([0xBD,a>>8,a&0xFF])
         elif op=="LDAB#": out+=bytes([0xC6,a&0xFF])
         elif op=="SUBBe": out+=bytes([0xF0,a>>8,a&0xFF])
@@ -106,6 +114,7 @@ def asm(org):
         elif op=="STXd":  out+=bytes([0xDF,a&0xFF])
         elif op=="STXe":  out+=bytes([0xFF,a>>8,a&0xFF])
         elif op=="LDXd":  out+=bytes([0xDE,a&0xFF])
+        elif op=="LDAAe": out+=bytes([0xB6,a>>8,a&0xFF])
         elif op=="LDAAd": out+=bytes([0x96,a&0xFF])
         elif op=="STAAd": out+=bytes([0x97,a&0xFF])
         elif op=="LDABd": out+=bytes([0xD6,a&0xFF])
@@ -125,7 +134,7 @@ def main():
     off=lambda a:a-ROM_BASE
     code,lab=asm(ROUT)
     # свободно под рутину и данные
-    for a,n in [(ROUT,len(code)),(VEMAP,256),(PAXIS,16),(SMESH,1),(KM,1),(NAKL,1),(KTPS,256),(TAXIS,16),(SPAN,1)]:
+    for a,n in [(ROUT,len(code)),(VEMAP,256),(PAXIS,16),(SMESH,1),(KM,1),(NAKL,1),(KTPS,256),(TAXIS,16),(SPAN,1),(MODE,1)]:
         assert all(b==0x3F for b in rom[off(a):off(a)+n]),"не пусто @ %04X"%a
     # врезка
     ho=off(HOOK)
@@ -139,6 +148,8 @@ def main():
     for i in range(256): rom[off(KTPS)+i]=0x80
     for i,v in enumerate(TAXIS_VAL): rom[off(TAXIS)+i]=v
     rom[off(SPAN)]=172        # span полного газа в $14A2 (=344 в $1492)
+    rom[off(MODE)]=0          # ПО УМОЛЧАНИЮ РАСХОДОМЕР: без датчика давления ДАД
+                              # считал бы мусор. Ставить 1 после установки датчика.
     # врезка адреса
     rom[ho+1],rom[ho+2]=ROUT>>8,ROUT&0xFF
     # чек-сумма
@@ -152,6 +163,7 @@ def main():
     print("  рутина %d байт @ C700..%04X"%(len(code),ROUT+len(code)-1))
     print("  VE @ C900, ось давл @ CA00 | Ktps @ CB00, ось TPS @ CC00")
     print("  ось TPS в $14A2:",TAXIS_VAL)
+    print("  режим @ %04X = %d (0 расходомер / 1 ДАД)"%(MODE,rom[off(MODE)]))
     print("  чек-сумма: %02X/%02X"%(s,x))
 
 

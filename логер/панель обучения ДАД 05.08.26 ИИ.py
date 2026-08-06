@@ -32,6 +32,8 @@ LABELS = [
     (0x141A, "Смесь из карты (сырьё)",8,"что вернула выборка", None),
     (0x140F, "УОЗ сырьё",             8, "°=70−байт",          None),
     (0x143B, "УОЗ из карты",          8, "≈градусы, до коррекций", None),
+    # ° = 128 − байт, пересчёт ниже в snapshot (линейным множителем не выражается)
+    (0x14EA, "Откат по детонации, °",  8, "0 = блок угол не крутит", None),
     (0x00F7, "Давление, кПа",         8, "считает рутина ДАД", None),
     (0x00F8, "VE (ДАД)",    8, "× (1.00 = нет)",     0.0078125),  # карта 0x4900
     (0x00F9, "Ktps (ДАД)",  8, "× (1.00 = нет)",     0.0078125),  # карта 0x4B00
@@ -97,6 +99,7 @@ NARROW_MAP = [
     0x1492, 0x1493,
     0x140F, 0x143B,
     0x17FF,           # упакованные флаги
+    0x17E0,           # АЦП канал 9 — свободный, ищем выход на разъём
     0x0053,           # сырьё флагов угла
     0x142C,
     0x14A2, 0x14DE,
@@ -104,6 +107,7 @@ NARROW_MAP = [
     0x004D, 0x004E,   # реальный впрыск
     0x17F8, 0x17F9,   # карта в тени / вердикт
     0x141A,
+    0x14EA,           # откат по детонации (128 = нет)
 ]
 
 STATE = {
@@ -304,7 +308,7 @@ LOGST = {"on": False, "path": "", "n": 0, "stop": None, "thread": None, "f": Non
 # Порядок колонок: сначала ПАРАМЕТРЫ (в т.ч. вычисленные), потом ФЛАГИ, потом АЦП сырьём.
 # Внутри параметров — смысловыми кучами: режим, топливо, зажигание, ДАД, лямбда, онлайн.
 ADC_NAMES = ["АЦП Расходомер/ДАД", "АЦП Дроссель", "АЦП Напряжение борта",
-             "АЦП Температура ОЖ", "АЦП Лямбда"]
+             "АЦП Температура ОЖ", "АЦП Лямбда", "АЦП канал 9 (свободный)"]
 PARAM_NAMES = [nm for (_a, nm, _f, _u, _m) in LABELS if nm not in ADC_NAMES]
 CALC_NAMES = ["УОЗ, градусы", "Нагрузка TP", "Газ, %", "Впрыск расчётный, мс",
               "Загрузка форсунок, %", "K форсунок", "КМ (ДАД)",
@@ -1042,6 +1046,9 @@ def snapshot():
         if v is not None and mul is not None:
             r = v * mul
             real = int(round(r)) if abs(r) >= 10 else round(r, 2)
+        # откат по детонации: не множитель, а смещение (128 = нет отката)
+        if addr == 0x14EA and v is not None:
+            real = 128 - v
         var.append({"name": name, "addr": "$%04X" % addr, "val": v, "unit": unit, "real": real})
     # разложить: параметры, потом флаги, потом АЦП
     _par = [v for v in var if v["name"] not in ADC_NAMES]
@@ -1455,6 +1462,7 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  <button id=bulkmul>× умножить</button>
  <button id=bulkadd>+ прибавить</button>
  <button id=bulkbin class=clr>Свести к бину</button>
+ <button id=bulkall>Выделить всё</button>
  <button id=bulkclr class=clr>Снять выделение</button>
  <span id=bulkstat style="color:#8aa"></span>
 </div>
@@ -1803,8 +1811,16 @@ function bulkNum(){const v=parseFloat(document.getElementById('bulkv').value.rep
 // Раньше всё шло через afrToByte безусловно; на карте угла это записало бы мусор.
 function bulkToByte(v,cur){return byteOf(liveMap,v,cur);}
 function bulkOfByte(b){return physOf(liveMap,b);}
+function selectAllCells(){
+ // выделить всю живую карту: возить мышью по 256 ячейкам невозможно
+ if(!liveMap){document.getElementById('onstat').textContent='живой карты нет';return;}
+ clearSel();
+ for(let r=0;r<16;r++)for(let c=0;c<16;c++){
+  const e=document.getElementById(liveMap+'_'+r+'_'+c); if(e)addSel(e);}
+ showBulk();}
 function wireBulk(){
  const B=(id,fn)=>{const e=document.getElementById(id);if(e)e.onclick=fn;};
+ B('bulkall',selectAllCells);
  B('bulkclr',clearSel);
  B('bulkset',()=>{const v=bulkNum();if(v===null)return;
    bulkApply(cur=>bulkToByte(v,cur));});
