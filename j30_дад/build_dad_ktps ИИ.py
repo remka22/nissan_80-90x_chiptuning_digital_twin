@@ -54,53 +54,87 @@ THR_PCT = [0, 2, 4, 6, 8, 10, 14, 18, 23, 29, 37, 46, 56, 66, 80, 100]
 # в единицах $14A2 (полный газ 100% = 172): %×1.72, монотонно
 TAXIS_VAL = [min(255, round(p * 172 / 100)) for p in THR_PCT]
 
+# ЗАЧЕМ ДВЕ ЧАСТИ.
+# Врезка 89D8 сидит ВНУТРИ обработчика прерывания по метке коленвала — там же,
+# где считаются моменты искры и впрыска. У него бюджет от 25 мс на холостом до
+# 4 мс на 5000 об, и не уложиться нельзя.
+# Раньше вся работа делалась там: чтение АЦП (а $B209 ЗАПРЕЩАЕТ ПРЕРЫВАНИЯ и ждёт
+# железку в пустом цикле!) плюс два поиска по таблицам, внутри каждого по два
+# деления. При гейте 0x1F это запускалось редко и проскакивало; с гейтом 0 —
+# на каждой метке, и основной цикл переставал получать время: пропадали кадры и
+# управление холостым, а мотор продолжал крутиться на прерываниях.
+#
+# Теперь:
+#   TP (в прерывании)  — только готовые числа и умножения. Ни ожиданий, ни делений.
+#                        Сырьё АЦП берём из $1408, которое завод и так обновляет
+#                        сам (8908-890d) — читать канал второй раз было ошибкой.
+#   VECALC (в основном цикле) — тяжёлые поиски VE и Ktps, результат в $FA/$FB.
+# Так устроен и заводской код: датчики читаются в цикле, в прерывании только счёт.
+VE_C, KT_C = 0xFA, 0xFB          # кэш VE и Ktps (наша зона zero-page, завод её не трогает)
+
 PROG = [
-    # РЕЖИМ: 0 -> отдать расчёт заводу и выйти. Ровно тот же приём, что уже используется
-    # гейтом по оборотам ниже, поэтому путь проверенный.
+    # ---------- ЧАСТЬ 1: то, что зовётся из прерывания ----------
     (None,"LDAAe",MODE),(None,"BNE","DADMODE"),
     (None,"JSRe",0x8057),(None,"RTS",None),
-    ("DADMODE","LDDe",0x140A),(None,"SUBD#",RPMGATE),(None,"BCC","RUN"),
-    (None,"JSRe",0x8057),(None,"RTS",None),
-    # --- Д (давление) из MAF-канала ---
-    # СМЕЩЕНИЕ ЗНАКОВОЕ (−128…+127 отсчётов АЦП). Минус означает, что датчик
-    # показывает давление уже при нуле отсчётов — так устроены широкодиапазонные
-    # (напр. тойотовский 89421-30100: 43 кПа при нуле вольт). Беззнаковое вычитание
-    # такую характеристику выразить не может: вся кривая уезжает вниз на постоянную
-    # величину, и на малых нагрузках смесь уходит в дичайшую бедноту.
-    ("RUN","LDAB#",0x00),(None,"JSRe",0xB209),(None,"LSRD",None),(None,"LSRD",None),
-    (None,"STABd",0xF7),                                  # сырьё АЦП, B тоже сохраняется
+    # Гейта по оборотам больше НЕТ: рутина стала дешёвой, душить её незачем,
+    # а с гейтом мотор не заводился (ниже порога расчёт уходил заводскому коду,
+    # который делит накопленный расход воздуха — а расходомера уже нет).
+    # --- Д (давление) из ГОТОВОГО сырья $1408 ---
+    # СМЕЩЕНИЕ ЗНАКОВОЕ (−128…+127 отсчётов): широкодиапазонные датчики показывают
+    # давление уже при нуле отсчётов, беззнаковое вычитание такое не выражает.
+    ("DADMODE","LDDe",0x1408),(None,"LSRD",None),(None,"LSRD",None),
+    (None,"STABd",0xF7),
     (None,"LDAAe",SMESH),(None,"BMI","DADD"),
-    # смещение >= 0: честное вычитание, перенос = заём. Ноль тоже сюда, и работает.
     (None,"LDAAd",0xF7),(None,"SUBAe",SMESH),(None,"BCC","DOK"),
-    (None,"CLRA",None),(None,"BRA","DOK"),                # ушло ниже нуля → 0
-    # смещение < 0: прибавляем модуль, потолок 255
+    (None,"CLRA",None),(None,"BRA","DOK"),
     ("DADD","NEGA",None),(None,"ABA",None),(None,"BCC","DOK"),
     (None,"LDAA#",0xFF),
     ("DOK","STAAd",0xF7),
-    (None,"LDAAd",0xF7),(None,"LDABe",NAKL),(None,"MUL",None),(None,"STAAd",0xF7),  # Д в kPa → $F7
-    # --- lookup VE по обороты × давление ---
+    (None,"LDAAd",0xF7),(None,"LDABe",NAKL),(None,"MUL",None),(None,"STAAd",0xF7),
+    # --- Тр = ((Д×VE)>>7 × Ktps)>>7 × КМ >>7, множители ГОТОВЫЕ ---
+    # Страховка на первый запуск: пока основной цикл ни разу не отработал, в кэше
+    # нули, и без неё Tp вышел бы нулевым — то есть ни капли топлива.
+    (None,"LDAAd",VE_C),(None,"BNE","VEOK"),(None,"LDAA#",0x80),
+    ("VEOK","LDABd",0xF7),(None,"MUL",None),(None,"ASLD",None),
+    (None,"LDABd",KT_C),(None,"BNE","KTOK"),(None,"LDAB#",0x80),
+    ("KTOK","MUL",None),(None,"ASLD",None),
+    (None,"LDABe",KM),(None,"MUL",None),(None,"ASLD",None),
+    (None,"TAB",None),(None,"CLRA",None),(None,"RTS",None),
+
+    # ---------- ЧАСТЬ 2: то, что зовётся из основного цикла ----------
+    # Врезка на b0e5 (был JSR $B148 — заводской опрос датчиков). Сначала отдаём
+    # управление ему, чтобы сырьё было свежим, потом считаем множители.
+    ("VECALC","JSRe",0xB148),
+    (None,"LDAAe",MODE),(None,"BNE","VRUN"),(None,"RTS",None),
+    # давление тем же способом, что и в части 1 (нужно как ось поиска VE)
+    ("VRUN","LDDe",0x1408),(None,"LSRD",None),(None,"LSRD",None),
+    (None,"STABd",0xF7),
+    (None,"LDAAe",SMESH),(None,"BMI","VDADD"),
+    (None,"LDAAd",0xF7),(None,"SUBAe",SMESH),(None,"BCC","VDOK"),
+    (None,"CLRA",None),(None,"BRA","VDOK"),
+    ("VDADD","NEGA",None),(None,"ABA",None),(None,"BCC","VDOK"),
+    (None,"LDAA#",0xFF),
+    ("VDOK","STAAd",0xF7),
+    (None,"LDAAd",0xF7),(None,"LDABe",NAKL),(None,"MUL",None),(None,"STAAd",0xF7),
+    # --- поиск VE по обороты × давление ---
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
     (None,"CLRA",None),(None,"LDABd",0xF7),(None,"STDe",0x1482),
     (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
-    (None,"LDXd",PTR_VE),(None,"STXd",0x74),   # база VE — ИЗ УКАЗАТЕЛЯ (ПЗУ или тень)
+    (None,"LDXd",PTR_VE),(None,"STXd",0x74),
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",PAXIS),(None,"STXd",0x78),
-    (None,"JSRe",0x80CF),(None,"STAAd",0xF8),  # $F8 = VE
+    (None,"JSRe",0x80CF),(None,"STAAd",VE_C),
     (None,"LDAAd",0xF6),(None,"STAAd",0x7D),(None,"LDXd",0xF4),(None,"STXe",0x1482),
-    # --- lookup Ktps по обороты × TPS ($14A2) ---
+    # --- поиск Ktps по обороты × TPS ---
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
-    (None,"CLRA",None),(None,"LDABe",0x14A2),(None,"STDe",0x1482),   # $1482 = 00:$14A2
+    (None,"CLRA",None),(None,"LDABe",0x14A2),(None,"STDe",0x1482),
     (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
-    (None,"LDXd",PTR_KT),(None,"STXd",0x74),   # база Ktps — ИЗ УКАЗАТЕЛЯ (ПЗУ или тень)
+    (None,"LDXd",PTR_KT),(None,"STXd",0x74),
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",TAXIS),(None,"STXd",0x78),
-    (None,"JSRe",0x80CF),(None,"STAAd",0xF9),  # $F9 = Ktps
+    (None,"JSRe",0x80CF),(None,"STAAd",KT_C),
     (None,"LDAAd",0xF6),(None,"STAAd",0x7D),(None,"LDXd",0xF4),(None,"STXe",0x1482),
-    # --- Тр = ((Д×VE)>>7 × Ktps)>>7 × КМ >>7 ---
-    (None,"LDAAd",0xF8),(None,"LDABd",0xF7),(None,"MUL",None),(None,"ASLD",None),   # A=Д×VE
-    (None,"LDABd",0xF9),(None,"MUL",None),(None,"ASLD",None),                       # × Ktps
-    (None,"LDABe",KM),(None,"MUL",None),(None,"ASLD",None),                         # × КМ
-    (None,"TAB",None),(None,"CLRA",None),(None,"RTS",None),
+    (None,"RTS",None),
 ]
 
 LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LSRD":1,"SUBBe":3,
@@ -108,7 +142,7 @@ LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LS
      "STDe":3,"ANDA#":2,"ORAA#":2,"LDX#":3,"LDXd":2,"STXe":3,"MUL":1,
      "LDABe":3,"ASLD":1,"TAB":1,
      # добавлено под ЗНАКОВОЕ смещение ДАД (см. блок «Д (давление)»)
-     "BMI":2,"BRA":2,"SUBAe":3,"NEGA":1,"ABA":1,"LDAA#":2}
+     "BMI":2,"BRA":2,"SUBAe":3,"NEGA":1,"ABA":1,"LDAA#":2,"LDAB#":2}
 OP1={"RTS":0x39,"LSRD":0x04,"CLRB":0x5F,"CLRA":0x4F,"MUL":0x3D,"ASLD":0x05,"TAB":0x16,
      "NEGA":0x40,"ABA":0x1B}
 
@@ -208,8 +242,16 @@ def main():
     rom[off(SPAN)]=172        # span полного газа в $14A2 (=344 в $1492)
     rom[off(MODE)]=0          # ПО УМОЛЧАНИЮ РАСХОДОМЕР: без датчика давления ДАД
                               # считал бы мусор. Ставить 1 после установки датчика.
-    # врезка адреса
+    # врезка адреса — прерывание зовёт часть 1
     rom[ho+1],rom[ho+2]=ROUT>>8,ROUT&0xFF
+    # ВТОРАЯ ВРЕЗКА: основной цикл (b0e5: JSR $B148) -> наша часть 2, а она в начале
+    # сама зовёт $B148. Порядок заводских вызовов сохраняется, а тяжёлые поиски VE
+    # и Ktps уезжают из прерывания сюда, где ждать можно сколько угодно.
+    ho2=off(0xB0E5)
+    assert rom[ho2]==0xBD and (rom[ho2+1]<<8|rom[ho2+2])==0xB148,"по B0E5 не JSR B148"
+    va=lab["VECALC"]
+    rom[ho2+1],rom[ho2+2]=va>>8,va&0xFF
+    print("  врезка в основной цикл: B0E5 -> VECALC @ %04X"%va)
     # чек-сумма
     s=x=0
     for i in range(len(rom)):

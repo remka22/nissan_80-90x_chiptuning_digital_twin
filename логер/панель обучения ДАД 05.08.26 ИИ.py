@@ -1023,8 +1023,19 @@ def _open_link(port, baud):
         host, _, p = port.rpartition(":")
         return NetSerial(host, int(p))
     import serial
-    return serial.Serial(port, int(baud), bytesize=8,
-                         parity=serial.PARITY_NONE, stopbits=1, timeout=0.2)
+    # ⚠ dsrdtr/rtscts выключены, а DTR и RTS сняты ЯВНО: на плате ESP32 эти линии
+    # заведены на схему автосброса (ими же идёт прошивка). pyserial при открытии
+    # порта дёргает их по умолчанию — и панель перезагружала мост при каждом
+    # подключении. По Wi-Fi этих линий нет, поэтому там подключалось сразу.
+    # Для FTDI к блоку они не используются, так что снятие безопасно для обоих.
+    s = serial.Serial(None, int(baud), bytesize=8,
+                      parity=serial.PARITY_NONE, stopbits=1, timeout=0.2,
+                      dsrdtr=False, rtscts=False)
+    s.port = port
+    s.dtr = False
+    s.rts = False
+    s.open()
+    return s
 
 
 def do_start(port, baud):
