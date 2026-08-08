@@ -8,13 +8,18 @@ O2, напряжение, темпа, впрыск...), полный образ 
 
 Скорости под версии дампа:  v5(E/16)=125000  v6(E/128)=16000  v7(E/1024)=2000
 """
-import argparse, threading, time, json, os, collections
+import argparse, threading, time, json, os, socket, collections
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK = threading.Lock()
+
+# Точка доступа моста на ESP32 (см. esp32/j30_мост_ЭБУ-ШДК). Появляется в списке
+# портов отдельной строкой. Bluetooth-вариант того же моста выбирается как обычный
+# /dev/cu.* и сюда не попадает.
+ESP_NET_ADDR = "192.168.4.1:2323"
 
 # известные адреса ОЗУ (из разбора). fmt: 8=байт, 16=слово big-endian. Показываем СЫРЬЁ.
 # (адрес, имя, формат 8/16, единица, множитель-в-реал или None). Единицы ВЫВЕДЕНЫ ИЗ КОДА.
@@ -947,6 +952,78 @@ def _fill_shadow(s, which, arr):
     return True, 0, ""
 
 
+def _afr_from_bridge(ram, wbl):
+    """AFR факт. ПРИОРИТЕТ У ПРОВОДНОГО ШДК, мост — запасной источник.
+
+    Проводной подключён напрямую к ноуту и идёт без посредников, поэтому если он
+    жив — верим ему. `wbl["afr"]` уже приходит пустым, когда поток протух, так что
+    отдельной проверки свежести не нужно.
+
+    Ноль от моста означает «мой ШДК молчит» — тогда пусто. Молча перестать слать
+    мост не может: панель кладёт значение в образ ОЗУ, а оттуда оно само никогда
+    не исчезает, и застывшее число писалось бы в лог до конца заезда.
+    """
+    if wbl["afr"] is not None:
+        return wbl["afr"]
+    if 0x0200 in ram and 0x0201 in ram:
+        v = (ram[0x0200] << 8) | ram[0x0201]
+        return round(v / 100.0, 2) if v else None
+    return None
+
+
+class NetSerial:
+    """Сокет, прикидывающийся serial.Serial.
+
+    Нужен, чтобы всё остальное в панели (reader_loop, _send_cmd, дамп C9, заливка
+    блоков) работало БЕЗ ПРАВОК — им всё равно, куда писать, лишь бы у объекта были
+    read/write/close. Мост на ESP32 отдаёт ровно тот же байтовый поток, что и провод.
+    """
+    def __init__(self, host, port, timeout=0.2):
+        self.s = socket.create_connection((host, port), timeout=5.0)
+        self.s.settimeout(timeout)
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.is_open = True
+
+    def read(self, n=1):
+        # serial.read ждёт до таймаута и возвращает сколько есть, в т.ч. b"".
+        # У сокета таймаут кидает исключение — гасим его, иначе reader_loop
+        # свалится на первой же паузе между кадрами (а она у нас 400 мс).
+        try:
+            return self.s.recv(n) or b""
+        except socket.timeout:
+            return b""
+        except OSError:
+            return b""
+
+    def write(self, data):
+        self.s.sendall(bytes(data)); return len(data)
+
+    def reset_input_buffer(self):
+        old = self.s.gettimeout(); self.s.settimeout(0.05)
+        try:
+            while self.s.recv(4096): pass
+        except Exception:
+            pass
+        self.s.settimeout(old)
+
+    def flush(self): pass
+
+    def close(self):
+        self.is_open = False
+        try: self.s.close()
+        except Exception: pass
+
+
+def _open_link(port, baud):
+    """host:порт -> сеть, иначе обычный COM/USB-порт (в т.ч. Bluetooth SPP)."""
+    if ":" in port and not port.startswith("/"):
+        host, _, p = port.rpartition(":")
+        return NetSerial(host, int(p))
+    import serial
+    return serial.Serial(port, int(baud), bytesize=8,
+                         parity=serial.PARITY_NONE, stopbits=1, timeout=0.2)
+
+
 def do_start(port, baud):
     import serial
     # SER_LOCK: смена порта посреди обмена подменила бы CTRL["ser"] под работающей
@@ -955,8 +1032,7 @@ def do_start(port, baud):
         if CTRL["stop"]: CTRL["stop"].set()
         if CTRL["thread"]: CTRL["thread"].join(timeout=1.0)
         try:
-            ser = serial.Serial(port, int(baud), bytesize=8,
-                                parity=serial.PARITY_NONE, stopbits=1, timeout=0.2)
+            ser = _open_link(port, baud)
         except Exception as e:
             with LOCK:
                 STATE["error"] = f"Не открыл {port} @ {baud}: {e}"; STATE["running"] = False
@@ -1101,7 +1177,8 @@ def snapshot():
         "afr_target": None, "uoz": None,
         # °BTDC = 70 − $140F (код: SBA #0x46; проверено: ХХ-нейтраль 55→15° = спец VG30E)
         "uoz_deg": (70 - ram[0x140F]) if 0x140F in ram else None,
-        "afr_fact": wbl["afr"], "press": None, "ve_corr": None,
+        # AFR факт: приоритет у проводного ШДК, мост — запасной (см. _afr_from_bridge)
+        "afr_fact": _afr_from_bridge(ram, wbl), "press": None, "ve_corr": None,
     }
     # ТОЧНАЯ загрузка форсунок: РЕАЛЬНЫЙ впрыск $004D (в UPP) × 0.010мс × об / 1200.
     # ЦЕНА ТИКА = 10 мкс (исправлено 04.08.26, было 5). Делитель 1200 — потому что
@@ -2054,6 +2131,9 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/status"): self._json(snapshot()); return
         if self.path.startswith("/api/ports"):
             ports, sug = list_ports()
+            # мост на ESP32 — сетевым адресом, портом мак его не считает
+            ports = list(ports) + [{"device": ESP_NET_ADDR,
+                                    "desc": "мост ESP32 (Wi-Fi)", "ftdi": False}]
             with LOCK: ep = STATE["port"] if STATE["running"] else ""
             with WLOCK: wp = WBL["port"] if WBL["running"] else ""
             self._json({"ports": ports, "suggested": sug, "ecu_port": ep, "wbl_port": wp}); return
