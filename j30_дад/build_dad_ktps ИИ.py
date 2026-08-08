@@ -116,7 +116,13 @@ PROG = [
     ("VECALC","JSRe",0xB148),
     (None,"LDAAe",MODE),(None,"BNE","VRUN"),(None,"RTS",None),
     # давление тем же способом, что и в части 1 (нужно как ось поиска VE)
-    ("VRUN","LDDe",0x1408),(None,"LSRD",None),(None,"LSRD",None),
+    # ⚠ SEI: $80CF НЕВХОДИМАЯ — держит состояние в общих $0067-$007A и $007D, и ею
+    # же пользуется расчёт угла ВНУТРИ прерывания. Пока поиски жили в прерывании,
+    # они были неделимы по построению. Вынеся их в цикл, защиту надо вернуть явно,
+    # иначе прерывание затирает рабочие ячейки на середине поиска и множители
+    # выходят near-нулевыми. Заводской код делает так же ($B209: SEI ... CLI).
+    ("VRUN","SEI",None),
+    (None,"LDDe",0x1408),(None,"LSRD",None),(None,"LSRD",None),
     (None,"STABd",0xF7),
     (None,"LDAAe",SMESH),(None,"BMI","VDADD"),
     (None,"LDAAd",0xF7),(None,"SUBAe",SMESH),(None,"BCC","VDOK"),
@@ -143,7 +149,7 @@ PROG = [
     (None,"LDX#",TAXIS),(None,"STXd",0x78),
     (None,"JSRe",0x80CF),(None,"STAAd",KT_C),
     (None,"LDAAd",0xF6),(None,"STAAd",0x7D),(None,"LDXd",0xF4),(None,"STXe",0x1482),
-    (None,"RTS",None),
+    (None,"CLI",None),(None,"RTS",None),
 ]
 
 LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LSRD":1,"SUBBe":3,
@@ -151,9 +157,9 @@ LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LS
      "STDe":3,"ANDA#":2,"ORAA#":2,"LDX#":3,"LDXd":2,"STXe":3,"MUL":1,
      "LDABe":3,"ASLD":1,"TAB":1,
      # добавлено под ЗНАКОВОЕ смещение ДАД (см. блок «Д (давление)»)
-     "BMI":2,"BRA":2,"SUBAe":3,"NEGA":1,"ABA":1,"LDAA#":2,"LDAB#":2}
+     "BMI":2,"BRA":2,"SUBAe":3,"NEGA":1,"ABA":1,"LDAA#":2,"LDAB#":2,"SEI":1,"CLI":1}
 OP1={"RTS":0x39,"LSRD":0x04,"CLRB":0x5F,"CLRA":0x4F,"MUL":0x3D,"ASLD":0x05,"TAB":0x16,
-     "NEGA":0x40,"ABA":0x1B}
+     "NEGA":0x40,"ABA":0x1B,"SEI":0x0F,"CLI":0x0E}
 
 
 def asm(org):
