@@ -261,7 +261,10 @@ def load_tables(path):
         t["ve"] = rd(0x4900, 256)       # VE 16×16 (значение/128 = наполнение)
         t["ve_rax"] = rd(0x7B20, 16)    # ось оборотов (родная FB20)
         t["ve_pax"] = rd(0x4A00, 16)    # ось давления, кПа
-        t["dad_ofs"] = b[0x4A10]        # Смещ (ноль датчика, отсчёты>>2)
+        # ЗНАКОВОЕ: 223 в байте это −33. Читалось беззнаковым, и запасной расчёт
+        # давления давал чушь на датчиках с отрицательным смещением.
+        _ofs = b[0x4A10]
+        t["dad_ofs"] = _ofs - 256 if _ofs > 127 else _ofs
         t["dad_slope"] = b[0x4A11]      # наклон кПа/отсчёт ×256
     # Ktps (поправка по дросселю) — есть если карта 0x4B00 не пустая (0x3F)
     if dad and any(z != 0x3F for z in rd(0x4B00, 16)):
@@ -897,7 +900,10 @@ def snapshot():
             # Пересчёт из сырья оставлен запасным путём для старых бинов, где $00F7 в кадре нет.
             press = ram.get(0x00F7)
             maf_raw = w(0x1408)   # 16 бит: значение прижато вправо, старший байт лишь 2 бита
-            if press is None and maf_raw is not None:
+            # НОЛЬ тоже считаем «нет данных»: абсолютное давление нулём не бывает, а блок
+            # в режиме расходомера ($CA13=0) до расчёта не доходит и оставляет там ноль.
+            # Раньше проверялось только на None — и этот ноль ехал в панель как настоящий.
+            if not press and maf_raw is not None:
                 praw = (maf_raw >> 2) - t["dad_ofs"]
                 if praw < 0: praw = 0
                 press = (praw * t["dad_slope"]) >> 8             # давление, кПа
@@ -1641,6 +1647,10 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
   // восстановление онлайна из памяти браузера: отрисовать редактируемые таблицы когда оси готовы
   if(online&&liveMap&&ONLINE[liveMap]&&AX[liveMap]&&!editRendered){renderEdit(liveMap);editRendered=true;}
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
+  // VE и Ktps не подсвечивались НИКОГДА: сервер координаты считал и отдавал,
+  // а здесь их не применяли. Проверка на наличие — карты есть только на ДАД-бине.
+  if(d.ve)setHL('ve',d.ve.hr,d.ve.hc);
+  if(d.ktps)setHL('ktps',d.ktps.hr,d.ktps.hc);
  }
 }).catch(e=>{}).finally(()=>setTimeout(tick,150));}   // 400→150мс: срезает до 250мс экранной задержки
 function toggleHud(){

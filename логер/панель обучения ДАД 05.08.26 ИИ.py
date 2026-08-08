@@ -266,7 +266,10 @@ def load_tables(path):
         t["ve"] = rd(0x4900, 256)       # VE 16×16 (значение/128 = наполнение)
         t["ve_rax"] = rd(0x7B20, 16)    # ось оборотов (родная FB20)
         t["ve_pax"] = rd(0x4A00, 16)    # ось давления, кПа
-        t["dad_ofs"] = b[0x4A10]        # Смещ (ноль датчика, отсчёты>>2)
+        # ЗНАКОВОЕ: 223 в байте это −33. Читалось беззнаковым, и запасной расчёт
+        # давления давал чушь на датчиках с отрицательным смещением.
+        _ofs = b[0x4A10]
+        t["dad_ofs"] = _ofs - 256 if _ofs > 127 else _ofs
         t["dad_slope"] = b[0x4A11]      # наклон кПа/отсчёт ×256
     # Ktps (поправка по дросселю) — есть если карта 0x4B00 не пустая (0x3F)
     if dad and any(z != 0x3F for z in rd(0x4B00, 16)):
@@ -1240,7 +1243,10 @@ def snapshot():
             # Пересчёт из сырья оставлен запасным путём для старых бинов, где $00F7 в кадре нет.
             press = ram.get(0x00F7)
             maf_raw = w(0x1408)   # 16 бит: значение прижато вправо, старший байт лишь 2 бита
-            if press is None and maf_raw is not None:
+            # НОЛЬ тоже считаем «нет данных»: абсолютное давление нулём не бывает, а блок
+            # в режиме расходомера ($CA13=0) до расчёта не доходит и оставляет там ноль.
+            # Раньше проверялось только на None — и этот ноль ехал в панель как настоящий.
+            if not press and maf_raw is not None:
                 praw = (maf_raw >> 2) - t["dad_ofs"]
                 if praw < 0: praw = 0
                 press = (praw * t["dad_slope"]) >> 8             # давление, кПа
@@ -1662,6 +1668,21 @@ function afrToByte(afr,cur){  // остаёмся в кластере текущ
  return Math.max(0,Math.min(255,b));}
 // байт → физика по карте: смесь = AFR, угол = градусы, VE и Ktps = коэффициент (128 = 1.0)
 const MAPBOX={fuel:'fuelmap',ign:'ignmap',ve:'vemap',ktps:'ktpsmap'};
+// Живая (настраиваемая) карта — НАВЕРХ, пока включён ОНЛАЙН. Выключил — порядок
+// возвращается исходный: иначе карта так и висела бы первой без всякой причины.
+let mapOrder=null, raisedFor=null;
+function raiseLive(){
+ const anchor=document.getElementById('fuelmap'); if(!anchor)return;
+ const mb=anchor.closest('.mapbox'); if(!mb||!mb.parentNode)return;
+ const par=mb.parentNode;
+ if(!mapOrder) mapOrder=Array.from(par.children).filter(e=>e.classList&&e.classList.contains('mapbox'));
+ const want=(online&&liveMap&&MAPBOX[liveMap])?liveMap:null;
+ if(want===raisedFor)return;                       // ничего не изменилось — DOM не трогаем
+ for(const el of mapOrder) par.appendChild(el);    // сперва вернуть исходный порядок
+ if(want){const lb=document.getElementById(MAPBOX[want]);const t=lb&&lb.closest('.mapbox');if(t)par.prepend(t);}
+ raisedFor=want;
+}
+
 function physOf(which,b){
  if(which==='fuel')return afrOf(b);
  if(which==='ign') return b;
@@ -2110,7 +2131,12 @@ function tick(){fetch('/api/status').then(r=>r.json()).then(d=>{
    mapBin=d.bin;hlIds={fuel:null,ign:null,ve:null,ktps:null};}
   // восстановление онлайна из памяти браузера: отрисовать редактируемые таблицы когда оси готовы
   if(online&&liveMap&&ONLINE[liveMap]&&AX[liveMap]&&!editRendered){renderEdit(liveMap);editRendered=true;}
+  raiseLive();   // настраиваемую карту держим первой на странице
   setHL('fuel',d.fuel.hr,d.fuel.hc);setHL('ign',d.ign.hr,d.ign.hc);
+  // VE и Ktps не подсвечивались НИКОГДА: сервер координаты считал и отдавал,
+  // а здесь их не применяли. Проверка на наличие — карты есть только на ДАД-бине.
+  if(d.ve)setHL('ve',d.ve.hr,d.ve.hc);
+  if(d.ktps)setHL('ktps',d.ktps.hr,d.ktps.hc);
  }
 }).catch(e=>{}).finally(()=>setTimeout(tick,150));}   // 400→150мс: срезает до 250мс экранной задержки
 function toggletheme(){const dark=document.getElementById('darkbox').checked;
