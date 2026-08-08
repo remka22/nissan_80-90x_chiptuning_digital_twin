@@ -507,8 +507,11 @@ function render(){
     const slope=(p2-p1)/(v2-v1);            // кПа/В
     const voff=v1 - p1/slope;               // В при 0 кПа
     const smRaw=Math.round(voff/0.0195), slRaw=Math.round(slope*5);
-    if(slRaw<0||slRaw>255||smRaw<0||smRaw>255){alert('Вне диапазона байта: наклон>51 кПа/В (3-бар+ не влезает) или смещение <0/>5В. Запишу с ограничением — проверь датчик/точки.');}
-    const smByte=Math.max(0,Math.min(255,smRaw));
+    // Смещение ЗНАКОВОЕ: −128…+127 отсчётов, это примерно −2.5…+2.5 В.
+    // Минус — не ошибка: широкодиапазонные датчики показывают давление уже при
+    // нуле вольт, и продлённая назад прямая пересекает 0 кПа в минусе.
+    if(slRaw<0||slRaw>255||smRaw<-128||smRaw>127){alert('Вне диапазона: наклон 0…51 кПа/В (3-бар+ не влезает) или смещение вне −2.5…+2.5 В. Запишу с ограничением — проверь точки.');}
+    const smByte=Math.max(-128,Math.min(127,smRaw)) & 0xFF;
     const slByte=Math.max(0,Math.min(255,slRaw));
     ROM[0x4A10]=smByte; ROM[0x4A11]=slByte;
     mark();

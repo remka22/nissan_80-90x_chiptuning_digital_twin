@@ -56,9 +56,21 @@ PROG = [
     ("DADMODE","LDDe",0x140A),(None,"SUBD#",RPMGATE),(None,"BCC","RUN"),
     (None,"JSRe",0x8057),(None,"RTS",None),
     # --- Д (давление) из MAF-канала ---
+    # СМЕЩЕНИЕ ЗНАКОВОЕ (−128…+127 отсчётов АЦП). Минус означает, что датчик
+    # показывает давление уже при нуле отсчётов — так устроены широкодиапазонные
+    # (напр. тойотовский 89421-30100: 43 кПа при нуле вольт). Беззнаковое вычитание
+    # такую характеристику выразить не может: вся кривая уезжает вниз на постоянную
+    # величину, и на малых нагрузках смесь уходит в дичайшую бедноту.
     ("RUN","LDAB#",0x00),(None,"JSRe",0xB209),(None,"LSRD",None),(None,"LSRD",None),
-    (None,"SUBBe",SMESH),(None,"BCC","DOK"),(None,"CLRB",None),
-    ("DOK","STABd",0xF7),
+    (None,"STABd",0xF7),                                  # сырьё АЦП, B тоже сохраняется
+    (None,"LDAAe",SMESH),(None,"BMI","DADD"),
+    # смещение >= 0: честное вычитание, перенос = заём. Ноль тоже сюда, и работает.
+    (None,"LDAAd",0xF7),(None,"SUBAe",SMESH),(None,"BCC","DOK"),
+    (None,"CLRA",None),(None,"BRA","DOK"),                # ушло ниже нуля → 0
+    # смещение < 0: прибавляем модуль, потолок 255
+    ("DADD","NEGA",None),(None,"ABA",None),(None,"BCC","DOK"),
+    (None,"LDAA#",0xFF),
+    ("DOK","STAAd",0xF7),
     (None,"LDAAd",0xF7),(None,"LDABe",NAKL),(None,"MUL",None),(None,"STAAd",0xF7),  # Д в kPa → $F7
     # --- lookup VE по обороты × давление ---
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
@@ -88,8 +100,11 @@ PROG = [
 LEN={"BNE":2,"LDAAe":3,"LDDe":3,"SUBD#":3,"BCC":2,"JSRe":3,"RTS":1,"LDAB#":2,"LSRD":1,"SUBBe":3,
      "CLRB":1,"STABd":2,"LDXe":3,"STXd":2,"LDAAd":2,"STAAd":2,"CLRA":1,"LDABd":2,
      "STDe":3,"ANDA#":2,"ORAA#":2,"LDX#":3,"LDXd":2,"STXe":3,"MUL":1,
-     "LDABe":3,"ASLD":1,"TAB":1}
-OP1={"RTS":0x39,"LSRD":0x04,"CLRB":0x5F,"CLRA":0x4F,"MUL":0x3D,"ASLD":0x05,"TAB":0x16}
+     "LDABe":3,"ASLD":1,"TAB":1,
+     # добавлено под ЗНАКОВОЕ смещение ДАД (см. блок «Д (давление)»)
+     "BMI":2,"BRA":2,"SUBAe":3,"NEGA":1,"ABA":1,"LDAA#":2}
+OP1={"RTS":0x39,"LSRD":0x04,"CLRB":0x5F,"CLRA":0x4F,"MUL":0x3D,"ASLD":0x05,"TAB":0x16,
+     "NEGA":0x40,"ABA":0x1B}
 
 
 def asm(org):
@@ -120,6 +135,12 @@ def asm(org):
         elif op=="LDABd": out+=bytes([0xD6,a&0xFF])
         elif op=="LDABe": out+=bytes([0xF6,a>>8,a&0xFF])
         elif op=="STDe":  out+=bytes([0xFD,a>>8,a&0xFF])
+        elif op=="BMI":
+            r=lab[a]-nx; assert -128<=r<=127,("BMI %s %d"%(a,r)); out+=bytes([0x2B,r&0xFF])
+        elif op=="BRA":
+            r=lab[a]-nx; assert -128<=r<=127,("BRA %s %d"%(a,r)); out+=bytes([0x20,r&0xFF])
+        elif op=="SUBAe": out+=bytes([0xB0,a>>8,a&0xFF])
+        elif op=="LDAA#": out+=bytes([0x86,a&0xFF])
         elif op=="ANDA#": out+=bytes([0x84,a&0xFF])
         elif op=="ORAA#": out+=bytes([0x8A,a&0xFF])
         elif op=="LDX#":  out+=bytes([0xCE,a>>8,a&0xFF])
@@ -141,7 +162,18 @@ def main():
     assert rom[ho]==0xBD and (rom[ho+1]<<8|rom[ho+2])==0x8057,"по 89D8 не JSR 8057"
     rom[off(ROUT):off(ROUT)+len(code)]=code
     # данные ДАД (номинал)
-    for i in range(256): rom[off(VEMAP)+i]=0x80
+    # VE — НАКЛОННАЯ ПЛОСКОСТЬ по оборотам: 0.40 на 800 об, 0.80 на 5000, линейно
+    # и дальше в обе стороны. По давлению плоская (все 16 столбцов одинаковы) —
+    # наполнение уже учтено самим давлением, VE правит только крутящий по оборотам.
+    # Раскладка карты: адрес = база + строка(обороты)*16 + столбец(давление).
+    # Ось оборотов берём ИЗ ПЗУ ($FB20), а не хардкодом — иначе разъедется с блоком.
+    # Обороты = значение оси × 51.2 (ось = $140A>>2, а $140A × 12.807 = об/мин).
+    rax=[rom[off(0xFB20)+i] for i in range(16)]
+    for r in range(16):
+        rpm = rax[r] * 51.2
+        ve  = 0.40 + (rpm - 800.0) * (0.40 / 4200.0)      # 800→0.40, 5000→0.80
+        b   = max(0, min(255, round(ve * 128)))
+        for c in range(16): rom[off(VEMAP)+r*16+c] = b
     for i,v in enumerate([20,26,32,38,44,50,56,62,68,74,80,86,92,98,104,110]): rom[off(PAXIS)+i]=v
     rom[off(SMESH)]=26; rom[off(KM)]=128; rom[off(NAKL)]=125
     # данные Ktps: карта 0x80 (=1.0, без поправки), ось TPS из января
