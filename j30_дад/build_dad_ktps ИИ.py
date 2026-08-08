@@ -70,6 +70,15 @@ TAXIS_VAL = [min(255, round(p * 172 / 100)) for p in THR_PCT]
 #                        сам (8908-890d) — читать канал второй раз было ошибкой.
 #   VECALC (в основном цикле) — тяжёлые поиски VE и Ktps, результат в $FA/$FB.
 # Так устроен и заводской код: датчики читаются в цикле, в прерывании только счёт.
+# ⚠ ДВА БАГА, ЖИВШИЕ С ПЕРВОЙ ВЕРСИИ ДАД (найдены 08.08.26 меткой на двойнике):
+#  1) Ось нагрузки интерполятор читает СТАРШИМ байтом ($80CF: STX $0069 / LDAA $0069).
+#     Мы клали давление в младший — поиск по оси всегда получал НОЛЬ, и VE брался
+#     из крайнего левого столбца при любом давлении. Вместо 0.8 читалось 0.26.
+#  2) Маска была ANDA #$1F — она СОХРАНЯЕТ бит 4, поэтому снять его через ORAA
+#     было нельзя. Стало ANDA #$0F: биты 4-7 чистятся, дальше ORAA #$04.
+#     Бит 4 в $007D включает формат карты УГЛА ($8208 -> 8258: ANDA #$7F, ADDA #$80),
+#     то есть к значению прибавлялось 128. Для обычной карты бит должен быть СНЯТ.
+# Ошибки частично гасили друг друга, поэтому смесь была просто неверной, а не нулевой.
 VE_C, KT_C = 0xFA, 0xFB          # кэш VE и Ktps (наша зона zero-page, завод её не трогает)
 
 PROG = [
@@ -118,8 +127,8 @@ PROG = [
     (None,"LDAAd",0xF7),(None,"LDABe",NAKL),(None,"MUL",None),(None,"STAAd",0xF7),
     # --- поиск VE по обороты × давление ---
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
-    (None,"CLRA",None),(None,"LDABd",0xF7),(None,"STDe",0x1482),
-    (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
+    (None,"LDAAd",0xF7),(None,"CLRB",None),(None,"STDe",0x1482),   # давление в СТАРШИЙ байт
+    (None,"LDAAd",0x7D),(None,"ANDA#",0x0F),(None,"ORAA#",0x04),(None,"STAAd",0x7D),
     (None,"LDXd",PTR_VE),(None,"STXd",0x74),
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",PAXIS),(None,"STXd",0x78),
@@ -127,8 +136,8 @@ PROG = [
     (None,"LDAAd",0xF6),(None,"STAAd",0x7D),(None,"LDXd",0xF4),(None,"STXe",0x1482),
     # --- поиск Ktps по обороты × TPS ---
     (None,"LDXe",0x1482),(None,"STXd",0xF4),(None,"LDAAd",0x7D),(None,"STAAd",0xF6),
-    (None,"CLRA",None),(None,"LDABe",0x14A2),(None,"STDe",0x1482),
-    (None,"LDAAd",0x7D),(None,"ANDA#",0x1F),(None,"ORAA#",0x14),(None,"STAAd",0x7D),
+    (None,"LDAAe",0x14A2),(None,"CLRB",None),(None,"STDe",0x1482),  # TPS в СТАРШИЙ байт
+    (None,"LDAAd",0x7D),(None,"ANDA#",0x0F),(None,"ORAA#",0x04),(None,"STAAd",0x7D),
     (None,"LDXd",PTR_KT),(None,"STXd",0x74),
     (None,"LDX#",0xFB20),(None,"STXd",0x76),
     (None,"LDX#",TAXIS),(None,"STXd",0x78),
