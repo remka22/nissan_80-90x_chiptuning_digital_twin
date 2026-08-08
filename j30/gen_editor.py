@@ -237,11 +237,13 @@ const INJ_CALC=`<div class=calc>
 </div>`;
 
 const DAD_CALC=`<div class=calc>
-<b>📐 Расчёт тарировки ДАД по 2 точкам</b> — введи две пары (напряжение → давление) из паспорта датчика:<br>
-Точка 1: <input id=dv1 class=ci placeholder="0.5"> В → <input id=dp1 class=ci placeholder="0"> кПа<br>
-Точка 2: <input id=dv2 class=ci placeholder="4.5"> В → <input id=dp2 class=ci placeholder="100"> кПа<br>
+<b>📐 Расчёт тарировки ДАД по 2 точкам</b> — введи две пары <b>отсчёт АЦП → давление</b>. Отсчёт бери прямо из панели, строка «АЦП Расходомер/ДАД» (10 бит, 0…1023):<br>
+Точка 1: <input id=dv1 class=ci placeholder="170"> АЦП → <input id=dp1 class=ci placeholder="40"> кПа<br>
+Точка 2: <input id=dv2 class=ci placeholder="1000"> АЦП → <input id=dp2 class=ci placeholder="150"> кПа<br>
 <button id=dadgo>📐 РАССЧИТАТЬ — Наклон + Смещение</button>
-<div class=calcnote>Наклон = (P2−P1)/(V2−V1) кПа/В; Смещение = напряжение при 0 кПа. Пишет прямо в поля Наклон/Смещение выше. Пример: 0.5В→0кПа, 4.5В→100кПа даёт наклон 25, смещение 0.5. После — сохрани дамп.</div>
+<div class=calcnote>Вводятся ОТСЧЁТЫ, а не вольты: блок работает в отсчётах, а перевод в вольты содержит непроверенное допущение про опору АЦП платы. Рутина делит 10 бит на 4 — редактор это учитывает сам. Смещение может быть ОТРИЦАТЕЛЬНЫМ, это норма для широкодиапазонных датчиков.<br>
+<b>Перевод в вольты (прикидка):</b> <code>В ≈ АЦП10 × 0.00488</code> &nbsp;·&nbsp; обратно <code>АЦП10 ≈ В × 205</code>. Для 8-битного отсчёта <code>В ≈ АЦП8 × 0.0195</code>. Это допущение «5 В на 256 отсчётов»; реальная опора АЦП платы блока из ПЗУ не выводится, поэтому в вольтах может быть смещение — тарируйся по отсчётам, а вольты только для прикидки.<br>
+Пишет прямо в поля Наклон/Смещение выше. После — сохрани дамп.</div>
 </div>`;
 const ROM_ORIG=Uint8Array.from(atob("__ROM__"),c=>c.charCodeAt(0));
 let ROM=ROM_ORIG.slice();      // редактируемая копия
@@ -281,7 +283,7 @@ function rawToPhys(conv,x){switch(conv){
   case 'idlerpm': return Math.round((64+x)*7.2);
   case 've': return Math.round(x/128*1000)/1000;
   case 'kpa': return x;
-  case 'dadofs': return Math.round(x*0.0195*100)/100;
+  case 'dadofs': {const s=(x>127?x-256:x); return Math.round(s*0.0195*100)/100;}  // ЗНАКОВОЕ
   case 'dadslope': return Math.round(x/5*10)/10;
   case 'km': return Math.round(x/255*1000)/1000;
   case 'tpsadc': return x*2;
@@ -304,7 +306,8 @@ function physToRaw(conv,v){v=(''+v).trim();if(v==='')return null;
    case 'idlerpm': return clamp(Math.round(+v/7.2-64));
    case 've': return clamp(Math.round(+v*128));
    case 'kpa': return clamp(Math.round(+v));
-   case 'dadofs': return clamp(Math.round(+v/0.0195));
+   // ЗНАКОВОЕ: −128…+127 отсчётов (≈ −2.5…+2.5 В). clamp() режет в 0…255 и минус бы съел.
+   case 'dadofs': {const n=Math.round(+v/0.0195); return isNaN(n)?null:(Math.max(-128,Math.min(127,n))&0xFF);}
    case 'dadslope': return clamp(Math.round(+v*5));
    case 'km': return clamp(Math.round(+v*255));
    case 'tpsadc': return clamp(Math.round(+v/2));
@@ -503,19 +506,22 @@ function render(){
   if(dg)dg.addEventListener('click',()=>{
     const v1=parseFloat(document.getElementById('dv1').value), p1=parseFloat(document.getElementById('dp1').value);
     const v2=parseFloat(document.getElementById('dv2').value), p2=parseFloat(document.getElementById('dp2').value);
-    if(isNaN(v1)||isNaN(p1)||isNaN(v2)||isNaN(p2)||v1===v2){alert('Введи две РАЗНЫЕ точки: напряжение → давление');return;}
-    const slope=(p2-p1)/(v2-v1);            // кПа/В
-    const voff=v1 - p1/slope;               // В при 0 кПа
-    const smRaw=Math.round(voff/0.0195), slRaw=Math.round(slope*5);
-    // Смещение ЗНАКОВОЕ: −128…+127 отсчётов, это примерно −2.5…+2.5 В.
-    // Минус — не ошибка: широкодиапазонные датчики показывают давление уже при
-    // нуле вольт, и продлённая назад прямая пересекает 0 кПа в минусе.
-    if(slRaw<0||slRaw>255||smRaw<-128||smRaw>127){alert('Вне диапазона: наклон 0…51 кПа/В (3-бар+ не влезает) или смещение вне −2.5…+2.5 В. Запишу с ограничением — проверь точки.');}
+    if(isNaN(v1)||isNaN(p1)||isNaN(v2)||isNaN(p2)||v1===v2){alert('Введи две РАЗНЫЕ точки: отсчёт АЦП → давление');return;}
+    // Панель показывает 10 бит, а рутина работает с 8 (делит на 4). Приводим сразу,
+    // чтобы пользователь вводил ровно то, что видит, и ничего не пересчитывал в уме.
+    const a1=v1/4, a2=v2/4;
+    const kpc=(p2-p1)/(a2-a1);              // кПа на ОТСЧЁТ
+    const aoff=a1 - p1/kpc;                 // отсчёт при 0 кПа — может быть ОТРИЦАТЕЛЬНЫМ
+    // Блок считает (АЦП − Смещ) × Наклон / 256, значит Наклон = кПа_на_отсчёт × 256.
+    const smRaw=Math.round(aoff), slRaw=Math.round(kpc*256);
+    // Смещение ЗНАКОВОЕ: −128…+127 отсчётов. Минус — не ошибка: широкодиапазонные
+    // датчики показывают давление уже при нуле, и прямая пересекает 0 кПа в минусе.
+    if(slRaw<0||slRaw>255||smRaw<-128||smRaw>127){alert('Вне диапазона: наклон 0…1.0 кПа/отсчёт (круче не влезает) или смещение вне −128…+127 отсчётов. Запишу с ограничением — проверь точки.');}
     const smByte=Math.max(-128,Math.min(127,smRaw)) & 0xFF;
     const slByte=Math.max(0,Math.min(255,slRaw));
     ROM[0x4A10]=smByte; ROM[0x4A11]=slByte;
     mark();
-    document.getElementById('status').textContent='ДАД: наклон '+slope.toFixed(1)+' кПа/В (байт '+slByte+'), смещение '+voff.toFixed(2)+' В (байт '+smByte+')';
+    document.getElementById('status').textContent='ДАД: наклон '+kpc.toFixed(3)+' кПа/отсчёт (байт '+slByte+'), смещение '+smRaw+' отсчётов ≈ '+(smRaw*0.0195).toFixed(2)+' В (байт '+smByte+'). Проверка: АЦП '+v1+' ≈ '+(v1*0.00488).toFixed(2)+' В → '+(((Math.max(0,Math.min(255,Math.round(a1)-smRaw)))*slByte)>>8)+' кПа';
     render();
   });
 }
