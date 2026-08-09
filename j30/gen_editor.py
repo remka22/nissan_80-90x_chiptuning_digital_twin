@@ -427,9 +427,13 @@ function secHtml(it){
 function render(){
   const app=document.getElementById('app');
   const own=ITEMS.filter(i=>i.own);
-  // Собственные карты показывать ТОЛЬКО если ДАД-патч реально прошит:
-  // врезка 89D8 указывает на нашу рутину C700 (ROM[0x09D9]==0xC7). В стоке там 0x80.
-  const dadOn=(ROM[0x09D9]===0xC7);
+  // Собственные карты показывать ТОЛЬКО если ДАД-патч реально прошит.
+  // ⚠ 09.08.26 врезка ПЕРЕЕХАЛА с 89D8 на 8965 (на выход таблицы линеаризации).
+  // Детект по старому адресу молча прятал ВСЕ собственные карты, и настройку ДАД
+  // было не открыть. Проверяем оба места: 8965 (файл 0x0965) — текущая схема,
+  // 89D8 (файл 0x09D8) — прежняя, чтобы старые бины тоже открывались.
+  const dadOn=(ROM[0x0965]===0xBD && ROM[0x0966]===0xC7 && ROM[0x0967]===0x00)
+            ||(ROM[0x09D8]===0xBD && ROM[0x09D9]===0xC7 && ROM[0x09DA]===0x00);
   const known=ITEMS.filter(i=>!i.unknown && !i.own), unk=ITEMS.filter(i=>i.unknown);
   const byA={}; for(const i of known) byA[i.a]=i;
   let html='';
