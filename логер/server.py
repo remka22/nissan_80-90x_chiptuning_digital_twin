@@ -45,6 +45,11 @@ _latest = {"t": 0, "raw": {}, "phys": {}, "afr": None}
 # последний AFR от ШДК (второй источник). None -> данных нет -> в логе "-"
 _afr_lock = threading.Lock()
 _latest_afr = None
+# когда это значение приняли. Нужно, чтобы не выдавать протухшее за свежее:
+# ШДК отдаёт новое число примерно раз в секунду, а кадр пишется чаще, и в логе
+# до 60% строк были повторами предыдущего значения без всякой пометки.
+_latest_afr_t = 0.0
+AFR_STALE_S = 2.0                        # старше этого -> в лог "-"
 
 
 def _broadcast(rec):
@@ -85,27 +90,60 @@ def serial_source(stop, port, baud):
 
 # --- второй источник: ШДК (широкополосник) по RS232 -------------------------
 # AEM X-Series: 9600 8N1, дисплей держать в AFR, поток ASCII (число строкой).
-# Точную форму строки фиксируем по сырому образцу (--wbl-raw). Пока — лениво:
-# берём первое число из строки, отсекаем по здравому диапазону AFR.
-_num_re = re.compile(rb"(\d+(?:\.\d+)?)")
+#
+# ⚠ ПОЧЕМУ РАЗБОР СТРОГИЙ (переделано 31.08.26).
+# Раньше брали ПЕРВОЕ число из строки регуляркой search(). Если две посылки
+# слипались в одну строку («13.0» + «13.0» -> «13.013.0»), search() выкусывал
+# «13.013» и это уходило в лог как 13.01 — при том, что прибор показывал 13.0.
+# Подпись беды: 94.6% значений в логе оканчивались на «.x1». Отсюда же прыжки
+# 11/15 в логе при ровных 13 на дисплее ШДК.
+# Теперь строка обязана БЫТЬ числом целиком (fullmatch). Слиплась — выкидываем,
+# а не угадываем. Лучше пропуск, чем выдуманное число.
+_AFR_RE = re.compile(rb"^\s*([0-9]{1,2}(?:\.[0-9]{1,2})?)\s*$")
+
+# Разумные пределы. Бензин: стехиометрия 14.7, край шкалы контроллера ~8…22.
+AFR_MIN, AFR_MAX = 8.0, 22.0
+# Если прибор переключили в Lambda — приходит 0.55…1.50. Переводим в AFR.
+LAM_MIN, LAM_MAX = 0.50, 1.60
+LAM_TO_AFR = 14.7
+
+# счётчики разбора — чтобы видеть, что формат угадан верно
+_wbl_stat = {"ok": 0, "bad": 0, "empty": 0, "last_bad": b""}
 
 
 def _parse_afr(line):
-    m = _num_re.search(line)
+    """Строгий разбор одной строки ШДК. Возвращает AFR или None.
+
+    Принимаем ТОЛЬКО строку, которая целиком является числом.
+    Всё остальное — в счётчик 'bad', в поток значений не попадает.
+    """
+    s = line.strip()
+    if not s:
+        _wbl_stat["empty"] += 1
+        return None
+    m = _AFR_RE.match(s)
     if not m:
+        _wbl_stat["bad"] += 1
+        _wbl_stat["last_bad"] = s[:32]
         return None
     try:
         v = float(m.group(1))
     except ValueError:
+        _wbl_stat["bad"] += 1
         return None
-    # здравый диапазон AFR (бензин). Отсекает битые строки и баг точки в Lambda.
-    # ПОСЛЕ снятия реального образца — заменить на точный разбор формата AEM.
-    return v if 8.0 <= v <= 22.0 else None
+    if LAM_MIN <= v <= LAM_MAX:          # прибор в режиме Lambda
+        v *= LAM_TO_AFR
+    if AFR_MIN <= v <= AFR_MAX:
+        _wbl_stat["ok"] += 1
+        return v
+    _wbl_stat["bad"] += 1
+    _wbl_stat["last_bad"] = s[:32]
+    return None
 
 
 def wbl_reader_loop(stop, port, baud, raw=False):
     """Читает ШДК со второго порта -> кладёт AFR в _latest_afr."""
-    global _latest_afr
+    global _latest_afr, _latest_afr_t
     try:
         import serial
     except ImportError:
@@ -117,8 +155,19 @@ def wbl_reader_loop(stop, port, baud, raw=False):
         print("ШДК: не открыть порт %s: %s" % (port, e))
         return
     buf = bytearray()
+    t_stat = time.time()
     try:
         while not stop.is_set():
+            # раз в 10 с — отчёт о разборе. Если 'плохих' много, формат угадан
+            # неверно: снять образец `--wbl-raw` и поправить _AFR_RE.
+            if time.time() - t_stat > 10.0:
+                t_stat = time.time()
+                ok, bad = _wbl_stat["ok"], _wbl_stat["bad"]
+                if ok or bad:
+                    lb = _wbl_stat["last_bad"]
+                    lb = lb.decode("ascii", "replace") if lb else "-"
+                    print("ШДК: принято %d, отброшено %d (%.0f%%), последняя плохая: %r"
+                          % (ok, bad, 100.0 * bad / max(1, ok + bad), lb))
             data = ser.read(64)
             if not data:
                 continue
@@ -138,6 +187,7 @@ def wbl_reader_loop(stop, port, baud, raw=False):
                 if afr is not None:
                     with _afr_lock:
                         _latest_afr = afr
+                        _latest_afr_t = time.time()
             if len(buf) > 256:                   # не копить мусор
                 del buf[:len(buf) - 256]
     finally:
@@ -146,11 +196,12 @@ def wbl_reader_loop(stop, port, baud, raw=False):
 
 def sim_afr_loop(stop):
     """Фейковый AFR для проверки мержа в вакууме (--sim)."""
-    global _latest_afr
+    global _latest_afr, _latest_afr_t
     t0 = time.time()
     while not stop.is_set():
         with _afr_lock:
             _latest_afr = ecu_sim.gen_afr(time.time() - t0)
+            _latest_afr_t = time.time()
         time.sleep(0.1)
 
 
@@ -171,6 +222,8 @@ def reader_loop(source_gen, csv_path, stop):
             t_ms = int((time.time() - t0) * 1000)
             with _afr_lock:
                 afr = _latest_afr
+                if afr is not None and time.time() - _latest_afr_t > AFR_STALE_S:
+                    afr = None               # протухло -> честный пропуск
             afr_s = ("%.2f" % afr) if afr is not None else "-"   # нет ШДК -> "-"
             row = ([str(t_ms)] + [str(phys[k]) for k, *_ in frame.FIELDS]
                    + [afr_s])

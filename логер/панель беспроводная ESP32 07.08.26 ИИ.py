@@ -148,23 +148,49 @@ CTRL_LOCK = threading.Lock()
 import glob, re
 
 # ---------- ШДК (широкополосник) — второй серийный поток, AFR факт ----------
-WBL = {"running": False, "port": "", "total": 0, "raw": "", "hex": "", "afr": None, "last_t": 0, "error": ""}
+WBL = {"running": False, "port": "", "total": 0, "raw": "", "hex": "", "afr": None, "last_t": 0,
+       "afr_t": 0, "ok": 0, "bad": 0, "last_bad": "", "error": ""}
 WLOCK = threading.Lock()
 WCTRL = {"thread": None, "stop": None, "ser": None}
 
 
-def parse_afr(buf):
-    # формат AEM пока неизвестен (0 байт) — наивный разбор ASCII-числа AFR.
-    # когда пойдут реальные байты — уточним по факту формата.
+# ⚠ ПЕРЕДЕЛАНО 31.08.26. КАК БЫЛО И ПОЧЕМУ ЭТО ВРАЛО.
+# Старый разбор копил СКОЛЬЗЯЩИЙ буфер 96 байт, выбрасывал из него всё
+# непечатное (а это и есть \r\n — разделители посылок!), склеивал остаток в одну
+# строку и брал ПОСЛЕДНЕЕ совпадение r"\d{1,2}\.\d+".
+# Поток «13.0» «12.7» «15.4» превращался в «13.012.715.4», совпадения выходили
+# ['13.012','15.4'], бралось 15.4 — при том, что прибор показывал 13.0.
+# Отсюда прыжки 11/15 в логе при ровных 13 на дисплее, и подпись беды:
+# 95.5% значений в логе оканчивались на «.x1», честных «NN.N0» — НИ ОДНОГО,
+# а сотая доля в 95% случаев совпадала с первой цифрой следующего значения.
+# ТЕПЕРЬ: режем по \r\n, строка обязана БЫТЬ числом целиком. Склеилась —
+# выбрасываем, а не угадываем.
+_AFR_LINE = re.compile(r"^\s*([0-9]{1,2}(?:\.[0-9]{1,2})?)\s*$")
+AFR_LO, AFR_HI = 8.0, 22.0          # рабочая шкала контроллера, бензин
+LAM_LO, LAM_HI = 0.50, 1.60         # если прибор переключён в Lambda
+WSTAT = {"ok": 0, "bad": 0, "last_bad": ""}
+
+
+def parse_afr_line(line):
+    """Одна ЦЕЛАЯ строка -> AFR или None. Ничего не выкусываем из середины."""
+    s = line.strip()
+    if not s:
+        return None
+    m = _AFR_LINE.match(s)
+    if not m:
+        WSTAT["bad"] += 1; WSTAT["last_bad"] = s[:32]
+        return None
     try:
-        s = "".join(chr(x) for x in buf if 32 <= x < 127)
-        m = re.findall(r"\d{1,2}\.\d+", s)
-        if m:
-            v = float(m[-1])
-            if 7.0 <= v <= 25.0:
-                return round(v, 2)
-    except Exception:
-        pass
+        v = float(m.group(1))
+    except ValueError:
+        WSTAT["bad"] += 1
+        return None
+    if LAM_LO <= v <= LAM_HI:                  # режим Lambda -> в AFR
+        v *= 14.7
+    if AFR_LO <= v <= AFR_HI:
+        WSTAT["ok"] += 1
+        return round(v, 2)
+    WSTAT["bad"] += 1; WSTAT["last_bad"] = s[:32]
     return None
 
 
@@ -176,16 +202,34 @@ def wbl_reader(ser, stop_ev):
         except Exception as e:
             with WLOCK: WBL["error"] = str(e)
             break
-        if chunk:
-            buf += chunk
-            if len(buf) > 96: buf = buf[-96:]
-            asc = "".join(chr(x) if 32 <= x < 127 else "." for x in buf[-48:])
-            hx = " ".join("%02X" % x for x in buf[-24:])
-            afr = parse_afr(buf)
-            with WLOCK:
-                WBL["total"] += len(chunk); WBL["raw"] = asc; WBL["hex"] = hx
-                WBL["last_t"] = time.time()
-                if afr is not None: WBL["afr"] = afr
+        if not chunk:
+            continue
+        buf += chunk
+        # для индикатора в панели — сырьё как пришло (с точками вместо непечатных)
+        asc = "".join(chr(x) if 32 <= x < 127 else "." for x in buf[-48:])
+        hx = " ".join("%02X" % x for x in buf[-24:])
+        afr = None
+        while True:                              # режем по CR/LF, разбираем целые строки
+            i = next((k for k, b in enumerate(buf) if b in (0x0D, 0x0A)), -1)
+            if i < 0:
+                break
+            line = bytes(buf[:i]).decode("ascii", "ignore")
+            del buf[:i + 1]
+            v = parse_afr_line(line)
+            if v is not None:
+                afr = v                          # берём последнее ЦЕЛОЕ значение пачки
+        if len(buf) > 256:                       # защита от потока без разделителей
+            del buf[:len(buf) - 256]
+        with WLOCK:
+            WBL["total"] += len(chunk); WBL["raw"] = asc; WBL["hex"] = hx
+            WBL["last_t"] = time.time()
+            # значение ДЕРЖИМ (прибор отдаёт ~раз в секунду, дырки в логе не нужны),
+            # но помним, когда оно пришло — возраст уходит в лог отдельной колонкой.
+            if afr is not None:
+                WBL["afr"] = afr
+                WBL["afr_t"] = time.time()
+            WBL["ok"] = WSTAT["ok"]; WBL["bad"] = WSTAT["bad"]
+            WBL["last_bad"] = WSTAT["last_bad"]
     try: ser.close()
     except Exception: pass
     with WLOCK: WBL["running"] = False
@@ -361,7 +405,7 @@ ADC_NAMES = ["АЦП Расходомер/ДАД", "АЦП Дроссель", "�
 PARAM_NAMES = [nm for (_a, nm, _f, _u, _m) in LABELS if nm not in ADC_NAMES]
 CALC_NAMES = ["УОЗ, градусы", "Нагрузка TP", "Газ, %", "Впрыск расчётный, мс",
               "Загрузка форсунок, %", "K форсунок", "КМ (ДАД)",
-              "AFR цель", "AFR факт (ШДК)", "Поправка VE (факт/цель)"]
+              "AFR цель", "AFR факт (ШДК)", "AFR возраст, с", "Поправка VE (факт/цель)"]
 LOG_HEADER = ["Время, с"] + PARAM_NAMES + CALC_NAMES + FLAGNAMES + ADC_NAMES
 
 
@@ -383,6 +427,12 @@ def _log_row():
     vals["Загрузка форсунок, %"] = g(tp.get("inj_duty"))
     vals["AFR цель"] = g(tp["afr_target"])
     vals["AFR факт (ШДК)"] = g(tp["afr_fact"])
+    # ВОЗРАСТ значения ШДК. Значение держим (прибор отдаёт ~раз в секунду, дырки
+    # в логе не нужны), но на переходах секундной давности число уже врёт —
+    # поэтому пишем, сколько ему лет, и при разборе транзиентов фильтруем по нему.
+    with WLOCK:
+        _at = WBL.get("afr_t") or 0
+    vals["AFR возраст, с"] = round(time.time() - _at, 2) if _at else ""
     vals["Поправка VE (факт/цель)"] = g(tp["ve_corr"])
     for n, v in (d.get("flags") or {}).items(): vals[n] = g(v)
     return [round(time.time() - LOGST["t0"], 2)] + [vals.get(n, "") for n in LOG_HEADER[1:]]

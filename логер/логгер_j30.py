@@ -183,44 +183,104 @@ CTRL_LOCK = threading.Lock()
 import glob, re
 
 # ---------- ШДК (широкополосник) — второй серийный поток, AFR факт ----------
-WBL = {"running": False, "port": "", "total": 0, "raw": "", "hex": "", "afr": None, "last_t": 0, "error": ""}
+WBL = {"running": False, "port": "", "total": 0, "raw": "", "hex": "", "afr": None, "last_t": 0,
+       "afr_t": 0, "ok": 0, "bad": 0, "error": ""}
+# Сколько секунд значение ШДК считается действительным. Прибор шлёт ~1 раз в
+# секунду, поэтому 2 с — это «пропустили одну посылку». Дольше — в лог и на
+# экран идёт ПРОЧЕРК, а не последнее известное число.
+AFR_STALE_S = 2.0
 WLOCK = threading.Lock()
 WCTRL = {"thread": None, "stop": None, "ser": None}
 
 
-def parse_afr(buf):
-    # формат AEM пока неизвестен (0 байт) — наивный разбор ASCII-числа AFR.
-    # когда пойдут реальные байты — уточним по факту формата.
+# ⚠ ПЕРЕДЕЛАНО 31.08.26. ЧТО БЫЛО СЛОМАНО И ПОЧЕМУ.
+# Старый разбор копил СКОЛЬЗЯЩИЙ буфер 96 байт, выбрасывал из него всё непечатное
+# (а это и есть \r\n — разделители посылок ШДК!), склеивал остаток в одну строку
+# и брал ПОСЛЕДНЕЕ совпадение r"\d{1,2}\.\d+".
+# Поток «13.0» «12.7» «15.4» превращался в «13.012.715.4», совпадения выходили
+# ['13.012','15.4'], в лог уходило 15.4 — при том, что на дисплее ШДК ровно 13.0.
+# ЭТО И ЕСТЬ прыжки 11/15 в логе при стабильном показании прибора.
+# Подпись беды в логах: 95% значений оканчивались на «.x1», честных «NN.N0» —
+# НИ ОДНОГО за весь лог, а сотая доля в 95% случаев совпадала с первой цифрой
+# СЛЕДУЮЩЕГО значения (то есть к числу прилипало начало следующей посылки).
+# Формат подтверждён кодом моста: esp32/j30_мост — WBL_BAUD 9600, ASCII "NN.N\r\n".
+# ТЕПЕРЬ: режем по \r\n, строка обязана БЫТЬ числом целиком. Склеилась — в мусор,
+# а не угадываем. Лучше пропуск, чем выдуманное число.
+_AFR_LINE = re.compile(r"^\s*([0-9]{1,2}(?:\.[0-9]{1,2})?)\s*$")
+AFR_LO, AFR_HI = 8.0, 22.0          # рабочая шкала контроллера, бензин
+LAM_LO, LAM_HI = 0.50, 1.60         # если прибор переключён в режим Lambda
+WSTAT = {"ok": 0, "bad": 0, "last_bad": ""}
+
+
+def parse_afr_line(line):
+    """Одна ЦЕЛАЯ строка -> AFR или None. Из середины ничего не выкусываем."""
+    s = line.strip()
+    if not s:
+        return None
+    m = _AFR_LINE.match(s)
+    if not m:
+        WSTAT["bad"] += 1; WSTAT["last_bad"] = s[:32]
+        return None
     try:
-        s = "".join(chr(x) for x in buf if 32 <= x < 127)
-        m = re.findall(r"\d{1,2}\.\d+", s)
-        if m:
-            v = float(m[-1])
-            if 7.0 <= v <= 25.0:
-                return round(v, 2)
-    except Exception:
-        pass
+        v = float(m.group(1))
+    except ValueError:
+        WSTAT["bad"] += 1
+        return None
+    if LAM_LO <= v <= LAM_HI:                   # режим Lambda -> перевод в AFR
+        v *= 14.7
+    if AFR_LO <= v <= AFR_HI:
+        WSTAT["ok"] += 1
+        return round(v, 2)
+    WSTAT["bad"] += 1; WSTAT["last_bad"] = s[:32]
     return None
 
 
 def wbl_reader(ser, stop_ev):
     buf = bytearray()
+    t_stat = time.time()
     while not stop_ev.is_set():
         try:
-            chunk = ser.read(256)
+            # читаем МЕЛКО: 32 байта ~= 5 посылок. Вместе с timeout=0.05 это даёт
+            # разбор по мере прихода, а не пачками раз в секунду.
+            chunk = ser.read(32)
         except Exception as e:
             with WLOCK: WBL["error"] = str(e)
             break
-        if chunk:
-            buf += chunk
-            if len(buf) > 96: buf = buf[-96:]
-            asc = "".join(chr(x) if 32 <= x < 127 else "." for x in buf[-48:])
-            hx = " ".join("%02X" % x for x in buf[-24:])
-            afr = parse_afr(buf)
-            with WLOCK:
-                WBL["total"] += len(chunk); WBL["raw"] = asc; WBL["hex"] = hx
-                WBL["last_t"] = time.time()
-                if afr is not None: WBL["afr"] = afr
+        # раз в 10 с — отчёт в консоль. Много «отброшено» = формат не тот,
+        # снять образец сырья и поправить _AFR_LINE.
+        if time.time() - t_stat > 10.0:
+            t_stat = time.time()
+            if WSTAT["ok"] or WSTAT["bad"]:
+                print("ШДК: принято %d, отброшено %d (%.0f%%), последняя плохая: %r"
+                      % (WSTAT["ok"], WSTAT["bad"],
+                         100.0 * WSTAT["bad"] / max(1, WSTAT["ok"] + WSTAT["bad"]),
+                         WSTAT["last_bad"]))
+        if not chunk:
+            continue
+        buf += chunk
+        asc = "".join(chr(x) if 32 <= x < 127 else "." for x in buf[-48:])
+        hx = " ".join("%02X" % x for x in buf[-24:])
+        afr = None
+        while True:                              # режем по CR/LF, разбираем ЦЕЛЫЕ строки
+            i = next((k for k, b in enumerate(buf) if b in (0x0D, 0x0A)), -1)
+            if i < 0:
+                break
+            line = bytes(buf[:i]).decode("ascii", "ignore")
+            del buf[:i + 1]
+            v = parse_afr_line(line)
+            if v is not None:
+                afr = v                          # последнее ЦЕЛОЕ значение пачки
+        if len(buf) > 256:                       # поток без разделителей — не копим
+            del buf[:len(buf) - 256]
+        with WLOCK:
+            WBL["total"] += len(chunk); WBL["raw"] = asc; WBL["hex"] = hx
+            WBL["last_t"] = time.time()
+            # значение ДЕРЖИМ (прибор отдаёт ~раз в секунду, дырки в логе не нужны),
+            # но помним, когда оно пришло — возраст пишем отдельной колонкой.
+            if afr is not None:
+                WBL["afr"] = afr
+                WBL["afr_t"] = time.time()
+            WBL["ok"] = WSTAT["ok"]; WBL["bad"] = WSTAT["bad"]
     try: ser.close()
     except Exception: pass
     with WLOCK: WBL["running"] = False
@@ -232,7 +292,16 @@ def wbl_start(port):
         if WCTRL["stop"]: WCTRL["stop"].set()
     if WCTRL["thread"]: WCTRL["thread"].join(timeout=1.0)
     try:
-        ser = serial.Serial(port, 9600, bytesize=8, parity="N", stopbits=1, timeout=1)
+        # ⚠ ТАЙМАУТ 0.05 c, А НЕ 1 с. Исправлено 01.09.26.
+        # AEM 30-0300 отдаёт RS232 на 10 Гц, посылка "NN.N\r\n" = 6 байт -> 60 байт/с.
+        # Было timeout=1 и read(256): 256 байт при 60 байт/с копятся 4.3 с, значит
+        # read КАЖДЫЙ РАЗ выходил по таймауту, принося пачку из ~10 посылок, а цикл
+        # брал из пачки только ПОСЛЕДНЮЮ -> 1 значение в секунду, девять из десяти
+        # выбрасывались. Замерено по логу 01.09: обновление ровно 1.0 Гц.
+        # Частота потока у прибора НЕ настраивается (по дисплею меняются только
+        # единицы, число знаков, free-air калибровка и CAN ID) — значит забирать
+        # надо чаще на нашей стороне.
+        ser = serial.Serial(port, 9600, bytesize=8, parity="N", stopbits=1, timeout=0.05)
     except Exception as e:
         with WLOCK: WBL["error"] = str(e); WBL["running"] = False
         return False, str(e)
@@ -253,7 +322,7 @@ def wbl_stop():
         WBL["running"] = False
         # отключили — значений БОЛЬШЕ НЕТ, а не «последние». Чистим и сырьё: значок ШДК
         # смотрит в т.ч. на raw, и с непочищенным raw оставался бы зелёным после обрыва.
-        WBL["afr"] = None; WBL["last_t"] = 0; WBL["raw"] = ""; WBL["hex"] = ""
+        WBL["afr"] = None; WBL["last_t"] = 0; WBL["afr_t"] = 0; WBL["raw"] = ""; WBL["hex"] = ""
     return True
 
 
@@ -424,7 +493,7 @@ ADC_NAMES = ["АЦП Расходомер/ДАД", "АЦП Дроссель", "�
 PARAM_NAMES = [nm for (_a, nm, _f, _u, _m) in LABELS if nm not in ADC_NAMES]
 CALC_NAMES = ["УОЗ, градусы", "Нагрузка TP", "Газ, %", "Впрыск расчётный, мс",
               "Загрузка форсунок, %", "K форсунок", "КМ (ДАД)",
-              "AFR цель", "AFR факт (ШДК)", "Поправка VE (факт/цель)"]
+              "AFR цель", "AFR факт (ШДК)", "AFR возраст, с", "Поправка VE (факт/цель)"]
 LOG_HEADER = ["Время, с"] + PARAM_NAMES + CALC_NAMES + FLAGNAMES + ADC_NAMES
 
 
@@ -446,6 +515,12 @@ def _log_row():
     vals["Загрузка форсунок, %"] = g(tp.get("inj_duty"))
     vals["AFR цель"] = g(tp["afr_target"])
     vals["AFR факт (ШДК)"] = g(tp["afr_fact"])
+    # ВОЗРАСТ значения ШДК. Значение держим (прибор отдаёт ~раз в секунду, дырки
+    # в логе не нужны), но на переходах секундной давности число уже врёт —
+    # пишем, сколько ему лет, чтобы при разборе транзиентов можно было отфильтровать.
+    with WLOCK:
+        _at = WBL.get("afr_t") or 0
+    vals["AFR возраст, с"] = round(time.time() - _at, 2) if _at else ""
     vals["Поправка VE (факт/цель)"] = g(tp["ve_corr"])
     for n, v in (d.get("flags") or {}).items(): vals[n] = g(v)
     return [round(time.time() - LOGST["t0"], 2)] + [vals.get(n, "") for n in LOG_HEADER[1:]]
@@ -1362,7 +1437,14 @@ def snapshot():
     temp_raw = ram.get(0x004C)
     alpha_raw = ram.get(0x1431)
     with WLOCK:
-        wfresh = (now - WBL["last_t"]) < 2.0 if WBL["last_t"] else False
+        # ⚠ СВЕЖЕСТЬ СЧИТАЕТСЯ ПО ПОСЛЕДНЕМУ РАЗОБРАННОМУ ЗНАЧЕНИЮ (afr_t),
+        # а НЕ по приходу байт (last_t). Исправлено 01.09.26.
+        # Было: last_t обновлялся на КАЖДОМ куске байт из порта. Пока прибор шлёт
+        # хоть что-то — пусть мусор, пусть нечитаемое — значение считалось свежим,
+        # и старое AFR уходило в лог и на экран как текущее. В логе 01.09 нашёлся
+        # участок, где значение не обновлялось 2244 с (37 минут), а писалось как живое.
+        # Теперь: нет НОВОГО РАЗОБРАННОГО числа дольше AFR_STALE_S -> прочерк.
+        wfresh = (now - WBL["afr_t"]) < AFR_STALE_S if WBL.get("afr_t") else False
         wbl = {"running": WBL["running"], "port": WBL["port"], "total": WBL["total"],
                "raw": WBL["raw"], "hex": WBL["hex"], "error": WBL["error"], "fresh": wfresh,
                # ПРОТУХШИЙ AFR НЕ ОТДАЁМ. Раньше WBL["afr"] держал последнее значение вечно
@@ -1576,6 +1658,10 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  .hud .num{font-size:24px;font-weight:700;font-family:ui-monospace,Menlo,monospace;color:#7fd;line-height:1.2}
  .hud .cell.tgt .num{color:#fc8}.hud .cell.fact .num{color:#8f8}.hud .cell.uoz .num{color:#9cf}.hud .cell.vec .num{color:#f9a}
  .hud .num.na{color:#556;font-weight:400}
+ /* Давление: мин/макс за сессию мелким по краям, основное число не трогаем */
+ .hud .numrow{display:flex;align-items:baseline;justify-content:center;gap:6px}
+ .hud .numrow .num{flex:0 0 auto}
+ .hud .mm{font-size:11px;font-family:ui-monospace,Menlo,monospace;color:#6a8;min-width:22px;opacity:.85}
  /* панель ШДК */
  .wblbar{display:flex;flex-wrap:wrap;gap:10px;align-items:end;padding:10px 18px;background:#131922;border-bottom:1px solid #263040}
  .wblbar .raw{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#9c8;background:#0a0d11;border:1px solid #263040;border-radius:6px;padding:6px 9px;min-width:220px}
@@ -1613,6 +1699,7 @@ PAGE = r"""<!doctype html><html lang=ru><head><meta charset=utf-8>
  body.light .hud .num{color:#046}
  body.light .hud .cell.tgt .num{color:#a3520a}body.light .hud .cell.fact .num{color:#0a6b2a}body.light .hud .cell.uoz .num{color:#1650a3}body.light .hud .cell.vec .num{color:#a3186a}
  body.light .hud .num.na{color:#99a}
+ body.light .hud .mm{color:#4a7}
  body.light .wblbar{background:#e6edf4;border-bottom:2px solid #b3bcc7}
  body.light .wblbar .raw{color:#0a5d26;background:#f6f8fa;border:1px solid #9aa6b3}
  body.light .maps{background:#eef1f5;border-bottom:2px solid #b3bcc7}
@@ -1921,12 +2008,14 @@ async function pickBin(){
   b.disabled=false;
   if(!d.ok){b.textContent=old;if(d.error)alert(d.error);return;}   // без пути — отмена, молчим
   setBinBtn(d.name,d.path);
+  pressReset();                                    // новая прошивка = новая сессия
   mapBin=null;                                     // карты перерисовать из нового файла
   if(document.getElementById('port').value)ecuAuto();
  }catch(e){b.disabled=false;b.textContent=old;alert('Окно выбора файла не открылось.');}
 }
 // автоподключение по выбору порта (бод известен = 15625)
 async function ecuAuto(){const port=document.getElementById('port').value;
+ pressReset();                                     // старт/стоп = граница сессии
  if(!port){await fetch('/api/stop',{method:'POST'});return;}
  await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:port,baud:15625})});}
 async function wblAuto(){const port=document.getElementById('wport').value;
@@ -2000,9 +2089,26 @@ function renderVars(vars,top){
   if(c.dataset.d!==disp){c.innerHTML=disp;c.dataset.d=disp;}
  }}
 // ---- ДАТЧИКИ: те же величины, но крупно ----
-const HUDF=[['Обороты','rpm','',0],['Нагрузка','tp','',0],['VE','ve','×',1],
-            ['AFR цель','afr_target','',0],['AFR факт','afr_fact','',0],['Газ','tps_pct','%',0],
-            ['УОЗ','uoz_deg','°',0],['Давление','press','кПа',1]];
+const HUDF=[['Обороты','rpm','',0],['Нагрузка','tp','',0],['УОЗ','uoz_deg','°',0],
+            ['VE','ve','×',1],['Газ','tps_pct','%',0],
+            ['AFR цель','afr_target','',0],['AFR факт','afr_fact','',0],
+            ['Давление','press','кПа',1]];
+
+// ---- мин/макс давления ЗА СЕССИЮ (от выбора прошивки/старта до стопа) ----
+// Выбросы не берём: считаем гистограмму по целым кПа и отступаем от края,
+// пока не наберётся PRESS_MIN_N точек. Одиночный всплеск краем не станет.
+const PRESS_MIN_N=10;
+let pressCnt=Object.create(null), pressLo=null, pressHi=null;
+function pressReset(){pressCnt=Object.create(null);pressLo=null;pressHi=null;}
+function pressFeed(v){
+ if(v==null||!isFinite(v))return;
+ const k=Math.round(v); pressCnt[k]=(pressCnt[k]||0)+1;
+ const ks=Object.keys(pressCnt).map(Number).sort((a,b)=>a-b);
+ let acc=0; pressLo=null;
+ for(let i=0;i<ks.length;i++){acc+=pressCnt[ks[i]]; if(acc>=PRESS_MIN_N){pressLo=ks[i];break;}}
+ acc=0; pressHi=null;
+ for(let i=ks.length-1;i>=0;i--){acc+=pressCnt[ks[i]]; if(acc>=PRESS_MIN_N){pressHi=ks[i];break;}}
+}
 let hudBuilt='';
 function toggleHud(){const h=document.getElementById('hud');const on=h.classList.toggle('on');
  document.getElementById('btnHud').classList.toggle('on',on);
@@ -2012,13 +2118,23 @@ function hudShow(top){
  if(!box.classList.contains('on'))return;
  const F=HUDF.filter(f=>!f[3]||isDad), key=isDad?'d':'m';
  if(hudBuilt!==key){box.innerHTML=F.map((f,i)=>
-   '<div class=cell><div class=lbl>'+f[0]+'</div><div class=num id=hn'+i+'>—</div></div>').join('');
+   (f[1]==='press'
+     ? '<div class=cell><div class=lbl>'+f[0]+'</div>'+
+       '<div class=numrow><span class=mm id=hpmin>—</span>'+
+       '<span class=num id=hn'+i+'>—</span>'+
+       '<span class=mm id=hpmax>—</span></div></div>'
+     : '<div class=cell><div class=lbl>'+f[0]+'</div><div class=num id=hn'+i+'>—</div></div>')
+   ).join('');
   hudBuilt=key;}
+ if(top&&top['press']!=null)pressFeed(top['press']);
  F.forEach((f,i)=>{const e=document.getElementById('hn'+i);if(!e)return;
   const raw=(top&&top[f[1]]!=null)?top[f[1]]:null;
   const t=(raw===null)?'—':(raw+(f[2]?(' '+f[2]):''));
   if(e.textContent!==t)e.textContent=t;
-  e.classList.toggle('na',raw===null);});}
+  e.classList.toggle('na',raw===null);});
+ const lo=document.getElementById('hpmin'), hi=document.getElementById('hpmax');
+ if(lo){const t=(pressLo===null)?'—':String(pressLo); if(lo.textContent!==t)lo.textContent=t;}
+ if(hi){const t=(pressHi===null)?'—':String(pressHi); if(hi.textContent!==t)hi.textContent=t;}}
 function toggleDrawer(){const d=document.getElementById('drawer');const on=d.classList.toggle('on');
  document.getElementById('btnDrawer').classList.toggle('on',on);}
 // ---- расходомерная прошивка: прячем всё, чего в ней нет ----
