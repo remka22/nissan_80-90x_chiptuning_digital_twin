@@ -1,12 +1,42 @@
 # -*- coding: utf-8 -*-
 # Генератор автономной веб-страницы редактора данных J30 (всё в браузере).
-import os, sys, base64, json
+import os, re, sys, base64, json
 sys.path.insert(0, "/Users/remka22/Documents/ЭБУ Максима/1994_Nissan_Maxima_J30_RUS/j30")
 import rom_editor as RE
 
 ROOT = "/Users/remka22/Documents/ЭБУ Максима/1994_Nissan_Maxima_J30_RUS"
-orig = bytearray(open(RE.ORIG, "rb").read())   # СТОК вшит; ДАД-карты появятся при «Загрузить дамп» боевого бина
+orig = bytearray(open(RE.ORIG, "rb").read())   # СТОК вшит — эталон сравнения по умолчанию
 layout = RE.build_layout(orig, orig)
+
+
+def latest_bin():
+    """Последняя прошивка из логер/: наибольшая версия, внутри неё — наибольшая
+    подверсия (j30_v42_3_... старше j30_v42_...). При равных — более свежий файл.
+    Смотрим только верхний уровень папки: старые лежат в «Бэкграунд прошивок»."""
+    d = os.path.join(ROOT, "логер")
+    best = None
+    for fn in os.listdir(d):
+        m = re.match(r"j30_v(\d+)(?:_(\d+))?_", fn, re.I)
+        p = os.path.join(d, fn)
+        if not (m and fn.lower().endswith(".bin") and os.path.getsize(p) == 32768):
+            continue
+        key = (int(m.group(1)), int(m.group(2) or 0), os.path.getmtime(p))
+        if best is None or key > best[0]:
+            best = (key, fn, p)
+    return best
+
+
+# ⭐ ПО УМОЛЧАНИЮ РЕДАКТОР ОТКРЫВАЕТ ПОСЛЕДНЮЮ ПРОШИВКУ, а не сток. Раньше при
+# открытии показывался сток, и боевую приходилось каждый раз грузить вручную.
+# Сток остаётся эталоном сравнения. Новая версия появилась — перегенерировать
+# редактор (python3 gen_editor.py), он подхватит её сам.
+_lb = latest_bin()
+if _lb:
+    latest_name = _lb[1]
+    latest = open(_lb[2], "rb").read()
+else:
+    latest_name, latest = "сток (HN27C256G)", bytes(orig)
+print("по умолчанию:", latest_name)
 
 # ось (шкала X) по адресу таблицы: чем индексируется значение
 AXIS = {
@@ -15,6 +45,8 @@ AXIS = {
   0x7E00:"temp", 0x7E20:"temp", 0x7EB0:"temp", 0x7F30:"temp",
   0x7E30:"temp", 0x7E40:"temp", 0x7E50:"temp", 0x7EC0:"temp",
   0x7E60:"temp", 0x7F40:"temp", 0x7F50:"temp",
+  0x5300:"tz",                                   # КТЗ (v43): ось — температура заряда
+  0x7B30:"adc32",                                # тарировка ТОЖ/ДТВ: вход — сырьё АЦП через 8
   0x7BA8:"clrpm", 0x7BA0:"idx8",
   0x79E3:"knock3", 0x7FE0:"knock3",
   0x79A0:"ld8x2", 0x79B0:"ld8x2", 0x79C0:"ld8x2", 0x79D0:"ld8x2",
@@ -30,6 +62,7 @@ for it in layout:
         "locked": it.get("locked", False), "note": it.get("note", ""),
         "rax": it.get("rax"), "cax": it.get("cax"), "own": it.get("own", False),
         "axis": AXIS.get(it["a"], ""), "dead": it.get("dead", False),
+        "ktz": it.get("ktz", False),
     })
 rom_b64 = base64.b64encode(bytes(orig)).decode()
 
@@ -305,7 +338,11 @@ const DAD_CALC=`<div class=calc>
 Пишет прямо в поля Наклон/Смещение выше. После — сохрани дамп.</div>
 </div>`;
 const ROM_ORIG=Uint8Array.from(atob("__ROM__"),c=>c.charCodeAt(0));
-let ROM=ROM_ORIG.slice();      // редактируемая копия
+// последняя прошивка из логер/ — открывается по умолчанию (подставляет gen_editor.py)
+const ROM_LATEST=Uint8Array.from(atob("__LATEST__"),c=>c.charCodeAt(0));
+const LATEST_NAME=__LATEST_NAME__;
+let ROM=ROM_LATEST.slice();    // редактируемая копия
+let BASE=ROM_LATEST.slice(), BASE_NAME=LATEST_NAME;   // к чему сбрасывать правки
 let REF=ROM_ORIG.slice();      // эталон сравнения (по умолчанию = сток, можно загрузить файл)
 const CHK=[0x7F7A,0x7F7B];
 const EXPANDED=new Set();       // адреса свёрнутых секций, которые раскрыли вручную
@@ -407,6 +444,8 @@ function cellHtml(it,k,heatStyle){
 }
 const AX={
   temp:['-40','-30','-20','-10','0','10','20','30','40','50','60','70','80','90','100','110'],
+  tz:['-40','-30','-20','-10','0','10','20','30','40','50','60','70','80','90','100','110'],
+  adc32:[...Array(32).keys()].map(k=>String(k*8)),
   rpm6000:['0','400','800','1200','1600','2000','2400','2800','3200','3600','4000','4400','4800','5200','5600','6000'],
   rpm3000:['0','200','400','600','800','1000','1200','1400','1600','1800','2000','2200','2400','2600','2800','3000'],
   clrpm:['450','500','550','600','700','800','2000','4000'],
@@ -414,7 +453,7 @@ const AX={
   ld8x2:['0','16','32','48','64','80','96','112','0','16','32','48','64','80','96','112'],
   tps16:['0','16','32','48','64','80','96','112','128','144','160','176','192','208','224','240'],
 };
-function axCap(a){return {temp:'темп ОЖ °C',rpm6000:'об/мин',rpm3000:'об/мин',clrpm:'об/мин',idx8:'индекс',ld8x2:'открытие дросселя, АЦП $1492 (2 подтабл. по 8)',tps16:'открытие дросселя, АЦП $1492 (0=закрыт)'}[a]||'ось';}
+function axCap(a){return {temp:'темп ОЖ °C',tz:'температура заряда °C',adc32:'сырьё АЦП (меньше — горячее)',rpm6000:'об/мин',rpm3000:'об/мин',clrpm:'об/мин',idx8:'индекс',ld8x2:'открытие дросселя, АЦП $1492 (2 подтабл. по 8)',tps16:'открытие дросселя, АЦП $1492 (0=закрыт)'}[a]||'ось';}
 function bodyHtml(it){
   if(it.axis=='knock3'){ // 3x3: столбцы=нагрузка, строки=обороты
     const L=['0','29','80'],R=['0','1600','3600'];
@@ -464,7 +503,7 @@ function secHtml(it){
   // месте, но начинают означать другую нагрузку/давление: поверхность перекашивается,
   // и заметить это по цифрам невозможно. Поэтому у каждой оси, на которой сидят карты,
   // есть кнопка пересчёта, а появляется она ровно тогда, когда ось УЖЕ изменена.
-  const deps=ITEMS.filter(m=>m.rax===it.a||m.cax===it.a);
+  const deps=ITEMS.filter(m=>(m.rax===it.a||m.cax===it.a)&&liveItem(m));
   let axbtn='';
   if(deps.length){
     const moved=[...Array(cellCount(it)).keys()].some(k=>ROM[it.a+k]!==REF[it.a+k]);
@@ -496,9 +535,14 @@ function secHtml(it){
   }
   return `<div class="sec${it.unknown?' unk':''}${it.locked?' locked':''}${it.dead?' dead':''}">${h}</div>`;
 }
+// КТЗ/КВТЗ (v43) существуют, только если врезка прошита: JSR на $C7D5 (файл 0x47D5).
+// На прошивках до v43 там пустая область: показ дал бы бессмысленные 0.49, а
+// «пересчитать карты под ось» переписал бы пустые байты. Поэтому фильтр — везде,
+// где перечисляются карты: показ, подсказка «на оси сидят», сам пересчёт.
+function liveItem(m){return !m.ktz || ROM[0x47D5]===0xBD;}
 function render(){
   const app=document.getElementById('app');
-  const own=ITEMS.filter(i=>i.own);
+  const own=ITEMS.filter(i=>i.own && liveItem(i));
   // Собственные карты показывать ТОЛЬКО если ДАД-патч реально прошит.
   // ⚠ 09.08.26 врезка ПЕРЕЕХАЛА с 89D8 на 8965 (на выход таблицы линеаризации).
   // Детект по старому адресу молча прятал ВСЕ собственные карты, и настройку ДАД
@@ -602,7 +646,7 @@ function render(){
         const f=(x-axv[i])/(axv[i+1]-axv[i]);
         return vals[i]+(vals[i+1]-vals[i])*f;
       };
-      const deps=ITEMS.filter(m=>m.rax===ax||m.cax===ax);
+      const deps=ITEMS.filter(m=>(m.rax===ax||m.cax===ax)&&liveItem(m));
       const done=[];
       for(const m of deps){
         const cur=[...Array(256).keys()].map(k=>ROM[m.a+k]);      // СЫРЫЕ байты карты
@@ -816,12 +860,16 @@ document.getElementById('save').addEventListener('click',()=>{
 document.getElementById('load').addEventListener('change',e=>{
   const f=e.target.files[0];if(!f)return;const rd=new FileReader();
   rd.onload=()=>{const u=new Uint8Array(rd.result);if(u.length!=ROM_ORIG.length){alert('Размер не 32768!');return;}ROM=u.slice();
-    let s=0,x=0;for(let i=0;i<ROM.length;i++){if(i==0x7F7A||i==0x7F7B)continue;s=(s+ROM[i])&0xFF;x^=ROM[i];}
-    const ok=(ROM[0x7F7A]==s&&ROM[0x7F7B]==x);render();
-    document.getElementById('status').textContent='загружен: '+f.name+' — чек-сумма '+(ok?'✓ СХОДИТСЯ':'✗ НЕ СХОДИТСЯ (файл правленый или битый)');};
+    BASE=u.slice();BASE_NAME=f.name;
+    render();
+    document.getElementById('status').textContent='загружен: '+f.name+' — чек-сумма '+(sumOk(ROM)?'✓ СХОДИТСЯ':'✗ НЕ СХОДИТСЯ (файл правленый или битый)');};
   rd.readAsArrayBuffer(f);
 });
-document.getElementById('reset').addEventListener('click',()=>{if(confirm('Сбросить все правки к оригиналу?')){ROM=ROM_ORIG.slice();render();document.getElementById('status').textContent='сброшено к оригиналу';}});
+function sumOk(r){let s=0,x=0;for(let i=0;i<r.length;i++){if(i==0x7F7A||i==0x7F7B)continue;s=(s+r[i])&0xFF;x^=r[i];}
+  return r[0x7F7A]==s&&r[0x7F7B]==x;}
+// Сброс — к ТОЙ прошивке, что открыта (последняя или загруженная кнопкой), а не к стоку:
+// раз по умолчанию открыта боевая, сброс в сток выбросил бы все её настройки.
+document.getElementById('reset').addEventListener('click',()=>{if(confirm('Сбросить все правки к «'+BASE_NAME+'»?')){ROM=BASE.slice();render();document.getElementById('status').textContent='сброшено к '+BASE_NAME;}});
 document.getElementById('theme').addEventListener('click',e=>{
   const light=document.body.classList.toggle('light');
   e.target.textContent=light?'🌙 Тёмная':'☀ Светлая';
@@ -829,9 +877,11 @@ document.getElementById('theme').addEventListener('click',e=>{
 });
 try{if(localStorage.getItem('j30theme')=='light'){document.body.classList.add('light');document.getElementById('theme').textContent='🌙 Тёмная';}}catch(_){}
 render();
+document.getElementById('status').textContent='открыта последняя: '+LATEST_NAME+' — чек-сумма '+(sumOk(ROM)?'✓ СХОДИТСЯ':'✗ НЕ СХОДИТСЯ');
 </script></body></html>"""
 
 HTML = HTML.replace("__ITEMS__", json.dumps(items, ensure_ascii=False)).replace("__ROM__", rom_b64).replace("__GROUPS__", json.dumps(GROUPS, ensure_ascii=False))
+HTML = HTML.replace("__LATEST__", base64.b64encode(latest).decode()).replace("__LATEST_NAME__", json.dumps(latest_name, ensure_ascii=False))
 # пишем в ОБА места: локальный html + реальный редактор контейнера ecu_twin (:8080/editor)
 outs = [
     os.path.join(ROOT, "j30", "J30_редактор.html"),
