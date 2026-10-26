@@ -1,0 +1,10 @@
+update=02.10.2026
+version=1
+last_client=kicad
+[general]
+version=1
+RootSch=
+BoardNm=
+[pcbnew]
+version=1
+LastNetListRead=
