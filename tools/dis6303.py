@@ -67,6 +67,24 @@ def dis(start, n):
         s = "0x%04X(cpu%04X): %02X " % (i, _cpu(i), b)
         if b in INH:
             print(s + "        " + INH[b]); i += 1; continue
+        # 6301/6303-расширения: без них листинг сбивается на первой же битовой команде
+        if b in (0x18, 0x1A):
+            print(s + "        " + ("XGDX" if b == 0x18 else "SLP")); i += 1; continue
+        if b in (0x61, 0x62, 0x65, 0x6B):     # AIM/OIM/EIM/TIM #imm, off,X
+            nm = {0x61: "AIM", 0x62: "OIM", 0x65: "EIM", 0x6B: "TIM"}[b]
+            print(s + "%02X %02X  %s #$%02X,%d,X" % (d[i+1], d[i+2], nm, d[i+1], d[i+2])); i += 3; continue
+        if b in (0x71, 0x72, 0x75, 0x7B):     # AIM/OIM/EIM/TIM #imm, $dd
+            nm = {0x71: "AIM", 0x72: "OIM", 0x75: "EIM", 0x7B: "TIM"}[b]
+            print(s + "%02X %02X  %s #$%02X,$%02X" % (d[i+1], d[i+2], nm, d[i+1], d[i+2])); i += 3; continue
+        if h >= 8 and l == 3:                  # SUBD (8x) / ADDD (Cx), 16 бит
+            nm = "SUBD" if h < 0xC else "ADDD"; mode = (h - 8) % 4
+            if mode == 0:
+                print(s + "%02X %02X  %s #$%04X" % (d[i+1], d[i+2], nm, (d[i+1] << 8) | d[i+2])); i += 3; continue
+            if mode == 1:
+                print(s + "%02X     %s $%02X" % (d[i+1], nm, d[i+1])); i += 2; continue
+            if mode == 2:
+                print(s + "%02X     %s %d,X" % (d[i+1], nm, d[i+1])); i += 2; continue
+            print(s + "%02X %02X  %s $%04X" % (d[i+1], d[i+2], nm, (d[i+1] << 8) | d[i+2])); i += 3; continue
         if b in BR:
             rel = d[i+1]; tgt = i+2 + (rel-256 if rel > 127 else rel)
             print(s + "%02X     %s 0x%04X" % (d[i+1], BR[b], tgt)); i += 2; continue
