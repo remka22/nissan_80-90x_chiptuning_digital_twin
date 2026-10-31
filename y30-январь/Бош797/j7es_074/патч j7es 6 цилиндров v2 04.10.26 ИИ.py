@@ -18,7 +18,16 @@
   E7FF  Z — зуб ВМТ 1-го цилиндра от первого зуба после пропуска (0..59).
   E7EF  ЗУБ ОПРОСА ДФ (с v6): 0 — датчик фаз читается на зубе 0 (как в стоке); 1..59 — уровень снимается на этом
         зубе (до пропуска, т.е. в предыдущем обороте) и берётся на зубе 0; нет свежего замера — фаза не подтверждена.
-По умолчанию: цилиндр N → форсунка ФN и катушка КN (с 19.10.26; раньше было по v1 — пары на Ф1–Ф3 и К1–К3).
+  ОТСЕЧКА ПО ОБОРОТАМ (с v9; все нули — как в стоке). Предел — штатный «Обороты блокировки впрыска» (605C, ×40),
+  на Launch — таблица 7AA7 (F9B7 = меньшее из двух):
+  E7EE  РЕЖИМ: бит0 = 1 — выше предела режется искра, топливо идёт (0 — топливо, как в стоке);
+        бит1 = 1 — без мягкой отсечки до предела (искра каждый такт, без сдвига угла);
+        бит2 = 1 — искра на отсечке через такт (0 — вся).
+  E7EC  ПАУЗА (×40 об/мин, ≤ 25): отсечка искрой кончается, когда обороты упали на паузу ниже предела.
+  E7ED  СТРАХОВКА (×40 об/мин): выше предела + страховка топливо режется (сток, с его гистерезисом 2Bh.3).
+  E7EB  УГОЛ НА ОТСЕЧКЕ: на сколько зубьев (1 зуб = 6°, ≤ 6) позже искра и зарядка, пока идёт отсечка искрой
+        (стоковый сдвиг 59h; при отсечке искрой 27h.6 включён всегда, не только флагом Launch 5F01.2).
+По умолчанию: цилиндр N → форсунка ФN; катушки парами на К1–К3 (с v9: К5/К6 не работают, см. ниже).
 Датчик фаз — штатный флаг 6051.5 (с v7; в v2–v6 был бит E7F0.2, а 6051.5 сборщик выключал).
 
 ВЫХОДЫ:
@@ -26,6 +35,8 @@
   Ф5 = CC4 / P1.4 (нога 1), Ф6 = CRC / P1.0 (нога 9), открыта = 1 (затворы ключей DA11 / DA12).
   К1–К4 = CM4–CM7 (P4.4–P4.7, ноги 69–72), зарядка = 0 (штатные каналы).
   К5 = P5.6 (нога 38), К6 = P5.7 (нога 37) через COMSET / COMCLR, полярность — E7F2.
+  ⛔ С v9 CC4EN (211E) — сток 98h: при FDh (v3–v7) режим сравнения на P5.0–P5.7 ломал SPI TLE6240
+  (нет главного реле и бензонасоса, разбор п.21). К5/К6 поэтому НЕ работают — катушки только К1–К4.
   (P5.6 / P5.7 на плате — SCL / SDA EEPROM 24C04, на разъём не выведены; j7es EEPROM не использует.
    P5.2 не взят: на нём j7es выдаёт свой ШИМ из таймера 1, @08B2–08CA.)
   P5.1 — сигнал расхода топлива, как в стоке (порции по [60FE/60FF]); гасится не COMCLR (он у катушек),
@@ -46,8 +57,8 @@ import os
 import sys
 
 # версия КОДА: меняется только при правке кода/врезок; калибровочные сборки — дочерние (--child M --what …)
-CODE_VER = 7
-CODE_WHAT = 'штатные-режимы-стока-на-6-цилиндров-фаза-впрыска'
+CODE_VER = 9
+CODE_WHAT = 'отсечка-по-оборотам-искрой-калибровкой-регистр-211E-как-в-стоке'
 
 ORG = 0xE800
 LIMIT = 0xF400
@@ -57,6 +68,8 @@ INJMAP, COILMAP, ZCAL = CFG + 3, CFG + 9, 0xE7FF
 PHT_CAL = 0xE7EF                   # зуб опроса ДФ (0 — на зубе 0, как в стоке)
 PHLAT = 0x94                       # замер ДФ на зубе опроса: бит0 уровень, бит7 «свежий» (верхнее ОЗУ, @R)
 PHT = 0xB7                         # копия PHT_CAL в ОЗУ (обработчик зуба не трогает DPTR)
+LIM_ANG, LIM_HYST, LIM_INS, LIM_MODE = 0xE7EB, 0xE7EC, 0xE7ED, 0xE7EE   # отсечка по оборотам (с v9)
+LIM_ST, LIM_TMP = 0xB8, 0xB9       # 1 — идёт отсечка искрой; копия предела (верхнее ОЗУ, @R)
 
 IDX = 0x77                         # индекс пары (нижнее ОЗУ)
 SLOT_A, SLOT_B = 0x95, 0x96        # цилиндр слота A / B (верхнее ОЗУ, через @R)
@@ -143,6 +156,9 @@ class Asm:
     # арифметика / логика
     def add_a_imm(self, i): self.e(0x24, i)
     def add_a_dir(self, d): self.e(0x25, d)
+    def add_a_ri(self, i): self.e(0x26 + i)
+    def subb_a_ri(self, i): self.e(0x96 + i)
+    def setb_c(self): self.e(0xD3)
     def addc_a_dir(self, d): self.e(0x35, d)
     def reti(self): self.e(0x32)
     def add_a_rn(self, n): self.e(0x28 + n)
@@ -785,6 +801,9 @@ def code(a):
     a.mov_ri_imm(0, 0)
     a.mov_rn_imm(0, PHT)
     a.mov_ri_imm(0, 0)
+    a.mov_rn_imm(0, LIM_ST)
+    a.mov_ri_imm(0, 0)
+    a.mov_dir_imm(0x59, 0)          # сдвиг зуба искры 59h: при отсечке искрой он включён всегда (27h.6)
     a.mov_dptr(P5POL)
     a.clr_a()
     a.movc()
@@ -818,6 +837,143 @@ def code(a):
     a.clr(P5_1)
     a.label('tf_x')
     a.pop(0x00)
+    a.ret()
+
+    # ---------- LIMF (@1353): порог отсечки топлива по [605C]; при отсечке искрой — выше на страховку E7ED ----------
+    # R0:R1 — цикловая подача (@121B), не трогать; B дальше сток пишет сам (@1367, @13C3)
+    a.label('limf')
+    a.mov_dptr(LIM_MODE)
+    a.clr_a()
+    a.movc()
+    a.mov_dir_a(B)
+    a.mov_dptr(0xF9A6)
+    a.movx_a()                      # A = предел [605C]
+    a.jnb(Bb(0), 'lf_c')
+    a.push(ACC)
+    a.mov_dptr(LIM_INS)
+    a.clr_a()
+    a.movc()
+    a.mov_dir_a(B)
+    a.pop(ACC)
+    a.add_a_dir(B)
+    a.jnc('lf_c')
+    a.mov_a_imm(0xFF)
+    a.label('lf_c')
+    a.clr_c()
+    a.subb_a_dir(0x55)
+    a.jnc('lf_ok')
+    a.ljmp(0x1395)                  # выше порога — отсечка топлива (сток)
+    a.label('lf_ok')
+    a.ljmp(0x135C)
+
+    # ---------- LIMS (@1377): предел F9B7 (605C / Launch 7AA7) — мягкая отсечка, отсечка искрой с паузой ----------
+    # Сток: 69h = предел − 55h (искра: ≥ 2 каждый такт, 1 через такт, 0 нет — @0397), 59h = 5F16[69h] — сдвиг зуба;
+    # выше предела @13B5: 69h = 0, 2Bh.3 = 1 — отсечка топлива.
+    a.label('lims')
+    a.mov_dptr(LIM_MODE)
+    a.clr_a()
+    a.movc()
+    a.mov_dir_a(B)
+    a.jb(Bb(0), 'ls_s')
+    a.mov_dptr(0xF9B7)              # отсечка топливом
+    a.movx_a()
+    a.clr_c()
+    a.subb_a_dir(0x55)
+    a.jnc('ls_f1')
+    a.ljmp(0x13B5)                  # выше предела — отсечка топлива (сток)
+    a.label('ls_f1')
+    a.jb(Bb(1), 'ls_full')
+    a.ljmp(0x1380)                  # мягкая отсечка стока: A = предел − 55h
+    a.label('ls_s')                 # отсечка искрой
+    a.mov_a_rn(1)
+    a.push(ACC)
+    a.mov_dptr(0xF9B7)
+    a.movx_a()
+    a.mov_rn_imm(1, LIM_TMP)
+    a.mov_ri_a(1)                   # TMP = предел
+    a.mov_dptr(LIM_INS)
+    a.clr_a()
+    a.movc()
+    a.add_a_ri(1)
+    a.jnc('ls_1')
+    a.mov_a_imm(0xFF)
+    a.label('ls_1')
+    a.clr_c()
+    a.subb_a_dir(0x55)
+    a.jnc('ls_2')
+    a.pop(ACC)
+    a.mov_rn_a(1)
+    a.ljmp(0x13B5)                  # выше предела + страховки — отсечка топлива (сток)
+    a.label('ls_2')
+    a.mov_dptr(LIM_HYST)
+    a.clr_a()
+    a.movc()
+    a.cjne_a_imm(26, 'ls_3')
+    a.label('ls_3')
+    a.jc('ls_4')
+    a.mov_a_imm(25)                 # пауза не больше 25 (1000 об/мин)
+    a.label('ls_4')
+    a.add_a_dir(0x55)
+    a.jnc('ls_5')
+    a.mov_a_imm(0xFF)
+    a.label('ls_5')
+    a.setb_c()
+    a.subb_a_ri(1)                  # заём — 55h + пауза ≤ предела
+    a.mov_rn_imm(1, LIM_ST)
+    a.jnc('ls_6')
+    a.mov_ri_imm(1, 0)              # обороты упали на паузу ниже предела — искра вернулась
+    a.label('ls_6')
+    a.mov_rn_imm(1, LIM_TMP)
+    a.mov_a_ri(1)
+    a.clr_c()
+    a.subb_a_dir(0x55)
+    a.mov_rn_imm(1, LIM_ST)
+    a.jnc('ls_7')
+    a.mov_ri_imm(1, 1)              # выше предела — отсечка искрой
+    a.label('ls_7')
+    a.mov_a_ri(1)
+    a.jz('ls_no')
+    a.clr_a()                       # 69h = 0 — вся искра, 1 — через такт
+    a.jnb(Bb(2), 'ls_8')
+    a.inc_a()
+    a.label('ls_8')
+    a.mov_dir_a(0x69)
+    a.mov_dptr(LIM_ANG)
+    a.clr_a()
+    a.movc()
+    a.cjne_a_imm(7, 'ls_9')
+    a.label('ls_9')
+    a.jc('ls_10')
+    a.mov_a_imm(6)                  # сдвиг не больше 6 зубьев (36°, проверено в v7)
+    a.label('ls_10')
+    a.mov_dir_a(0x59)
+    a.pop(ACC)
+    a.mov_rn_a(1)
+    a.ljmp(0x1392)                  # топливо как обычно (прочие отсечки — по 2Bh.3)
+    a.label('ls_no')
+    a.pop(ACC)
+    a.mov_rn_a(1)
+    a.jb(Bb(1), 'ls_full')
+    a.mov_dptr(0xF9B7)
+    a.movx_a()
+    a.clr_c()
+    a.subb_a_dir(0x55)              # здесь 55h ≤ предела (выше — отсечка)
+    a.ljmp(0x1380)                  # мягкая отсечка стока
+    a.label('ls_full')
+    a.mov_dir_imm(0x69, 7)          # без мягкой: искра каждый такт, без сдвига
+    a.mov_dir_imm(0x59, 0)
+    a.ljmp(0x1392)
+
+    # ---------- SH27 (@E725): 27h.6 (сдвиг зуба 59h) = 5F01.2 «Launch» или отсечка искрой (E7EE.0) ----------
+    a.label('sh27')
+    a.mov_c_bit(ACCb(2))            # заменённая команда: A = [5F01]
+    a.jc('s27')
+    a.mov_dptr(LIM_MODE)            # DPTR и A дальше сток грузит заново (@E729)
+    a.clr_a()
+    a.movc()
+    a.mov_c_bit(ACCb(0))
+    a.label('s27')
+    a.mov_bit_c(0x3E)               # 27h.6
     a.ret()
 
 
@@ -869,7 +1025,7 @@ def apply_cal(d, paid, cal):
         d[a] = d[a] | 1 << b if on else d[a] & ~(1 << b) & 0xFF
 
 
-def build(stock, z, cfg, paid=None, cal=(), pht=0):
+def build(stock, z, cfg, paid=None, cal=(), pht=0, lim=(0, 0, 0, 0)):
     d = bytearray(stock)
     if cal:
         apply_cal(d, paid, cal)
@@ -955,6 +1111,10 @@ def build(stock, z, cfg, paid=None, cal=(), pht=0):
     put(0x3E52, [0xAE], [0x8C])     # предел накопления 140° (окно до ВМТ 192° − УОЗ 45° − зуб)
     # --- прочее под 6 цилиндров ---
     put(0x38C6, [0x04], [0x06])     # «добавка на первых тактах» после пуска/отсечки — на все 6 цилиндров
+    # --- отсечка по оборотам (v9): искрой / без мягкой / пауза / страховка / угол — калибровка E7EB–E7EE ---
+    put(0x1353, [0x90, 0xF9, 0xA6], jmp('limf'))
+    put(0x1377, [0x90, 0xF9, 0xB7], jmp('lims'))
+    put(0xE725, [0xA2, 0xE2, 0x92, 0x3E], call('sh27') + [0])
     put(0xB500, [0x43, 0xE8, 0xFF], call('relayoff'))      # выключение реле: К5/К6 в покой
     put(0x2DEF, [0x75, 0xC1, 0x00], call('ccoff'))         # выключение по напряжению: К5/К6 в покой
     put(0x20F7, [0x30, 0xE0, 0x24], [0x80, 0x25, 0x00])    # моментный РХХ (5F00.0) не трогает COMSET/COMCLR
@@ -966,13 +1126,14 @@ def build(stock, z, cfg, paid=None, cal=(), pht=0):
     put(0x1929, [0x75, 0x90, 0xFF], [0x75, 0x90, 0xEE])    # P1.0, P1.4 = 0 (Ф5 / Ф6 закрыты)
     put(0x19C6, [0x75, 0x90, 0x1C], [0x75, 0x90, 0x0C])    # направление: P1.4 — выход
     put(0x1A72, [0x75, 0xC1, 0x4C], [0x75, 0xC1, 0x4E])    # CRC — сравнение
-    put(0x211E, [0x75, 0xC9, 0x98], [0x75, 0xC9, 0xFD])    # CC4 сравнение 1 + режим 2 на P5.0–P5.7 (COCON=111)
+    # 211E (CC4EN = 98h) — сток с v9: FDh (COCON = 111) ломал SPI TLE6240, разбор п.21; К5/К6 не работают
     put(0x46F0, [0xC2, 0x97], [0x22, 0x00])                # SPI детонации выкл (P1.0 — Ф6)
     put(0x0909, [0xC2, 0x42, 0x30, 0x47, 0x15], [0xC2, 0x42, 0x02, 0x0A, 0xE8])   # INT0: расчёт ДД пропустить
     put(0xDF53, [0x75, 0xB1, 0x00], call('early'))         # старт: ноги Ф5/Ф6/К5/К6 сразу
     # --- калибровка ---
     put(CFG, [0] * 16, cfg + [z])
     put(PHT_CAL, [0], [pht])
+    put(LIM_ANG, [0] * 4, lim)      # E7EB угол, E7EC пауза, E7ED страховка, E7EE режим
     fix_sum(d)
     return bytes(d), len(blob), L
 
@@ -996,7 +1157,8 @@ def fix_sum(d):
 
 
 DEFAULT = dict(mode=0x00, phpol=0x00, p5pol=0x01,          # mode (E7F0) с v7 не используется
-               inj=[0x01, 0x02, 0x04, 0x08, 0x10, 0x20], coil=[0, 1, 2, 3, 4, 5])
+               inj=[0x01, 0x02, 0x04, 0x08, 0x10, 0x20],
+               coil=[0, 1, 2, 0, 1, 2])                      # с v9 парами на К1–К3: К5/К6 не работают (211E)
 
 
 def cfg_bytes(c):
@@ -1017,6 +1179,11 @@ def main():
                     help='маски выходов форсунок для цилиндров 1..6 (hex)')
     ap.add_argument('--coil', default=','.join(str(v) for v in DEFAULT['coil']),
                     help='номер катушки 0..5 (К1..К6) для цилиндров 1..6')
+    ap.add_argument('--lim-mode', type=int, default=0,
+                    help='отсечка по оборотам E7EE: +1 искрой, +2 без мягкой, +4 искра через такт (0 — сток)')
+    ap.add_argument('--lim-pause', type=int, default=0, help='пауза отсечки искрой E7EC, ×40 об/мин (0..25)')
+    ap.add_argument('--lim-fuel', type=int, default=0, help='страховка по топливу E7ED, ×40 об/мин выше предела')
+    ap.add_argument('--lim-ang', type=int, default=0, help='угол на отсечке E7EB, зубья (1 = 6°, 0..6)')
     ap.add_argument('--child', type=int, default=0,
                     help='номер дочерней (смена калибровки): 0 — родитель v%d.0' % CODE_VER)
     ap.add_argument('--what', default='', help='что изменилось относительно v%d.0 (для --child > 0)' % CODE_VER)
@@ -1035,13 +1202,16 @@ def main():
                inj=[int(x, 16) for x in a.inj.split(',')], coil=[int(x) for x in a.coil.split(',')])
     if len(cfg['inj']) != 6 or len(cfg['coil']) != 6 or any(not 0 <= k <= 5 for k in cfg['coil']):
         sys.exit('таблицы: 6 значений, катушки 0..5')
+    if not (0 <= a.lim_mode <= 7 and 0 <= a.lim_pause <= 25 and 0 <= a.lim_fuel <= 255 and 0 <= a.lim_ang <= 6):
+        sys.exit('отсечка: режим 0..7, пауза 0..25, страховка 0..255, угол 0..6 зубьев')
+    lim = [a.lim_ang, a.lim_pause, a.lim_fuel, a.lim_mode]
     paid, cal = None, []
     if a.cal_from:
         paid = open(a.cal_from, 'rb').read()
         if len(paid) != 0x90000:
             sys.exit('платная должна быть 576 К (0x90000)')
         cal = load_cal_list(a.cal_list)
-    out, size, L = build(stock, a.z, cfg_bytes(cfg), paid, cal, a.phtooth)
+    out, size, L = build(stock, a.z, cfg_bytes(cfg), paid, cal, a.phtooth, lim)
     if cal:
         print('Перенесено таблиц из платной: %d (%d байт), флагов: %d' % (
             len(cal[0]), sum(t[1] for t in cal[0]), len(cal[1])))
@@ -1051,6 +1221,7 @@ def main():
     open(path, 'wb').write(out)
     print('Записан:', path)
     print('Новый код %d байт с %04X, калибровка E7F0–E7FF: %s' % (size, ORG, ' '.join('%02X' % v for v in cfg_bytes(cfg) + [a.z])))
+    print('Отсечка E7EB–E7EE (угол, пауза, страховка, режим): %s' % ' '.join('%02X' % v for v in lim))
     for k, v in sorted(L.items(), key=lambda x: x[1]):
         if '_' not in k or k in ('open5', 'open6'):
             print('  %04X %s' % (v, k))

@@ -9,7 +9,9 @@
   - иначе по точному названию (уникальному в обеих) и размеру;
   - значения платной: таблица находится в 270926_…bin поиском значений, читается из прошивки 18.10.26 по тому же
     адресу; не найдена — значения выгрузки 28.09; константы и флаги — только из выгрузки 28.09.
-Цвета в дереве: синий — есть в j7es, нет в платной; красный — есть в платной, нет в j7es (только просмотр).
+Цвета в дереве: чёрный — перенесено как есть; зелёный — устройство разное, измерения те же, перенесено пересчётом
+(GREEN, v13.4); жёлтый — пара есть, перенести нельзя; красный — только в платной (по папкам её программы, PAID_TREE);
+синий — только в j7es. Оси платной — PAID_AX (сняты с видео её программы 29.10.26).
 
 Запуск (из папки j7es_074):
     python3 "редактор калибровок j7es — генератор по описанию .j7 20.10.26 ИИ.py"           → редактор
@@ -34,6 +36,21 @@ LOGS = os.path.join(Y30, 'Логи 28.09.26')
 PAID27 = os.path.join(LOGS, '270926_Popravka_vozobravlenia_toplivopodachi.bin')
 PAIDST = os.path.join(Y30, 'Бош797', 'Исходные калибровки', '01_j796sx_i_v2_21_01_0B_C2_7E_0E_00_00_2D.bin')
 TUNED = os.path.join(Y30, 'Бош797', 'Исходные калибровки', '18_10_26_Otsechka_3.bin')
+# промежуточные прошивки платной: по ним и по выгрузкам правок после 28.09 ищутся адреса таблиц, которые потом меняли
+LATE_BINS = (os.path.join(Y30, 'Логи 29.09.26', '29_09_26_Mini_pravki_ot_ii.bin'),
+             os.path.join(Y30, 'Логи 8.10.26', '04_10_26_Peresobral.bin'))
+SET1 = (0x75000, 0x7C000)           # первый набор калибровок платной (второй — его копия со сдвигом 0xC000)
+CSUM = {0x7BFFE, 0x7BFFF}           # контрольная сумма набора
+LOC = {}                            # код таблицы платной → (адрес, ширина, знак, k, b, порядок) в «Отсечке 3»
+CLAIM = {}                          # байт первого набора → код калибровки, за которой он закреплён (None — константа)
+# константы платной не по адресу j7es + 0x70000 и в другом масштабе: название → (адрес, k, b), значение = байт·k + b
+# 0x760AE: в бине 27.09 байт 124 = 84 °C выгрузки 28.09 (хранится T+40); 29.09 стало 121 → 81 °C
+# 0x7600B: байт 39 × 5.12 = 199.68 кПа выгрузки 28.09; правка 29.09 «220» → 43 × 5.12 = 220.16
+KVTZ_TAB, KVTZ_TAB_THR, KVTZ_FLAG = 0x4D00, 0x4E00, 0x4F00   # наш патч v15.0 (свободный флеш 4C36–5ECF)
+KVTZ_PAID = 'Коэффициент выбора Тзаряда по давлению'
+KVTZ_PAID_THR = 'Коэффициент выбора Тзаряда по дросселю'
+PAID_CONST_LOC = {'Температура выключения': (0x760AE, 1.0, -40.0),
+                  'Давление блокировки впрыска': (0x7600B, 5.12, 0.0)}
 J7STOCK = os.path.join(HERE, 'j7es_v0.7.5.bin')
 J7DESC = os.path.join(HERE, 'j7es_0.7.4.j7')
 OUT = os.path.join(HERE, 'редактор калибровок j7es ИИ.html')
@@ -44,7 +61,12 @@ NO_FLASH = {(5, 0): 'Ф4–Ф6, К4–К6 не работают', (5, 1): 'Ф4�
             (6, 0): 'калибровки стока ВАЗ', (6, 1): 'перенос по адресу с ошибками',
             (6, 2): 'флаги и маска ошибок не как в платной, нет ПЦН 32×16',
             (6, 3): 'датчик фаз включался своим байтом, штатный флаг выключен (исправлено в v7)',
-            (7, 0): 'калибровки стока ВАЗ'}
+            (7, 0): 'калибровки стока ВАЗ; нет главного реле и бензонасоса (211E)',
+            (7, 1): 'нет главного реле и бензонасоса (211E)', (7, 2): 'нет главного реле и бензонасоса (211E)',
+            (8, 0): 'только проверка на столе: катушки на К5/К6', (9, 0): 'калибровки стока ВАЗ',
+            (10, 0): 'проверочная', (11, 0): 'проверочная', (12, 0): 'проверочная, без сдвига угла',
+            (13, 1): 'флаг «Проводка Калины» не нужен', (14, 0): 'проверочная: насос включён всегда'}
+LIMIT_SECT = 'Отсечка по оборотам (наш патч)'
 SECTIONS = {
     'Rabochie_rezhimy': 'Рабочие режимы', 'Kholostoy_khod': 'Холостой ход', 'Pusk': 'Пуск',
     'Perekhod_Pusk': 'Переход от пуска', 'Perekhod_ot_KhKh_k_rabochim_rezhimam': 'Переход от ХХ к рабочим режимам',
@@ -127,14 +149,119 @@ STRUCT = {0x9E5C: ('Желаемое положение РХХ', None),
           0x623C: ('Базовый duty (WGDC)', None),
           0x5FA3: ('Минимальное положение РХХ', 'в j7es одно число, в платной таблица'),
           0x6054: ('Зона нечувствительности по дросселю', 'в j7es одно число (обогащение по открытию), в платной '
-                   'таблица на 6 точек; константа платной = 2 — это обеднение по закрытию (5F74, перенесена)'),
-          0x8A0C: ('Коэффициент фильтра', 'в платной все значения 0 — перенос остановит регулятор')}
+                   'таблица на 6 точек; константа платной = 2 — это обеднение по закрытию (5F74, перенесена)')}
 STRUCT_PAID = {n for n, _ in STRUCT.values()}
 # одноимённые в платной, но у другого узла — не пара (остаются синими с пояснением)
 NOT_PAIR = {0x9ECF: 'в платной «Задержка включения вентилятора» — у её собственного вентилятора, не у доп. выхода j7es',
             0x71C6: 'в платной «Задержка включения вентилятора» — у её собственного вентилятора, не у кондиционера j7es',
             0x71C7: 'в платной «Смещение РХХ при включения вентилятора» — у её собственного вентилятора',
-            0x6090: 'в платной два «Режима управления» у других узлов'}
+            0x6090: 'в платной два «Режима управления» у других узлов',
+            0x9EA6: 'в платной «Максимальный МРВ для расчета Тз» = 800, в j7es 128 кг/ч — как одно пересчитать в другое, '
+                    'не установлено, не переносилось'}
+# зелёные: устройство или название разное, измерения те же — перенесено пересчётом в v13.4 (29.10.26, оси платной
+# сняты с видео её программы) или уже совпадает по значению. Адрес j7es → (калибровка платной, как перенесено)
+GREEN = {0x6713: ('Коэффициент весовой коррекции по ТОЖ', 'в платной 16×16 (ТОЖ при пуске × текущая ТОЖ); здесь по текущей '
+                  'ТОЖ — максимум по пускам с ТОЖ не выше текущей, шаг 10° → 5° (v13.4). v15.1: на холодную ×1.30 '
+                  '(≤0 °C) … ×1.05 (50 °C) по логу 30.10 13:38 (ХХ держится до ~13.5–14, было 16.3–17), с 60 °C как '
+                  'было; ниже 0 °C — без замера, −40…−35 упёрлось в предел 1.99'),
+         0x609A: ('Смещение характеристики ДАД', 'вход j7es видит датчик на ~0.235 В выше платной (заглушенный мотор: '
+                  '2.09 В против 1.855 В; наклон по логам обеих 45.8 кПа/В, сдвиг на ХХ тот же) → 0.337 − 0.235 = 0.1025, '
+                  'атмосфера 101 кПа и давление на всех режимах как у платной (v13.12)'),
+         0x9E5C: ('Желаемое положение РХХ', 'строка платной «дроссель 0 %» (16 точек по оборотам) → 32 точки; квантование '
+                  'оборотов 613C общее'),
+         0x6913: ('Шаг уменьшения уставки оборотов 1', 'в платной одно значение на все передачи → на все 32 точки'),
+         0x6933: ('Шаг уменьшения уставки оборотов 2', 'в платной одно значение на все передачи → на все 32 точки'),
+         0x9074: ('Коэффициент уменьшения GTC 1 при выходе из ХХ', 'ось та же (состояние отсечки ПХХ 0…15), точки 16–31 = '
+                  'последняя'),
+         0x5FA3: ('Минимальное положение РХХ', 'как в перенесённой таблице «Минимальное положение РХХ» по ТОЖ — не выше неё'),
+         0x7AC7: ('Зона калибровки уровня шума', 'оси те же (обороты × дроссель), один к одному'),
+         0xA051: ('Коррекция времени впрыска по дельте ДТ- АД', 'в платной везде 1.0 (без коррекции) → максимум j7es'),
+         0x607A: ('Скорость изменения коррекции состава смеси', 'тот же масштаб, значение платной'),
+         0x5F60: ('Задержка включения после пуска двигателя', 'те же единицы (с), значение платной'),
+         0x6054: ('Зона нечувствительности по дросселю', 'в платной на 2–5 передаче 1 — здесь уже 1'),
+         0x7BC7: ('Аттенюатор', 'значения те же, у j7es шкала ×64'),
+         0x60B3: ('Минимальное положение РХХ в движении', 'в платной таблица по оборотам, в «Отсечке 3» везде 12 '
+                  '(последняя точка 37) → 12 (v13.18; до того 14 по выгрузке 28.09)'),
+         0x60D8: ('Время блокировки выхода из режима ХХ', 'те же единицы (с), значение платной'),
+         0x9EA4: ('Минимальный коэфф. для расчета ТЗ', 'значение то же (0.25)'),
+         0x9EA5: ('Максимальный коэфф. для расчета ТЗ', 'значение то же (0.898)'),
+         0x866F: ('Коррекция ЦН по ТОЖ   (ДАД и дроссель)', 'значения платной ×2: формула та же (описание платной), но '
+                  'константа при V·P у платной вдвое больше, чем в j7es (логи 08.10 платная, 29.10 j7es); перенос '
+                  'один к одному давал вдвое меньшее наполнение (v13.10)'),
+         0x6061: ('Фаза впрыска по наполнению', 'в платной своей фазы на пуске нет; взята основная таблица (перенесена) '
+                  'на 600 об/мин при «Цилиндровое GBC на пуске» 650 мг/цикл — 294°, без скачка фазы на выходе из пуска (v13.8)')}
+GREEN_PAID = {n for n, _ in GREEN.values()}
+# перенос байтами по тому же адресу (v13.6): раскладка здесь общая (соседняя 8A32 совпадает байт в байт), назначение
+# сверено дизасмом 29.10.26 — регулятор ХХ в приращениях: 8A12 × изменение ошибки оборотов, 8A22 × ошибка → накопитель.
+# Программа платной зовёт их иначе, чем описание .j7. Адрес j7es → (калибровка платной, точек)
+BY_ADDR = {0x8A0C: ('Коэффициент фильтра (тот же адрес в бине платной; у одноимённой в выгрузке — нули, это другая)', 6),
+           0x8A12: ('Пропорциональный коэффициент', 16),
+           0x8A22: ('Интегральный коэффициент', 16)}
+BY_ADDR_PAID = {n for n, _ in BY_ADDR.values()}
+# оси платной (сняты с видео программы платной 29.10.26): (название, точек X) → (подпись X, точки X, подпись Z, точки Z)
+R16 = [600, 800, 1000, 1200, 1600, 2000, 2520, 3000, 3520, 4000, 4520, 5000, 5520, 6000, 7000, 10200]
+R32 = [600, 720, 800, 920, 1000, 1120, 1200, 1400, 1600, 1800, 2000, 2280, 2520, 2760, 3000, 3280, 3520, 3760, 4000, 4280,
+       4520, 4760, 5000, 5280, 5520, 5760, 6000, 6520, 7000, 7520, 10200, '32-я не показана']
+THR16 = [0, 2, 4, 6, 8, 10, 14, 18, 23, 29, 37, 46, 56, 66, 80, 100]
+TOJ16 = list(range(-40, 111, 10))
+TOJ39 = list(range(-40, 151, 5))
+GEAR = list(range(6))
+RPM, THR, GR = 'Обороты коленвала, об/мин', 'Положение дросселя, %', 'Передача'
+PAID_AX = {('Коэффициент весовой коррекции по ТОЖ', 16): ('Текущая ТОЖ, °C', TOJ16, 'ТОЖ при пуске, °C', TOJ16),
+           ('Желаемое положение РХХ', 16): (RPM, R16, THR, THR16),
+           ('Зона калибровки уровня шума', 16): (RPM, R16, THR, THR16),
+           ('Шаг уменьшения уставки оборотов 1', 6): (GR, GEAR, '', None),
+           ('Шаг уменьшения уставки оборотов 2', 6): (GR, GEAR, '', None),
+           ('Коэффициент фильтра', 6): (GR, GEAR, '', None),
+           ('Зона нечувствительности по дросселю', 6): ('Номер передачи', GEAR, '', None),
+           ('Пропорциональный коэффициент', 16): ('Время после пуска, с', list(range(16)), '', None),
+           ('Коэффициент уменьшения GTC 1 при выходе из ХХ', 16): ('Состояние отсечки ПХХ', list(range(16)), '', None),
+           ('Коррекция времени впрыска по дельте ДТ- АД', 32): ('Дельта давлений, кПа', [
+               0, 20, 41, 61, 82, 102, 123, 143, 164, 184, 205, 225, 246, 266, 287, 307, 328, 348, 369, 389, 410, 430, 451,
+               471, 492, 512, 532, 553, 573, 594, 614, 635], '', None),
+           ('Отскок УОЗ в режиме Launch', 32): ('Дельта оборотов, об/мин', list(range(0, 1241, 40)), '', None),
+           ('Базовый duty (WGDC)', 32): (RPM, R32, 'Значение переключателя', list(range(10))),
+           ('Аттенюатор', 128): (RPM, list(range(0, 10161, 80)), '', None),
+           ('Минимальное положение РХХ', 39): ('Температура ОЖ, °C', TOJ39, '', None),
+           ('Минимальное положение РХХ', 32): (RPM, R32, '', None)}
+# оси j7es, которых нет в описании .j7 (там «от 0 до 0»): в платной у тех же таблиц эти измерения, квантование общее
+AX_RPM = {'kind': 'q', 'tab': 0x613C, 'xstep': 40, 'len': 256}
+AX_GBC = {'kind': 'mm', 'min': 0x6064, 'rng': 0x6066, 'dmin': 6.0}
+AX_PRS = {'kind': 'mm', 'min': 0x5EF2, 'rng': 0x5EF4, 'dmin': 60.0}
+AX_AIR = ({'kind': 'lin', 'a': 0.0, 'b': 248.0}, 'Массовый расход воздуха, кг/ч')
+J7_AXFIX = {'УОЗ на ХХ': AX_RPM, 'УОЗ на ХХ при движении': AX_GBC, 'Коррекция по оборотам': AX_RPM,
+            'Динамическая коррекция GTC по GBC': AX_GBC, 'Коэффициент топлива по оборотам': AX_RPM,
+            'Коэффициент топлива по давлению': AX_PRS, 'Максимальное смещение УОЗ при детонации': AX_RPM,
+            'Коэффициент динамической коррекции': AX_RPM, 'Задержка отключения топливоподачи': AX_RPM,
+            'УОЗ при отключении подачи топлива': AX_RPM, 'Добавка топлива на первых 4 тактах': AX_GBC,
+            'Фаза начала измерения детонации': AX_RPM, 'Фаза окончания измерения детонации': AX_RPM,
+            'Относительный порог детонации': AX_RPM, 'Порог детонации': AX_RPM,
+            'Минимальное время между циклами детонации': AX_RPM, 'Период восстановления УОЗ': AX_RPM,
+            'Зона регулирования по дросселю': AX_RPM, 'Положение открытого дросселя, таблица': (AX_RPM, RPM),
+            'Положение закрытого дросселя, таблица': (AX_RPM, RPM), 'Ожидаемая температура ОГ в рабочих режимах': AX_AIR,
+            'Постоянная времени выпускной трубы': AX_AIR, 'Минимальный общий уровень шума для диагн.': AX_RPM,
+            'Желаемое положение РХХ': (AX_RPM, RPM)}
+# дерево программы платной (с видео 29.10.26): (название, номер одноимённой по порядку выгрузки) → папка
+PAID_TREE = os.path.join(HERE, 'дерево калибровок платной по видео 29.10.26 ИИ.tsv')
+# «Функции входов / выходов»: Fn = функция по порядку списка в программе платной, бит = выбранный вариант
+FN_IN = ['ДМРВ (аналоговый)', 'ДАД (аналоговый)', 'УДК (аналоговый)', 'Запрос включения кондиционера (триггер)',
+         'Переключение наборов калибровок (триггер)', 'Контроллер ШДК (аналоговый)', 'Датчик ТОГ (аналоговый)',
+         'Настраиваемая калибровка WGDC (переключатель)', 'Настраиваемая калибровка Обороты режима Launch (переключатель)',
+         'Датчик температуры 1 (аналоговый)', 'Датчик температуры 2 (аналоговый)', 'Активация Flat-shift (триггер)',
+         'Датчик включения VTEC (триггер)', 'Датчик давления топлива (аналоговый)', 'Датчик давления масла (аналоговый)',
+         'Датчик давления воды/спирта (аналоговый)']
+FN_OUT = ['Нагреватель датчика кислорода', 'Сигнал расхода топлива', 'Муфта кондиционера', 'Реле блокировки стартера',
+          'Вентилятор охлаждения (реле)', 'Дополнительный вентилятор охлаждения', 'Лампа индикации отсечки (shift light)',
+          'Управление по карте обороты/дроссель (реле)', 'Управление по карте обороты/давление (реле)',
+          'Лампа индикации детонации', 'Вентилятор охлаждения (ШИМ)', 'Клапан управления наддувом',
+          'Управление по карте обороты/дроссель (ШИМ)', 'Управление по карте обороты/давление (ШИМ)',
+          'Имитатор сигнала ДСА (ЧМ)', 'МРХХ вывод 1 (откр)', 'МРХХ вывод 2 (закр)', 'Управление VTEC - средние обороты',
+          'Управление VTEC - высокие обороты']
+PINS13 = ['нет', 'пин 18', 'пин 21', 'пин 23', 'пин 24', 'пин 37', 'пин 38', 'пин 41', 'пин 42', 'пин 54', 'пин 55',
+          'пин 56', 'пин 57']
+# варианты, сверенные с видео: (список, номер F) → варианты по битам; выходы — только выбранные у тебя
+FN_OPTS = {('Функции входов', 2): PINS13, ('Функции входов', 5): PINS13, ('Функции входов', 6): ['нет', 'пин 18']}
+FN_SEEN = {('Функции выходов', 5, 14): 'пин 68', ('Функции выходов', 6, 7): 'пин 29'}
 # константа j7es ← таблица платной: в j7es одно число, в платной таблица по ТОЖ — берётся максимум
 DERIVED = {'Обороты блокировки впрыска': 'Обороты блокировки впрыска по ТОЖ'}
 PREFER[0x9BC7] = 'Коррекция порога детонации'
@@ -151,36 +278,59 @@ def mod(name, fname):
 def cte_all():
     """Код → описание калибровки платной из выгрузок .cte (значения — настройка 28.09)."""
     out = {}
-    num = lambda s: float(s.replace(',', '.'))
     for f in sorted(glob.glob(os.path.join(LOGS, '*.cte'))):
         sect = SECTIONS.get(os.path.basename(f)[:-4], os.path.basename(f)[:-4])
-        t = open(f, encoding='cp1251').read().replace('\r', '')
-        for m in re.finditer(r'\[([0-9A-Fa-f]{8})\]\nName=(.*)\n((?:[^\[\n].*\n?)*)', t):
-            kv = re.findall(r'^(\w+)=(.*)$', m.group(3), re.M)
-            if not kv:
-                continue
-            e = dict(name=m.group(2).strip(), sect=sect)
-            if kv[0][0] == 'Const':
-                e.update(kind='const', text=kv[0][1].strip())
-                try:
-                    e['v'] = num(kv[0][1])
-                except ValueError:
-                    pass
-            elif re.match(r'F\d+$', kv[0][0]):
-                e.update(kind='flags', text=' '.join(v.strip() for _, v in kv))
-            elif any('Z' in k for k, _ in kv):
-                dct = {}
-                for k, v in kv:
-                    x, z = map(int, re.match(r'X(\d+)Z(\d+)', k).groups())
-                    dct[(x, z)] = num(v)
-                nx = max(x for x, _ in dct)
-                nz = max(z for _, z in dct)
-                e.update(kind='table', nx=nx, nz=nz,
-                         var=[[dct[(x, z)] for z in range(1, nz + 1) for x in range(1, nx + 1)],
-                              [dct[(x, z)] for x in range(1, nx + 1) for z in range(1, nz + 1)]])
-            else:
-                e.update(kind='table', nx=len(kv), nz=1, var=[[num(v) for _, v in kv]])
-            out[int(m.group(1), 16)] = e
+        out.update(parse_cte(f, sect))
+    return out
+
+
+def late_tables():
+    """Код → наборы значений таблиц из остальных выгрузок .cte (правки до и после 28.09) — для поиска адресов."""
+    out = {}
+    for f in glob.glob(os.path.join(Y30, '**', '*.cte'), recursive=True):
+        if os.path.dirname(os.path.abspath(f)) == os.path.abspath(LOGS):
+            continue
+        try:
+            got = parse_cte(f, '')
+        except (UnicodeDecodeError, ValueError, AttributeError):
+            continue
+        for code, e in got.items():
+            if e['kind'] == 'table':
+                out.setdefault(code, []).append(e['var'])
+    return out
+
+
+def parse_cte(f, sect):
+    """Код → калибровка из одного файла выгрузки .cte."""
+    out = {}
+    num = lambda s: float(s.replace(',', '.'))
+    t = open(f, encoding='cp1251').read().replace('\r', '')
+    for m in re.finditer(r'\[([0-9A-Fa-f]{8})\]\nName=(.*)\n((?:[^\[\n].*\n?)*)', t):
+        kv = re.findall(r'^(\w+)=(.*)$', m.group(3), re.M)
+        if not kv:
+            continue
+        e = dict(name=m.group(2).strip(), sect=sect, code=int(m.group(1), 16))
+        if kv[0][0] == 'Const':
+            e.update(kind='const', text=kv[0][1].strip())
+            try:
+                e['v'] = num(kv[0][1])
+            except ValueError:
+                pass
+        elif re.match(r'F\d+$', kv[0][0]):
+            e.update(kind='flags', text=' '.join(v.strip() for _, v in kv))
+        elif any('Z' in k for k, _ in kv):
+            dct = {}
+            for k, v in kv:
+                x, z = map(int, re.match(r'X(\d+)Z(\d+)', k).groups())
+                dct[(x, z)] = num(v)
+            nx = max(x for x, _ in dct)
+            nz = max(z for _, z in dct)
+            e.update(kind='table', nx=nx, nz=nz,
+                     var=[[dct[(x, z)] for z in range(1, nz + 1) for x in range(1, nx + 1)],
+                          [dct[(x, z)] for x in range(1, nx + 1) for z in range(1, nz + 1)]])
+        else:
+            e.update(kind='table', nx=len(kv), nz=1, var=[[num(v) for _, v in kv]])
+        out[e['code']] = e
     return out
 
 
@@ -301,27 +451,108 @@ def match(cal, cte):
     return res
 
 
-def paid_table(e, p27, ptu, c=None):
-    """Значения таблицы платной (z снаружи, x внутри): из прошивки 18.10 по найденному адресу или из выгрузки 28.09.
-    c — пара в j7es: если поиск не нашёл (одинаковые значения), проверяется адрес j7es + 0x70000 — там у
-    родственных калибровок та же раскладка и тот же масштаб (у 189 из 226 констант так и есть)."""
-    hits = []
-    for oi, v in enumerate(e['var']):
-        hits += [h + (oi,) for h in find(p27[0x75000:0x7C000], 0x75000, v)]
-    if len({h[0] for h in hits}) == 1:
-        a, w, sg, k, b, order = hits[0]
+def claim(a, n, code=None):
+    for i in range(a, a + n):
+        CLAIM.setdefault(i, code)
+
+
+def free_for(a, n, code):
+    """Место свободно или уже закреплено за этой же таблицей (повторный запрос той же таблицы)."""
+    return all(CLAIM.get(i, code) == code for i in range(a, a + n)) and (code is not None or not any(
+        i in CLAIM for i in range(a, a + n)))
+
+
+def same_everywhere(buf, addrs, n):
+    return len({bytes(buf[a:a + n]) for a in addrs}) == 1
+
+
+def locate_all(cte, late, p27, ptu, lbins):
+    """Адреса таблиц платной в первом наборе. Значения ищутся поиском с подбором масштаба: из выгрузки 28.09 — в бине
+    27.09, из остальных выгрузок — во всех бинах. Таблица с одним-двумя разными значениями поиском не ищется: с подбором
+    масштаба она «находится» на месте любой похожей (так «Коррекция по оборотам» ложилась на [14×31, 37]). Несколько мест
+    с одинаковыми байтами в «Отсечке 3» — значение определено, адрес берётся первый."""
+    lo, hi = SET1
+    for code, e in cte.items():
+        if e['kind'] != 'table':
+            continue
+        cand = {}
+        for var, bl in [(e['var'], (p27,))] + [(v, (p27,) + lbins + (ptu,)) for v in late.get(code, [])]:
+            if len(var[0]) != e['nx'] * e['nz']:
+                continue
+            for oi, v in enumerate(var):
+                if len(set(v)) < 3:
+                    continue
+                for b in bl:
+                    for h in find(b[lo:hi], lo, v):
+                        cand.setdefault(h[0], h + (oi,))
         n = e['nx'] * e['nz']
+        if cand and same_everywhere(ptu, cand, n * next(iter(cand.values()))[1]):
+            h = min(cand.values())
+            LOC[code] = h
+            for a in cand:
+                claim(a, n * h[1], code)
+
+
+def paid_table(e, p27, ptu, c=None):
+    """Значения таблицы платной (z снаружи, x внутри) из «Отсечки 3»: по адресу, найденному поиском (LOC), иначе —
+    по точным байтам выгрузки 28.09 (в масштабе пары j7es или байт как есть) в месте, не занятом другой таблицей.
+    Не нашлась — значения выгрузки 28.09 с src='28.09' (проверка, не менялась ли она, — в check_unexplained)."""
+    n = e['nx'] * e['nz']
+    h = LOC.get(e.get('code'))
+    if h:
+        a, w, sg, k, b, order = h
         dt = {('u', 1): np.uint8, ('s', 1): np.int8, ('u', 2): '<u2', ('s', 2): '<i2'}[(sg, w)]
         raw = np.frombuffer(ptu[a:a + n * w], dtype=dt).astype(float) * k + b
         if order == 1:                                   # в бине x снаружи → переставить
             raw = raw.reshape(e['nx'], e['nz']).T.reshape(-1)
         return dict(v=[round(float(x), 6) for x in raw], src='18.10', pa=a)
-    if c is not None:                                    # не нашлась поиском — адрес родственной раскладки
+    lo, hi = SET1
+    tries = []
+    if c is not None:
         enc = encode(c, e['var'][0])
-        pa = c['addr'] + SHIFT
-        if enc is not None and p27[pa:pa + len(enc)] == enc:
-            return dict(v=[round(float(x), 6) for x in j7val(ptu[SHIFT:], c)], src='18.10', pa=pa)
-    return dict(v=e['var'][0], src='28.09', pa=None)
+        if enc is not None:
+            tries.append((enc, lambda a, buf: j7val(buf[a - c['addr']:], c)))
+    if all(float(x).is_integer() and 0 <= x <= 255 for x in e['var'][0]):
+        enc = bytes(int(x) for x in e['var'][0])
+        tries.append((enc, lambda a, buf: np.frombuffer(buf[a:a + n], dtype=np.uint8).astype(float)))
+    for enc, rd in tries:
+        pos, k = [], p27.find(enc, lo)
+        while 0 <= k <= hi - len(enc):
+            if free_for(k, len(enc), e.get('code')):
+                pos.append(k)
+            k = p27.find(enc, k + 1)
+        if c is not None and c['addr'] + SHIFT in pos:   # родственная раскладка: адрес j7es + 0x70000
+            pos = [c['addr'] + SHIFT]
+        if pos and same_everywhere(ptu, pos, len(enc)):
+            # занимает одно место: одинаковых таблиц бывает несколько (две «Мин. положение РХХ» по 32 точки — 7A171, 7A38E)
+            mine = [a for a in pos if CLAIM.get(a) == e.get('code')] or pos
+            claim(mine[0], len(enc), e.get('code'))
+            return dict(v=[round(float(x), 6) for x in rd(mine[0], ptu)], src='18.10', pa=mine[0])
+    return dict(v=e['var'][0], src='28.09', pa=None, enc=tries[0][0] if tries else None)
+
+
+def unexplained(p27, ptu):
+    """Участки первого набора, изменённые от 27.09 к «Отсечке 3», за которыми не закреплена ни одна калибровка."""
+    lo, hi = SET1
+    out = []
+    for i in range(lo, hi):
+        if p27[i] != ptu[i] and i not in CLAIM and i not in CSUM:
+            if out and i - out[-1][1] <= 2:
+                out[-1][1] = i
+            else:
+                out.append([i, i])
+    return out
+
+
+def could_be_there(enc, p27, regs):
+    """Могут ли байты enc (в бине 27.09) лежать на одном из необъяснённых изменённых участков."""
+    if not enc:
+        return True
+    for a, b in regs:
+        for k in range(max(SET1[0], a - len(enc) + 1), b + 1):
+            if p27[k:k + len(enc)] == enc:
+                return True
+    return False
 
 
 def dec(c, raw):
@@ -377,6 +608,9 @@ def main():
             e['v0'] = e['v']                         # значение выгрузки 28.09 (= состояние бина 27.09)
     overlay_patches(cte)
     jes, p27, pst, ptu = (open(p, 'rb').read() for p in (J7STOCK, PAID27, PAIDST, TUNED))
+    lbins = tuple(open(p, 'rb').read() for p in LATE_BINS)
+    locate_all(cte, late_tables(), p27, ptu, lbins)
+    pending = []                                     # (dd, байты 27.09 для проверки) — адрес в «Отсечке 3» не найден
     m = match(cal, cte)
     cmin = {c['addr']: c['div'] for c in cal if c['kind'] == 3}          # делители минимумов осей
     same_addr = {}
@@ -396,6 +630,12 @@ def main():
                     ax = dict(ax, dmin=cmin.get(ax['min'], 1.0))
                 dd[k] = ax
             dd.update(xl=c.get('xl', ''), zl=c.get('zl', ''), vl=c.get('vl', ''))
+            fx = J7_AXFIX.get(c['name'])
+            if fx and dd.get('xax') and dd['xax']['kind'] == 'lin' and dd['xax']['a'] == dd['xax']['b'] == 0:
+                ax, lb = fx if isinstance(fx, tuple) else (fx, None)
+                dd['xax'] = ax
+                if lb and not dd['xl']:
+                    dd['xl'] = lb
             others = [n for n in same_addr[c['addr']] if n != c['name']]
             if others:
                 dd['note'] = 'та же память, что у «%s» — какую читает блок, решают флаги' % '», «'.join(others)
@@ -418,10 +658,23 @@ def main():
                     bl.append([a, b, nm, st[0], st[1], st[2]])
             dd['bits'] = bl
         code = m.get(i)
+        if c['addr'] in BY_ADDR and c['kind'] in (1, 2):
+            pn, n = BY_ADDR[c['addr']]
+            enc = bytes(ptu[c['addr'] + SHIFT:c['addr'] + SHIFT + n * c['w']])
+            claim(c['addr'] + SHIFT, n * c['w'])
+            dd['pb'] = enc.hex()
+            dd['paid'] = dict(name=pn, v=[float(x) for x in j7val(enc.rjust(c['addr'] + len(enc), b'\0'), c)], src='18.10')
+            dd['note'] = ('перенесено байтами по тому же адресу: раскладка общая, назначение сверено дизасмом 29.10.26 '
+                          '(регулятор ХХ в приращениях: 8A12 × изменение ошибки, 8A22 × ошибка)')
+            transfer.append((c['addr'], enc, c['name'], pn, '18.10'))
+            defs.append(dd)
+            continue
         src = DERIVED.get(c['name']) if c['kind'] == 3 else None
         srcs = [e for e in cte.values() if e['name'] == src and e['kind'] == 'table'] if src else []
         if code is None and len(srcs) == 1:
             pt = paid_table(srcs[0], p27, ptu)
+            if pt['src'] == '28.09':
+                pending.append((dd, pt.get('enc')))
             v = max(pt['v'])
             enc = encode(c, [v])
             dd['paid'] = dict(name=src, text='таблица по ТОЖ %g…%g, в j7es берётся максимум %g' % (min(pt['v']), v, v),
@@ -448,6 +701,8 @@ def main():
             if e['kind'] == 'table':
                 pt = paid_table(e, p27, ptu, c)
                 p.update(v=pt['v'], src=pt['src'])
+                if pt['src'] == '28.09':
+                    pending.append((dd, pt.get('enc')))
                 vals = pt['v']
                 enc = encode(c, vals)
                 js = j7val(jes, c)
@@ -471,10 +726,17 @@ def main():
                 # иначе (платная переложила) — значение выгрузки 28.09 с нашими правками поверх
                 pa, w = c['addr'] + SHIFT, c['w']
                 e28 = encode(c, [e['v0']])
-                if e28 is not None and p27[pa:pa + w] == e28:
+                loc = PAID_CONST_LOC.get(e['name'])
+                if loc and abs(p27[loc[0]] * loc[1] + loc[2] - e['v0']) < 1e-3:
+                    enc, src = encode(c, [ptu[loc[0]] * loc[1] + loc[2]]), '18.10'
+                    claim(loc[0], 1)
+                elif e28 is not None and p27[pa:pa + w] == e28:
                     enc, src = bytes(ptu[pa:pa + w]), '18.10'
+                    claim(pa, w)
                 else:
-                    enc, src = encode(c, [e['v']]), '28.09' + (' + ' + e['patched'][:18] if e.get('patched') else '')
+                    changed = e.get('patched') and e['v'] != e['v0']        # правка после 28.09 с другим значением
+                    enc, src = encode(c, [e['v']]), '28.09' + (' + ' + e['patched'][:18] if changed else '')
+                    pending.append((dd, e28))
                 why = ''
                 if enc is None:
                     why = 'значение %s не ложится в тип j7es — другие единицы' % e.get('text', '')
@@ -530,32 +792,149 @@ def main():
                     dd.pop('pb')
                     dd['note'] = (dd.get('note', '') + '; ' if dd.get('note') else '') + \
                         'блок читает на этом адресе «%s» — эта не используется' % PREFER.get(a, '?')
-    # только в платной
+    # зелёные: перенесено пересчётом (v13.4) или уже совпадает по значению
+    for dd in defs:
+        g = GREEN.get(dd.get('addr')) if dd['kind'] in (1, 2, 3) else None
+        if g:
+            dd.pop('orange', None)
+            dd.pop('blue', None)
+            dd.pop('pb', None)                       # значения не как в платной — сверять байты не с чем
+            dd['green'] = True
+            dd['paid'] = dict(dd.get('paid') or {}, name=g[0], why='')
+            dd['note'] = (dd['note'] + '; ' if dd.get('note') else '') + 'перенесено пересчётом: ' + g[1]
+    # КВТЗ таблицами (наш патч v15.0): C18E по флагу KVTZ_FLAG читает 16×16 обороты × давление или обороты × дроссель
+    # вместо прямой по расходу 9EA4/9EA5/9EA6 — эти три константы из дерева убраны
+    defs[:] = [x for x in defs if not (x.get('addr') in (0x9EA4, 0x9EA5, 0x9EA6) and x['kind'] == 3)]
+    tsect = 'Рабочие режимы › Цикловое наполнение › Расчет наполнения по ДАД › Температура заряда'
+    kvtz_codes = []
+    for tab, pname, like, idx in ((KVTZ_TAB, KVTZ_PAID, 0x9294, 'давлению (F89A)'),
+                                  (KVTZ_TAB_THR, KVTZ_PAID_THR, 0x7CF7, 'дросселю (F98C → квантование 7208)')):
+        kv = next((e for e in cte.values() if e['name'] == pname and e['kind'] == 'table'), None)
+        ax = next((x for x in defs if x.get('addr') == like and x.get('nx') == 16), None)
+        if not (kv and ax):
+            continue
+        pt = paid_table(kv, p27, ptu)
+        enc = bytes(int(round(x * 256)) for x in pt['v'])
+        defs.append(dict(name=pname, sect=tsect, kind=2, addr=tab, ty=0, w=1, div=256.0, mul=1.0, off=0.0, nx=16, nz=16,
+                         off2=0.0, inv=0.0, xax=ax['xax'], zax=ax['zax'], xl=ax['xl'], zl=ax['zl'],
+                         vl='Коэффициент выбора Тзаряда', pb=enc.hex(), paid=dict(name=kv['name'], v=pt['v'], src=pt['src']),
+                         note='наш патч v15.0: Тзаряда = ТОЖ + K·(ТВ − ТОЖ), K — из этой таблицы (интерполяция B00A по '
+                              'оборотам 57h и %s); какая из двух таблиц — флаг «Таблица коэффициента выбора Тзаряда по '
+                              'давлению». В бинах до v15.0 здесь пусто' % idx))
+        kvtz_codes.append(kv['code'])
+    defs.append(dict(name='Флаги КВТЗ (наш патч)', sect=tsect, kind=4, addr=KVTZ_FLAG,
+                     bits=[[KVTZ_FLAG, 0, 'Таблица коэффициента выбора Тзаряда по давлению', 'pair',
+                            'в платной ☑; выключен — таблица по дросселю (v15.0)', 1]]))
+    for i, code in enumerate(kvtz_codes):                    # пара есть — в «только в платной» не показывать
+        m[-1 - i] = code
+    # только в платной — по папкам дерева её программы
+    ptree = {}
+    if os.path.exists(PAID_TREE):
+        for ln in open(PAID_TREE, encoding='utf-8'):
+            if ln.strip() and not ln.startswith('#'):
+                n, k, path = ln.rstrip('\n').split('\t')
+                ptree[(n, int(k))] = path
+    pocc = {}
     usedc = set(m.values())
     for code, e in cte.items():
         if code in usedc or e['name'] in SIX_ANALOGS:           # аналоги есть в нашем патче 6 цилиндров
             continue
-        dd = dict(name=e['name'], sect=PAIDONLY + ' › ' + e['sect'], kind='paid', red=True, addr=0)
+        if e['name'] in BY_ADDR_PAID and e['kind'] == 'table' and e['nx'] == 16:   # перенесена по адресу (BY_ADDR)
+            continue
+        k = pocc.get(e['name'], 0)
+        pocc[e['name']] = k + 1
+        dd = dict(name=e['name'], sect=PAIDONLY + ' › ' + ptree.get((e['name'], k), e['sect']), kind='paid', red=True,
+                  addr=0)
         if e['name'] in STRUCT_PAID and e['kind'] == 'table':                # пара в j7es есть, сама не переносится
-            dd.update(red=False, orange=True, note='пара в j7es есть, но сама не переносится — см. её в дереве j7es')
+            dd.update(red=False, orange=True, note='пара в j7es есть, но перенести нельзя — см. её в дереве j7es')
+        if e['name'] in GREEN_PAID:
+            dd.pop('orange', None)
+            dd.update(red=False, green=True, note='перенесено в j7es пересчётом — см. пару в дереве j7es')
         if e['kind'] == 'table':
             pt = paid_table(e, p27, ptu)
             dd.update(pk=1, nx=e['nx'], nz=e['nz'], v=pt['v'], src=pt['src'])
+            if pt['src'] == '28.09':
+                pending.append((dd, pt.get('enc')))
+            ax = PAID_AX.get((e['name'], e['nx']))
+            if ax:
+                dd.update(xl=ax[0], xa=ax[1], zl=ax[2], za=ax[3])
         else:
             dd.update(pk=0, text=e.get('text', ''), src='28.09')
+            pending.append((dd, None))
+        if e['name'] in ('Функции входов', 'Функции выходов'):
+            names = FN_IN if e['name'] == 'Функции входов' else FN_OUT
+            fn = []
+            for j, mk in enumerate(e.get('text', '').split()):
+                v = int(mk, 16)
+                b = v.bit_length() - 1
+                opts = FN_OPTS.get((e['name'], j + 1))
+                if v in (0, 1):
+                    what = 'нет'
+                elif v & (v - 1):
+                    what = 'несколько вариантов сразу'
+                elif opts and b < len(opts):
+                    what = opts[b]
+                else:
+                    what = FN_SEEN.get((e['name'], j + 1, b), 'вариант № %d (список вариантов не снят)' % b)
+                fn.append([j + 1, names[j] if j < len(names) else '', mk, what])
+            dd['fn'] = fn
         defs.append(dd)
+    # адрес в «Отсечке 3» не найден: если ни на одном необъяснённом изменённом участке её байтов 27.09 нет — после
+    # 27.09 она не менялась и значение выгрузки 28.09 = «Отсечке 3»; иначе — не найдена (жёлтая у пары)
+    regs = unexplained(p27, ptu)
+    nfound = []
+    for dd, enc in pending:
+        p = dd if dd['kind'] == 'paid' else dd.get('paid')
+        if p is None:
+            continue
+        if '+' not in p.get('src', '') and enc is not None and not could_be_there(enc, p27, regs):
+            p['src'] = '18.10, не менялась после 27.09'
+            continue
+        p['src'] = 'выгрузка 28.09 — в «Отсечке 3» адрес не найден'
+        if dd['kind'] != 'paid':
+            nfound.append('%04X %s' % (dd['addr'], dd['name']))
+        if dd['kind'] != 'paid' and not dd.get('green'):
+            dd['orange'] = True
+            dd.pop('pb', None)
+            p['why'] = ('в «Отсечке 3» адрес не найден, а после 27.09 там менялись места, где она может лежать, — '
+                        'значение из выгрузки 28.09 не проверено')
+    print('изменено после 27.09 и ни за кем не закреплено:',
+          ', '.join('%05X–%05X' % (a, b) for a, b in regs) or 'нет')
+    print('пары, у которых значение «Отсечки 3» не найдено:', ', '.join(n for n in nfound) or 'нет')
+    # жёлтые и зелёные: рядом с калибровкой j7es показывать её из платной (своё устройство, только просмотр)
+    paidby = {d['name']: d for d in defs if d['kind'] == 'paid'}
+    for dd in defs:
+        pair = dd['kind'] != 'paid' and (dd.get('orange') or dd.get('green'))
+        p = paidby.get((dd.get('paid') or {}).get('name')) if pair else None
+        q = dd.get('paid') or {}
+        if p and p.get('pk'):
+            dd.update(pv=p['v'], pnx=p['nx'], pnz=p['nz'], psrc=p.get('src'))
+        elif p:
+            dd.update(ptext=p.get('text', ''))
+        elif pair and q.get('v'):                                             # то же устройство, другие единицы
+            dd.update(pv=q['v'], pnx=dd['nx'], pnz=dd['nz'], psrc=q.get('src'))
+        elif pair and q.get('text') not in (None, ''):
+            dd.update(ptext=q['text'], psrc=q.get('src'))
+        if dd.get('pv'):
+            ax = PAID_AX.get((q.get('name'), dd['pnx']))
+            if ax:
+                dd.update(pxl=ax[0], pxa=ax[1], pzl=ax[2], pza=ax[3])
     defs += six_defs(cte)
     # бины
     def ver(p):
         mm = re.match(r'j7es_v(\d+)\.(\d+)_', os.path.basename(p))
         return (int(mm.group(1)), int(mm.group(2))) if mm else (0, 0)
-    vb = sorted((p for p in glob.glob(os.path.join(HERE, 'j7es_v*_*ИИ.bin')) if ver(p) >= (5, 0)), key=ver)
+    vb = sorted((p for p in glob.glob(os.path.join(HERE, 'j7es_v*_*ИИ.bin'))   # 128 КБ (две половины) не берём
+                 if ver(p) >= (5, 0) and os.path.getsize(p) == 0x10000), key=ver)
     bins = {'Сток j7es 0.7.5': J7STOCK}
-    for p in vb:                                          # все сборки; последняя — по умолчанию
+    for p in vb:
         nm = os.path.basename(p)[:-4]
-        if p != vb[-1] and NO_FLASH.get(ver(p)):
+        if NO_FLASH.get(ver(p)):
             nm += ' — НЕ ШИТЬ: ' + NO_FLASH[ver(p)]
         bins[nm] = p
+    best = [k for k in bins if ' — НЕ ШИТЬ' not in k and k != 'Сток j7es 0.7.5']   # по умолчанию (последней) —
+    if best:                                                                      # последняя без «НЕ ШИТЬ»
+        bins[best[-1]] = bins.pop(best[-1])
     emb = {k: base64.b64encode(open(p, 'rb').read()).decode() for k, p in bins.items()}
     html = TEMPLATE.replace('/*DEFS*/', json.dumps(defs, ensure_ascii=False)).replace('/*BINS*/', json.dumps(emb))
     open(OUT, 'w', encoding='utf-8').write(html)
@@ -633,6 +1012,30 @@ def six_defs(cte):
              desc='Номер зуба от первого после пропуска (он 0-й), на котором ВМТ 1-го цилиндра. '
                   'Совпадает ли счёт с платной — проверить стробоскопом (1 зуб = 6°).'),
     ]
+    lim = dict(sect=LIMIT_SECT, blue=True)
+    six += [
+        dict(lim, name='Отсечка по оборотам', addr=0xE7EE, sk='choice', mask=1,
+             opts=[[0, 'топливом (как в стоке)'], [1, 'искрой, топливо идёт']],
+             desc='Что режется выше «Обороты блокировки впрыска» (на Launch — «Обороты блокировки впрыска в режим '
+                  'Launch»). Искрой — бензин без искры уходит в выпуск и там хлопает. Работает с прошивки v9.'),
+        dict(lim, name='Мягкая отсечка до предела', addr=0xE7EE, sk='choice', mask=2,
+             opts=[[0, 'есть (как в стоке)'], [2, 'нет']],
+             desc='Мягкая отсечка стока: за 80 об/мин до предела искра через такт, за 40 — нет искры. «Нет» — до '
+                  'предела искра каждый такт.'),
+        dict(lim, name='Искра на отсечке', addr=0xE7EE, sk='choice', mask=4,
+             opts=[[0, 'режется вся'], [4, 'через такт']],
+             desc='Только при отсечке искрой. Вся — редкие громкие хлопки, обороты прыгают. Через такт — частая '
+                  'очередь, обороты держатся ровно (всегда одна и та же половина цилиндров без искры).'),
+        dict(lim, name='Пауза отсечки', addr=0xE7EC, sk='num', max=25, unit=40, ut='об/мин',
+             desc='Только при отсечке искрой: искра возвращается, когда обороты упали на столько ниже предела. '
+                  'Больше — дольше без искры, хлопок громче и реже. 0 — режет и сразу возвращает.'),
+        dict(lim, name='Страховка по топливу', addr=0xE7ED, sk='num', max=255, unit=40, ut='об/мин выше предела',
+             desc='Только при отсечке искрой: выше предела на столько топливо режется, как в стоке. Предел + '
+                  'страховка — не выше 7500 об/мин.'),
+        dict(lim, name='Угол на отсечке', addr=0xE7EB, sk='num', max=6, unit=6, ut='° позже',
+             desc='Только при отсечке искрой: на сколько зубьев (1 зуб = 6°) позже искра, пока идёт отсечка. '
+                  'Больше — больше огня из трубы и сильнее нагрев выпуска. 0 — без сдвига.'),
+    ]
     return [dict(base, **s) for s in six]
 
 
@@ -640,8 +1043,8 @@ TEMPLATE = r'''<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Калибровки j7es</title>
 <style>
-:root{--bg:#fafafa;--fg:#1d1d1f;--mut:#6b6b70;--line:#dcdce0;--pane:#fff;--sel:#e6efff;--acc:#2f6fe4;--chg:#d9480f;--red:#d0342c;--blue:#1f6fd1;--orange:#c26a00}
-@media (prefers-color-scheme:dark){:root{--bg:#16171a;--fg:#e8e8ea;--mut:#9a9aa3;--line:#2c2e33;--pane:#1d1f23;--sel:#24324d;--acc:#6ea0ff;--chg:#ff8a50;--red:#ff6b6b;--blue:#6aa6ff;--orange:#ffab40}}
+:root{--bg:#fafafa;--fg:#1d1d1f;--mut:#6b6b70;--line:#dcdce0;--pane:#fff;--sel:#e6efff;--acc:#2f6fe4;--chg:#d9480f;--red:#d0342c;--blue:#1f6fd1;--orange:#b58900;--green:#1e8a3c}
+@media (prefers-color-scheme:dark){:root{--bg:#16171a;--fg:#e8e8ea;--mut:#9a9aa3;--line:#2c2e33;--pane:#1d1f23;--sel:#24324d;--acc:#6ea0ff;--chg:#ff8a50;--red:#ff6b6b;--blue:#6aa6ff;--orange:#f0c040;--green:#5fd07a}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;height:100vh;display:flex;flex-direction:column}
 header{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);flex-wrap:wrap}
 header b{font-size:15px;margin-right:8px}select,button,input{font:inherit;color:inherit;background:var(--pane);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
@@ -649,36 +1052,61 @@ button{cursor:pointer}button.on{background:var(--acc);color:#fff;border-color:va
 main{flex:1;display:flex;min-height:0}#tree{width:360px;min-width:220px;border-right:1px solid var(--line);overflow:auto;padding:6px}
 #tree input[type=text]{width:100%;margin-bottom:6px}.sec{font-weight:600;margin:8px 0 2px;cursor:pointer;user-select:none}.sec .cnt{color:var(--mut);font-weight:400}
 .it{padding:3px 6px 3px 14px;border-radius:5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.it:hover{background:var(--sel)}.it.act{background:var(--sel)}
-.it .dot{display:inline-block;width:6px;height:6px;border-radius:3px;background:var(--chg);margin-right:5px;vertical-align:middle}
-.blue{color:var(--blue)}.red{color:var(--red)}.orange{color:var(--orange)}.legend{font-size:12px;color:var(--mut);margin:0 0 6px}
+.it .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--red);margin-right:5px;vertical-align:middle}
+.blue{color:var(--blue)}.red{color:var(--red)}.orange{color:var(--orange)}.green{color:var(--green)}.legend{font-size:12px;color:var(--mut);margin:0 0 6px}
 #view{flex:1;overflow:auto;padding:12px 16px}#meta{color:var(--mut);margin:2px 0 10px}h2{margin:0;font-size:16px}
 table.g{border-collapse:collapse;font-variant-numeric:tabular-nums}table.g td,table.g th{border:1px solid var(--line);padding:2px 5px;text-align:right;min-width:42px}
 table.g th{background:var(--pane);color:var(--mut);font-weight:500;position:sticky;top:0}table.g td.ch{outline:2px solid var(--chg);outline-offset:-2px}
 table.g td input{width:56px;border:none;padding:0;background:transparent;text-align:right}table.g.six td{text-align:center}
-#chart svg{background:var(--pane);border:1px solid var(--line);border-radius:6px}.tools{display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+#chart svg{background:var(--pane);border:1px solid var(--line);border-radius:6px}
+.cmp{display:flex;gap:16px;align-items:flex-start;overflow-x:auto}.cmp>div{flex:1 0 300px;min-width:300px;overflow:auto}.cmp h3{margin:0 0 6px;font-size:14px}.tools{display:flex;gap:6px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
 .hint{color:var(--mut);font-size:12px}.desc{margin:0 0 10px;max-width:760px}.flags label{display:block;padding:2px 0}.flags h3{font-size:13px;margin:10px 0 2px}
 </style></head><body>
 <header><b>Калибровки j7es</b>
-<select id="binsel"></select><button id="open">Открыть бин…</button><input id="file" type="file" accept=".bin" hidden>
-<button id="save">Сохранить бин</button><label class="hint"><input type="checkbox" id="cmp"> Сравнить со стоком j7es</label>
+<button id="open">Выбрать прошивку с диска…</button><input id="file" type="file" accept=".bin" hidden>
+<span class="hint" id="binname">Файл не выбран</span>
+<button id="save" disabled>Сохранить бин</button><button id="savefolder">Папка с прошивками…</button>
+<span class="hint" id="savefoldername">Папка для сохранения не выбрана</span><span class="hint" id="savestatus" role="status" aria-live="polite"></span>
+<label class="hint"><input type="checkbox" id="cmp" checked> Показать исходные значения j7es 0.7.5</label>
+<label class="hint"><input type="checkbox" id="paidcmp" checked> Показать значения платной</label>
+<button id="compareopen">Выбрать прошивку для сравнения с диска…</button><input id="comparefile" type="file" accept=".bin" hidden>
+<span class="hint" id="comparefilename">Для сравнения файл не выбран</span><button id="compareclear" disabled>Убрать сравнение</button>
+<label class="hint" id="comparetoggle" hidden><input type="checkbox" id="comparevalues" checked> Показать значения сравниваемой</label>
 <span class="hint" id="stat"></span></header>
-<main><div id="tree"><input id="q" type="text" placeholder="Поиск по названию">
-<div class="legend"><span class="blue">синим</span> — нет в платной · <span class="red">красным</span> — нет в j7es (только просмотр) · <span class="orange">оранжевым</span> — пара есть, но сама не переносится</div><div id="list"></div></div>
+<main><div id="tree"><input id="q" type="text" placeholder="Поиск по названию калибровки или папки">
+<label class="hint"><input type="checkbox" id="diffonly"> Только отличительные</label>
+<div class="legend">чёрным — перенесено из платной как есть · <span class="green">зелёным</span> — устройство разное, измерения те же, перенесено пересчётом · <span class="orange">жёлтым</span> — пара есть, перенести нельзя · <span class="red">красным</span> — только в платной · <span class="blue">синим</span> — только в j7es · ≠ — в этом бине не как в платной</div><div id="list"></div></div>
 <div id="view"><div class="hint">Выберите калибровку слева.</div></div></main>
 <script>
 const DEFS=/*DEFS*/;const BINS=/*BINS*/;
 const b64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
-const STOCK=b64(BINS['Сток j7es 0.7.5']);let cur=null,curName='',sel=null,mode='table',cmpOn=false,paidOn=false;
+const STOCK=b64(BINS['Сток j7es 0.7.5']);let cur=null,curName='',sel=null,mode='table',cmpOn=true,paidOn=true;
+let saveDirectory=null,saving=false;
+let compareBin=null,compareName='',compareOn=true,onlyDifferences=false;
 const hex4=a=>a.toString(16).toUpperCase().padStart(4,'0');
-const binsel=document.getElementById('binsel');
-for(const k of Object.keys(BINS)){const o=document.createElement('option');o.value=k;o.textContent=k;binsel.appendChild(o)}
-binsel.value=Object.keys(BINS).slice(-1)[0];
-function loadEmb(){cur=b64(BINS[binsel.value]).slice();curName=binsel.value+'.bin';refresh()}
-binsel.onchange=loadEmb;
+async function readFirmware(file){const bytes=new Uint8Array(await file.arrayBuffer());
+ if(bytes.length===65536)return {data:bytes,copies:1};
+ if(bytes.length===131072){const half=bytes.slice(0,65536);
+  if(half.every((value,index)=>value===bytes[index+65536]))return {data:half,copies:2};
+  alert('У прошивки 128 КБ разные половины. Выберите файл 64 КБ.');return null}
+ alert('Нужна прошивка 64 КБ или 128 КБ с двумя одинаковыми половинами.');return null}
+function setComparison(data,name){compareBin=data;compareName=name;document.getElementById('comparetoggle').hidden=!data;
+ document.getElementById('comparefilename').textContent=name||'Для сравнения файл не выбран';document.getElementById('compareclear').disabled=!data;refresh()}
+document.getElementById('compareclear').onclick=()=>setComparison(null,'');
+document.getElementById('comparevalues').onchange=e=>{compareOn=e.target.checked;refresh()};
+document.getElementById('compareopen').onclick=()=>document.getElementById('comparefile').click();
+document.getElementById('comparefile').onchange=async e=>{const f=e.target.files[0];if(!f)return;
+ try{const firmware=await readFirmware(f);if(firmware)setComparison(firmware.data,f.name);
+ }catch(error){console.error(error);alert('Не удалось открыть прошивку для сравнения. Попробуйте ещё раз.')}
+ finally{e.target.value=''}};
 document.getElementById('cmp').onchange=e=>{cmpOn=e.target.checked;refresh()};
+document.getElementById('paidcmp').onchange=e=>{paidOn=e.target.checked;refresh()};
+document.getElementById('diffonly').onchange=e=>{onlyDifferences=e.target.checked;refresh()};
 document.getElementById('open').onclick=()=>document.getElementById('file').click();
-document.getElementById('file').onchange=e=>{const f=e.target.files[0];if(!f)return;f.arrayBuffer().then(b=>{const u=new Uint8Array(b);
- if(u.length!==65536){alert('Это не бин j7es: нужен файл 64 КБ.');return}cur=u;curName=f.name;refresh()})};
+document.getElementById('file').onchange=async e=>{const f=e.target.files[0];if(!f)return;
+ try{const firmware=await readFirmware(f);if(!firmware)return;cur=firmware.data;curName=f.name;document.getElementById('binname').textContent=f.name;document.getElementById('savestatus').textContent='';refresh()}
+ catch(error){console.error(error);alert('Не удалось открыть прошивку. Попробуйте ещё раз.')}
+ finally{e.target.value=''}};
 function hasPatch(d){for(let i=0xE800;i<0xE810;i++)if(d[i])return true;return false}
 function rraw(d,a,ty){let v=ty>=2?d[a]|d[a+1]<<8:d[a];if(ty===1&&v>127)v-=256;if(ty===3&&v>32767)v-=65536;return v}
 function wraw(d,a,ty,v){const w=ty>=2?2:1,s=ty===1||ty===3,lo=s?(w===1?-128:-32768):0,hi=s?(w===1?127:32767):(w===1?255:65535);
@@ -692,35 +1120,69 @@ function stp(t){if(t.inv&&t.addr!==undefined&&cur){const r=rraw(cur,t.addr,t.ty)
 function fmt(v,s){const dg=s>=1?0:s>=0.1?1:s>=0.01?2:s>=0.001?3:4;return (+v).toFixed(dg)}
 function nbytes(t){if(t.kind===4){const s=new Set(t.bits.map(b=>b[0]));return [...s]}const a=[];if(t.kind==='paid'||!t.w)return a;
  for(let i=0;i<t.nx*t.nz*t.w;i++)a.push(t.addr+i);return a}
-function changed(t){if(!cmpOn)return false;for(const a of nbytes(t))if(cur[a]!==STOCK[a])return true;return false}
+function differsFrom(t,data){if(t.kind==='paid')return false;
+ const currentExists=availableIn(t,cur),referenceExists=availableIn(t,data);
+ if(currentExists!==referenceExists)return true;if(!currentExists)return false;
+ if(t.kind===4)return t.bits.some(([a,b])=>(cur[a]>>b&1)!==(data[a]>>b&1));
+ if(t.kind==='six'){
+  if(t.sk==='choice')return (cur[t.addr]&t.mask)!==(data[t.addr]&t.mask);
+  const count=t.sk==='grid'?6:1,mask=t.sk==='grid'&&t.multi?0x3F:0xFF;
+  for(let i=0;i<count;i++)if((cur[t.addr+i]&mask)!==(data[t.addr+i]&mask))return true;return false}
+ for(const a of nbytes(t))if(cur[a]!==data[a])return true;
+ for(const [ax,n] of [[t.xax,t.nx],[t.zax,t.nz]])if(ax){const a=axis(ax,n,cur),b=axis(ax,n,data);if(a.some((v,i)=>v!==b[i]))return true}
+ return false}
+function numericEqual(a,b){return Object.is(a,b)||Number.isFinite(a)&&Number.isFinite(b)&&Math.abs(a-b)<=Math.max(0.000001,Math.max(Math.abs(a),Math.abs(b))*0.0000001)}
+function paidDiffers(t){if(t.kind==='paid'||t.red)return true;if(!availableIn(t,cur))return false;
+ if(t.kind===4)return mism(t);
+ if(t.pb)return mism(t);
+ const values=t.pv||(t.paid&&t.paid.v);
+ if(values){if(values.length!==t.nx*t.nz)return true;return values.some((v,i)=>!numericEqual(val(cur,t,i),v))}
+ const text=t.ptext!==undefined?t.ptext:t.paid&&t.paid.text;
+ if(text!==undefined&&text!==null&&String(text).trim()!==''){const value=Number(String(text).trim().replace(',','.'));
+  if(!Number.isNaN(value)&&t.nx*t.nz===1)return !numericEqual(val(cur,t,0),value)}
+ return !!t.blue&&!t.paid&&!t.analog}
+function differenceSources(t){if(!cur)return [];const sources=[];
+ if(cmpOn&&differsFrom(t,STOCK))sources.push('исходная j7es 0.7.5');
+ if(paidOn&&paidDiffers(t))sources.push('платная');
+ if(comparing()&&differsFrom(t,compareBin))sources.push('сравниваемая: '+compareName);
+ return sources}
+function changed(t){return differenceSources(t).length>0}
 // оси: по калибровкам текущего бина
 function u16(d,a){return d[a]|d[a+1]<<8}
-function axis(ax,n){if(!ax)return Array.from({length:n},(_,i)=>i+1);
+function axis(ax,n,data=cur){if(!ax)return Array.from({length:n},(_,i)=>i+1);
  if(ax.kind==='lin')return Array.from({length:n},(_,i)=>+(ax.a+(ax.b-ax.a)*i/Math.max(1,n-1)).toFixed(2));
  const st=256/n;
- if(ax.kind==='mm'){const mn=u16(cur,ax.min)/ax.dmin,B=cur[ax.rng],pc=B?2048/(B*ax.dmin):0;return Array.from({length:n},(_,k)=>+(mn+k*st*pc).toFixed(1))}
+ if(ax.kind==='mm'){const mn=u16(data,ax.min)/ax.dmin,B=data[ax.rng],pc=B?2048/(B*ax.dmin):0;return Array.from({length:n},(_,k)=>+(mn+k*st*pc).toFixed(1))}
  const out=[];for(let k=0;k<n;k++){const tg=k*st;let x=null;
-  for(let i=0;i<ax.len;i++){const c=cur[ax.tab+i];if(c>tg||(c===tg&&tg>0)){if(i===0)x=0;else{const c0=cur[ax.tab+i-1];x=i-1+(c>c0?(tg-c0)/(c-c0):0)}break}}
+  for(let i=0;i<ax.len;i++){const c=data[ax.tab+i];if(c>tg||(c===tg&&tg>0)){if(i===0)x=0;else{const c0=data[ax.tab+i-1];x=i-1+(c>c0?(tg-c0)/(c-c0):0)}break}}
   out.push(x===null?'>'+(ax.len-1)*ax.xstep:Math.round(x*ax.xstep))}return out}
 // не совпадает с платной в открытом бине: байты переноса другие или флаг стоит иначе
 function bitOn(a,b){return cur[a]>>b&1}
 function mism(t){if(t.pb){for(let i=0;i<t.pb.length/2;i++)if(cur[t.addr+i]!==parseInt(t.pb.substr(2*i,2),16))return true;return false}
  if(t.kind===4)return t.bits.some(x=>x[5]!==null&&x[5]!==undefined&&bitOn(x[0],x[1])!==x[5]);return false}
-function cls(t){return t.red?' red':(t.orange||mism(t))?' orange':t.blue?' blue':''}
-function buildTree(){const q=document.getElementById('q').value.toLowerCase();const L=document.getElementById('list');L.innerHTML='';
- const by={},order=[];DEFS.forEach((t,i)=>{if(q&&!t.name.toLowerCase().includes(q))return;if(!by[t.sect]){by[t.sect]=[];order.push(t.sect)}by[t.sect].push(i)});
+function cls(t){return t.red?' red':t.green?' green':t.orange?' orange':t.blue?' blue':''}
+function buildTree(){const q=document.getElementById('q').value.trim().toLowerCase();const L=document.getElementById('list');L.innerHTML='';
+ const by={},order=[],differences=new Map(),visible=new Set();DEFS.forEach((t,i)=>{if(q&&!t.name.toLowerCase().includes(q)&&!t.sect.toLowerCase().includes(q))return;
+  const sources=differenceSources(t);if(onlyDifferences&&!sources.length)return;differences.set(i,sources);visible.add(i);
+  if(!by[t.sect]){by[t.sect]=[];order.push(t.sect)}by[t.sect].push(i)});
+ if(sel!==null&&!visible.has(sel)){sel=null;document.getElementById('view').innerHTML='<p class="hint">Выберите калибровку слева.</p>'}
+ if(!visible.size){L.textContent=onlyDifferences?'Отличий по включённым сравнениям нет.':'Калибровки не найдены.';return}
  for(const s of order){const h=document.createElement('div');h.className='sec';h.innerHTML=s+' <span class="cnt">'+by[s].length+'</span>';L.appendChild(h);
   const box=document.createElement('div');L.appendChild(box);h.onclick=()=>box.hidden=!box.hidden;
-  for(const i of by[s]){const t=DEFS[i],e=document.createElement('div');e.className='it'+(i===sel?' act':'')+cls(t);e.title=t.name;
-   e.innerHTML=(changed(t)?'<span class="dot"></span>':'')+t.name;e.onclick=()=>{sel=i;buildTree();show()};box.appendChild(e)}}}
-document.getElementById('q').oninput=buildTree;
-function refresh(){buildTree();if(sel!==null)show();let n=0;DEFS.forEach(t=>{if(changed(t))n++});document.getElementById('stat').textContent=curName+(cmpOn?' · отличается от стока j7es: '+n+' калибровок':'')}
+  for(const i of by[s]){const t=DEFS[i],sources=differences.get(i),e=document.createElement('div');e.className='it'+(i===sel?' act':'')+cls(t);
+   e.title=t.name+(sources.length?' · Отличается: '+sources.join('; '):'');
+   e.innerHTML=(sources.length?'<span class="dot"></span>':'')+(paidOn&&mism(t)?'≠ ':'')+t.name;e.onclick=()=>{sel=i;buildTree();show()};box.appendChild(e)}}}
+document.getElementById('q').oninput=()=>{if(cur)buildTree()};
+function refresh(){document.getElementById('save').disabled=!cur||saving;
+ if(!cur){document.getElementById('list').innerHTML='';document.getElementById('stat').textContent='';document.getElementById('view').innerHTML='<p class="hint">Выберите прошивку с диска, чтобы открыть калибровки.</p>';return}
+ buildTree();if(sel!==null)show();let n=0;DEFS.forEach(t=>{if(changed(t))n++});document.getElementById('stat').textContent=curName+((cmpOn||paidOn||comparing())?' · отличаются по включённым сравнениям: '+n+' калибровок':'')}
 function head(t,extra){let m=t.sect+(t.addr?' · адрес '+hex4(t.addr):'');
  if(t.kind===1||t.kind===2)m+=' · '+(t.nz>1?t.nx+'×'+t.nz:t.nx+' точек')+' · '+(t.ty>=2?16:8)+' бит'+(t.ty===1||t.ty===3?' со знаком':'');
- if(t.blue)m+=' · <span class="blue">нет в платной</span>';if(t.red)m+=' · <span class="red">нет в j7es</span>';if(t.orange)m+=' · <span class="orange">пара есть, сама не переносится</span>';
- if(!t.orange&&mism(t))m+=' · <span class="orange">в этом бине не как в платной</span>';
- if(t.paid)m+='<br>В платной: «'+t.paid.name+'»'+(t.paid.text!==undefined&&t.paid.text!==''?' = '+t.paid.text:'')+(t.paid.src?' (значение '+t.paid.src+')':(t.paid.text?' (выгрузка 28.09)':''))+(t.paid.why?' · <span class="orange">не переносится: '+t.paid.why+'</span>':'');
- if(t.analog)m+='<br>В платной (настройка 28.09): '+t.analog;if(t.note)m+='<br>'+t.note;
+ if(t.blue)m+=' · <span class="blue">нет в платной</span>';if(t.red)m+=' · <span class="red">нет в j7es</span>';if(t.orange)m+=' · <span class="orange">пара есть, перенести нельзя</span>';
+ if(t.green)m+=' · <span class="green">перенесено пересчётом</span>';
+ if(!t.orange&&mism(t))m+=' · ≠ в этом бине не как в платной';
+ if(paidOn&&t.paid)m+='<br>В платной: «'+t.paid.name+'»'+(t.paid.text!==undefined&&t.paid.text!==''?' = '+t.paid.text:'')+(t.paid.src?' (значение '+t.paid.src+')':(t.paid.text?' (выгрузка 28.09)':''))+(t.paid.why?' · <span class="orange">не переносится: '+t.paid.why+'</span>':'');
+ if(paidOn&&t.analog)m+='<br>В платной (настройка 28.09): '+t.analog;if(t.note)m+='<br>'+t.note;
  return '<h2 class="'+cls(t)+'">'+t.name+'</h2><div id="meta">'+m+(extra||'')+'</div>'+(t.desc?'<p class="desc">'+t.desc+'</p>':'')}
 function show(){const t=DEFS[sel],V=document.getElementById('view');
  if(t.kind==='six'){if(!hasPatch(cur)){V.innerHTML=head(t)+'<p class="desc red">В этом бине нет патча 6 цилиндров.</p>';return}return sixView(V,t)}
@@ -730,12 +1192,44 @@ function show(){const t=DEFS[sel],V=document.getElementById('view');
  const ax=axis(t.xax,t.nx),az=axis(t.zax,t.nz);
  V.innerHTML=head(t,(t.xl?'<br>X: '+t.xl:'')+(t.nz>1&&t.zl?' · Z: '+t.zl:'')+(t.vl?' · значение: '+t.vl:''))+
  '<div class="tools"><button id="mt" class="'+(mode==='table'?'on':'')+'">Таблица</button><button id="mc" class="'+(mode==='chart'?'on':'')+'">График</button>'+
- (t.paid&&t.paid.v?'<label class="hint"><input type="checkbox" id="pp"'+(paidOn?' checked':'')+'> Показать твою из платной</label>':'')+
  '<span class="hint">Двойной клик по клетке — правка.'+(cmpOn?' Рамкой — отличие от стока j7es.':'')+'</span></div><div id="body"></div>';
  document.getElementById('mt').onclick=()=>{mode='table';show()};document.getElementById('mc').onclick=()=>{mode='chart';show()};
- const pp=document.getElementById('pp');if(pp)pp.onchange=e=>{paidOn=e.target.checked;show()};
- const get=(paidOn&&t.paid&&t.paid.v)?(i=>t.paid.v[i]):(i=>val(cur,t,i));
- const B=document.getElementById('body');if(mode==='table'||t.nx*t.nz===1)tableView(B,t,ax,az,get,!(paidOn&&t.paid&&t.paid.v));else chartView(B,t,ax,az,get)}
+ const get=i=>val(cur,t,i),hasPaid=paidOn&&(t.pv||t.ptext!==undefined||(t.paid&&t.paid.v));
+ document.getElementById('body').outerHTML='<div class="cmp"><div><h3>Текущее</h3><div id="body"></div></div>'+
+  (cmpOn?'<div><h3>Исходное — j7es 0.7.5</h3><div id="stockbody"></div></div>':'')+
+  (hasPaid?'<div><h3>Платная'+(t.psrc?' ('+t.psrc+')':'')+'</h3><div id="pbody"></div></div>':'')+comparisonColumn()+'</div>';
+ const B=document.getElementById('body');if(mode==='table'||t.nx*t.nz===1)tableView(B,t,ax,az,get,true);else chartView(B,t,ax,az,get);
+ if(cmpOn){const SB=document.getElementById('stockbody');
+  if([0x4D00,0x4E00].includes(t.addr)){SB.innerHTML='<p class="hint">В исходной прошивке этой таблицы нет.</p>'}
+  else{const sx=axis(t.xax,t.nx,STOCK),sz=axis(t.zax,t.nz,STOCK),sg=i=>val(STOCK,t,i);
+   if(mode==='table'||t.nx*t.nz===1)tableView(SB,t,sx,sz,sg,false);else chartView(SB,t,sx,sz,sg)}}
+ renderComparison(t);
+ const PB=document.getElementById('pbody');if(!PB)return;
+ if(!t.pv&&t.ptext===undefined&&t.paid&&t.paid.v){
+  if(mode==='table'||t.nx*t.nz===1)tableView(PB,t,ax,az,i=>t.paid.v[i],false);else chartView(PB,t,ax,az,i=>t.paid.v[i]);return}
+ if(!t.pv){PB.innerHTML='<p>Значение: <b>'+t.ptext+'</b></p>';return}
+ const pt=paidT(t),pg=i=>t.pv[i],px=t.pxa||num(t.pnx),pz=t.pza||num(t.pnz);
+ PB.insertAdjacentHTML('beforebegin','<div class="hint">X: '+pt.xl+(t.pnz>1?' · Z: '+pt.zl:'')+'</div>');
+ if(mode==='table'||t.pnx*t.pnz===1)tableView(PB,pt,px,pz,pg,false);else chartView(PB,pt,px,pz,pg)}
+function comparing(){return compareOn&&compareBin!==null}
+function comparisonColumn(){return comparing()?'<div><h3>Сравниваемая</h3><div id="comparename" class="hint"></div><div id="comparebody"></div></div>':''}
+function availableIn(t,data){if(t.kind==='six')return hasPatch(data);
+ if([0x4D00,0x4E00,0x4F00].includes(t.addr))return data[0xC18E]===0x90&&data[0xC18F]===0x4F&&data[0xC190]===0;return true}
+function renderComparison(t){if(!comparing())return;const body=document.getElementById('comparebody');if(!body)return;
+ document.getElementById('comparename').textContent=compareName;
+ if(!availableIn(t,compareBin)){body.innerHTML='<p class="hint">В сравниваемой прошивке этой настройки нет.</p>';return}
+ if(t.kind===3){const row=document.createElement('p'),input=document.createElement('input');input.disabled=true;input.style.width='120px';input.value=fmt(val(compareBin,t,0),stp(t));row.appendChild(input);row.appendChild(document.createTextNode(' '+(t.unit||'')));body.appendChild(row);return}
+ if(t.kind==='six'){
+  if(t.sk!=='grid'){const input=document.createElement('input');input.disabled=true;input.style.width='180px';
+   input.value=t.sk==='choice'?(t.opts.find(o=>o[0]===(compareBin[t.addr]&t.mask))||['','Неизвестное значение'])[1]:compareBin[t.addr];body.appendChild(input);return}
+  let h='<table class="g six"><tr><th>цилиндр</th>'+t.cols.map(c=>'<th>'+c+'</th>').join('')+'</tr>';
+  for(let row=0;row<6;row++){h+='<tr><th>'+(row+1)+'</th>';for(let col=0;col<6;col++){
+   const value=compareBin[t.addr+row],on=t.multi?(value>>col&1)===1:value===col;h+='<td><input type="checkbox" disabled'+(on?' checked':'')+'></td>'}h+='</tr>'}body.innerHTML=h+'</table>';return}
+ const ax=axis(t.xax,t.nx,compareBin),az=axis(t.zax,t.nz,compareBin),get=i=>val(compareBin,t,i);
+ if(mode==='table'||t.nx*t.nz===1)tableView(body,t,ax,az,get,false);else chartView(body,t,ax,az,get)}
+// платная сторона: оси из программы платной, если сняты; иначе — номера точек
+function num(n){return Array.from({length:n},(_,i)=>i+1)}
+function paidT(t){return {kind:'paid',nx:t.pnx,nz:t.pnz,xl:t.pxl||'номер точки платной (ось не снята)',zl:t.pnz>1?(t.pzl||'номер строки платной (ось не снята)'):''}}
 function color(v,lo,hi){if(hi===lo)return '';const p=(v-lo)/(hi-lo);return 'background:hsla('+(240-240*p)+',70%,55%,.28)'}
 function tableView(B,t,ax,az,get,edt){let lo=Infinity,hi=-Infinity;const n=t.nx*t.nz;for(let i=0;i<n;i++){const v=get(i);lo=Math.min(lo,v);hi=Math.max(hi,v)}
  const s=t.kind==='paid'?0.001:stp(t);
@@ -756,11 +1250,23 @@ function chartView(B,t,ax,az,get){const W=Math.min(1100,B.clientWidth-10)||900,H
  for(let z=0;z<t.nz;z++){let d='';for(let x=0;x<t.nx;x++)d+=(x?'L':'M')+X(x).toFixed(1)+' '+Y(get(z*t.nx+x)).toFixed(1);
   g+='<path d="'+d+'" fill="none" stroke="hsl('+(t.nz>1?240-240*z/(t.nz-1):220)+',70%,50%)" stroke-width="1.6"><title>Z = '+az[z]+'</title></path>'}
  B.innerHTML='<div id="chart">'+g+'</svg></div><div class="hint">'+(t.nz>1?'Линия на каждое значение Z'+(t.zl?' ('+t.zl+')':'')+': синяя — нижнее, красная — верхнее.':'')+' По X: '+(t.xl||'номер точки')+'.</div>'}
-function constView(V,t){const v=val(cur,t,0);V.innerHTML=head(t)+'<p><input id="cv" value="'+fmt(v,stp(t))+'" style="width:120px"> '+(t.unit||'')+
- (cmpOn?' <span class="hint">сток j7es: '+fmt(val(STOCK,t,0),stp(t))+'</span>':'')+'</p><p class="hint">Enter — записать. Шаг '+fmt(stp(t),stp(t)/10)+'.</p>';
- const inp=document.getElementById('cv');inp.onkeydown=e=>{if(e.key!=='Enter')return;const x=parseFloat(inp.value.replace(',','.'));if(isNaN(x)){alert('Нужно число');return}put(t,0,x);refresh()}}
+function constView(V,t){const v=val(cur,t,0),hasPaid=paidOn&&(t.pv||t.ptext!==undefined||(t.paid&&(t.paid.text!==undefined||t.paid.v)));
+ V.innerHTML=head(t)+'<div class="cmp"><div><h3>Текущее</h3><p><input id="cv" value="'+fmt(v,stp(t))+'" style="width:120px"> '+(t.unit||'')+
+ '</p><p class="hint">Enter — записать. Шаг '+fmt(stp(t),stp(t)/10)+'.</p></div>'+
+ (cmpOn?'<div><h3>Исходное — j7es 0.7.5</h3><p><input disabled value="'+fmt(val(STOCK,t,0),stp(t))+'" style="width:120px"> '+(t.unit||'')+'</p></div>':'')+
+ (hasPaid?'<div><h3>Платная'+(t.psrc?' ('+t.psrc+')':'')+'</h3><div id="pbody"></div></div>':'')+comparisonColumn()+'</div>';
+ const inp=document.getElementById('cv');inp.onkeydown=e=>{if(e.key!=='Enter')return;const x=parseFloat(inp.value.replace(',','.'));if(isNaN(x)){alert('Нужно число');return}put(t,0,x);refresh()};
+ renderComparison(t);
+ if(!hasPaid)return;
+ const PB=document.getElementById('pbody');
+ const referenceInput=value=>{const row=document.createElement('p'),field=document.createElement('input');field.disabled=true;field.value=value;field.style.width='120px';row.appendChild(field);row.appendChild(document.createTextNode(' '+(t.unit||'')));PB.appendChild(row)};
+ if(!t.pv&&t.ptext===undefined){referenceInput(t.paid.text!==undefined?t.paid.text:t.paid.v.join(', '));return}
+ if(!t.pv){referenceInput(t.ptext);return}
+ if(t.pv.length===1){referenceInput(t.pv[0]);return}
+ const pt=paidT(t);PB.innerHTML='<div class="hint">X: '+pt.xl+(t.pnz>1?' · Z: '+pt.zl:'')+'</div><div id="pt"></div>';
+ tableView(document.getElementById('pt'),pt,t.pxa||num(t.pnx),t.pza||num(t.pnz),i=>t.pv[i],false)}
 function flagsView(V,t){const hx=v=>v.toString(16).toUpperCase().padStart(2,'0')+'h';let h=head(t);
- if(t.paid&&t.paid.bytes)h+='<p class="desc">Байты «'+t.paid.name+'» в платной (выгрузка 28.09, названий битов нет): '+
+ if(paidOn&&t.paid&&t.paid.bytes)h+='<p class="desc">Байты «'+t.paid.name+'» в платной (выгрузка 28.09, названий битов нет): '+
   t.paid.bytes.map((v,i)=>(i+1)+'-й = '+hx(v)).join(', ')+'.</p>';
  h+='<div class="flags">';let last=-1;
  t.bits.forEach(([a,b,nm,st,why,want],k)=>{if(a!==last){h+='<h3>Байт '+hex4(a)+' = '+hx(cur[a])+(cmpOn?' <span class="hint">(сток '+hx(STOCK[a])+')</span>':'')+'</h3>';last=a}
@@ -768,29 +1274,80 @@ function flagsView(V,t){const hx=v=>v.toString(16).toUpperCase().padStart(2,'0')
   const c=st==='blue'?'blue':(st==='orange'||diff)?'orange':'';
   let txt=why||'';if(known&&st!=='orange')txt+=' → нужно '+(want?'вкл':'выкл')+(diff?' · в этом бине '+(on?'вкл':'выкл'):' · совпадает');
   h+='<label class="'+c+'"><input type="checkbox" data-k="'+k+'"'+(on?' checked':'')+'> бит '+b+' — '+nm+
-   (txt&&(t.paid||st!=='blue')?' <span class="hint">· '+txt+'</span>':'')+'</label>'});
+   (cmpOn?'<span class="hint"> · '+(a===0x4F00?'В исходной прошивке этой настройки нет.':'Исходное значение j7es 0.7.5: '+(STOCK[a]>>b&1?'вкл':'выкл'))+'</span>':'')+
+   (comparing()?'<span class="hint"> · Сравниваемая: '+(availableIn(t,compareBin)?'<input type="checkbox" disabled'+(compareBin[a]>>b&1?' checked':'')+'>':'этой настройки нет')+'</span>':'')+
+   (paidOn&&txt&&(t.paid||st!=='blue')?' <span class="hint">· '+txt+'</span>':'')+'</label>'});
  V.innerHTML=h+'</div>';V.querySelectorAll('input[data-k]').forEach(i=>i.onchange=()=>{const [a,b]=t.bits[+i.dataset.k];cur[a]=i.checked?cur[a]|1<<b:cur[a]&~(1<<b);refresh()})}
-function paidView(V,t){if(!t.pk){V.innerHTML=head(t)+'<p>Значение в платной (настройка 28.09): <b>'+t.text+'</b></p>';return}
- V.innerHTML=head(t,'<br>Значения из платной ('+t.src+'), только просмотр')+'<div id="body"></div>';
- const B=document.getElementById('body'),f=i=>t.v[i];tableView(B,t,Array.from({length:t.nx},(_,i)=>i+1),Array.from({length:t.nz},(_,i)=>i+1),f,false)}
-function sixView(V,t){let h=head(t);
+function paidView(V,t){if(!paidOn){V.innerHTML=head(t)+'<p class="hint">Значения платной скрыты.</p>';return}if(t.fn){V.innerHTML=head(t)+'<p class="desc">Настройка 28.09. Название функции — по порядку списка в программе платной (видео 29.10.26). Пин расшифрован там, где список вариантов сверен с видео.</p>'+
+  '<table class="g"><tr><th>F</th><th style="text-align:left">функция</th><th>маска</th><th style="text-align:left">выбрано</th></tr>'+
+  t.fn.map(([k,n,mk,w])=>'<tr><th>'+k+'</th><td style="text-align:left">'+(n||'<span class="hint">нет на видео</span>')+'</td><td>'+mk+'</td><td style="text-align:left">'+(w==='нет'?'<span class="hint">нет</span>':'<b>'+w+'</b>')+'</td></tr>').join('')+'</table>';return}
+ if(!t.pk){V.innerHTML=head(t)+'<p>Значение в платной (настройка 28.09): <b>'+t.text+'</b></p>';return}
+ V.innerHTML=head(t,'<br>Значения из платной ('+t.src+'), только просмотр<br>X: '+(t.xl||'номер точки (ось не снята)')+(t.nz>1?' · Z: '+(t.zl||'номер строки (ось не снята)'):''))+'<div id="body"></div>';
+ const B=document.getElementById('body'),f=i=>t.v[i];tableView(B,t,t.xa||num(t.nx),t.za||num(t.nz),f,false)}
+function sixView(V,t){let h='<div class="cmp"><div><h3>Текущее</h3>';
  if(t.sk==='choice'){const v=cur[t.addr]&t.mask;h+='<select id="ch">'+t.opts.map(o=>'<option value="'+o[0]+'"'+(o[0]===v?' selected':'')+'>'+o[1]+'</option>').join('')+'</select>'}
- else if(t.sk==='num'){h+='<p><input id="cv" value="'+cur[t.addr]+'" style="width:80px"> <span class="hint">Enter — записать</span></p>'}
+ else if(t.sk==='num'){h+='<p><input id="cv" value="'+cur[t.addr]+'" style="width:80px">'+(t.unit?' = <b>'+cur[t.addr]*t.unit+' '+t.ut+'</b>':'')+' <span class="hint">Enter — записать</span></p>'}
  else{h+='<table class="g six"><tr><th>цилиндр</th>'+t.cols.map(c=>'<th>'+c+'</th>').join('')+'</tr>';
   for(let r=0;r<6;r++){const v=cur[t.addr+r];let row='',any=false;
    for(let c=0;c<6;c++){const on=t.multi?(v>>c&1)===1:v===c;any=any||on;row+='<td><input type="'+(t.multi?'checkbox':'radio')+'" name="r'+r+'" data-r="'+r+'" data-c="'+c+'"'+(on?' checked':'')+'></td>'}
    h+='<tr><th'+(any?'':' class="red" title="у цилиндра нет выхода"')+'>'+(r+1)+'</th>'+row+'</tr>'}h+='</table>'}
- V.innerHTML=h;
+ V.innerHTML=head(t)+h+'</div>'+comparisonColumn()+'</div>';renderComparison(t);
  if(t.sk==='choice')document.getElementById('ch').onchange=e=>{cur[t.addr]=(cur[t.addr]&~t.mask)|+e.target.value;refresh()};
- else if(t.sk==='num'){const inp=document.getElementById('cv');inp.onkeydown=e=>{if(e.key!=='Enter')return;const x=parseInt(inp.value,10);if(isNaN(x)||x<0||x>59){alert('Нужно число 0…59');return}cur[t.addr]=x;refresh()}}
+ else if(t.sk==='num'){const inp=document.getElementById('cv');inp.onkeydown=e=>{if(e.key!=='Enter')return;const x=parseInt(inp.value,10),mx=t.max===undefined?59:t.max;if(isNaN(x)||x<0||x>mx){alert('Нужно число 0…'+mx);return}cur[t.addr]=x;refresh()}}
  else V.querySelectorAll('input[data-r]').forEach(i=>i.onchange=()=>{const a=t.addr+ +i.dataset.r,c=+i.dataset.c;if(t.multi)cur[a]=i.checked?cur[a]|1<<c:cur[a]&~(1<<c);else cur[a]=c;refresh()})}
 function fixsum(d){d[0xFFF8]=d[0xFFF9]=0;let s0=0;for(let i=0;i<0xFFFE;i++)s0+=d[i];s0&=0xFFFF;let c=-1;
  for(let hi=0;hi<256;hi++){const cc=(255*hi-s0)&0xFFFF;if(cc<=510){c=cc;break}}if(c<0){alert('Не удалось подобрать контрольную сумму');return false}
  d[0xFFF8]=Math.min(c,255);d[0xFFF9]=c-Math.min(c,255);let s1=0;for(let i=0;i<0xFFFE;i++)s1+=d[i];
  for(let v=0;v<65536;v++)if(((s1+(v&255)+(v>>8))&0xFFFF)===v){d[0xFFFE]=v&255;d[0xFFFF]=v>>8;return true}alert('Не удалось подобрать контрольную сумму');return false}
-document.getElementById('save').onclick=()=>{const d=cur.slice();if(!fixsum(d))return;const a=document.createElement('a');
- a.href=URL.createObjectURL(new Blob([d],{type:'application/octet-stream'}));a.download=curName.replace(/\.bin$/,'')+' правка.bin';a.click()};
-loadEmb();
+function setSaveBusy(busy){saving=busy;document.getElementById('save').disabled=busy||!cur;document.getElementById('savefolder').disabled=busy}
+async function chooseSaveFolder(){
+ if(typeof window.showDirectoryPicker!=='function'){alert('Для сохранения двух BIN в выбранную папку откройте редактор в Google Chrome или Microsoft Edge.');return null}
+ try{const directory=await window.showDirectoryPicker({id:'j7es-firmware',mode:'readwrite'});
+  saveDirectory=directory;document.getElementById('savefoldername').textContent='Папка: '+directory.name;return directory;
+ }catch(error){if(error.name==='AbortError')return null;throw error}}
+document.getElementById('savefolder').onclick=async()=>{if(saving)return;setSaveBusy(true);
+ try{await chooseSaveFolder()}catch(error){console.error(error);alert('Не удалось открыть папку для сохранения. Выберите доступную папку ещё раз.')}
+ finally{setSaveBusy(false)}};
+function firmwarePair(data){
+ const single=data.slice();if(single.length!==65536)throw new Error('Неверный размер прошивки');
+ if(!fixsum(single))return null;
+ let sum=0;for(const byte of single)sum=(sum+byte)&0xFFFF;
+ if(sum!==(single[0xFFFE]|single[0xFFFF]<<8))throw new Error('Проверка контрольной суммы не пройдена');
+ const double=new Uint8Array(131072);double.set(single);double.set(single,65536);
+ return [single,double]}
+async function unusedPairNames(directory,name){
+ const stem=name.replace(/\.bin$/i,'')+' правка';
+ for(let i=1;i<=10000;i++){
+  const prefix=stem+(i===1?'':' ('+i+')'),names=[prefix+' 64К OpenOLT.bin',prefix+' 128К ChipLoader.bin'];
+  let occupied=false;
+  for(const filename of names){try{await directory.getFileHandle(filename);occupied=true;break}
+   catch(error){if(error.name==='TypeMismatchError'){occupied=true;break}if(error.name!=='NotFoundError')throw error}}
+  if(!occupied)return names;
+ }throw new Error('Не удалось подобрать свободные имена файлов')}
+async function writeVerifiedFile(handle,data){
+ let writer;
+ try{writer=await handle.createWritable();await writer.write(data);await writer.close()}
+ catch(error){if(writer)try{await writer.abort()}catch(abortError){console.error(abortError)}throw error}
+ const actual=new Uint8Array(await (await handle.getFile()).arrayBuffer());
+ if(actual.length!==data.length||!actual.every((value,index)=>value===data[index]))throw new Error('Содержимое сохранённого файла отличается')}
+document.getElementById('save').onclick=async()=>{if(!cur||saving)return;
+ const data=cur.slice(),name=curName,attempted=[];let directory;
+ setSaveBusy(true);document.getElementById('savestatus').textContent='';
+ try{
+  directory=saveDirectory||await chooseSaveFolder();if(!directory)return;
+  const pair=firmwarePair(data);if(!pair)return;
+  const names=await unusedPairNames(directory,name);
+  for(let i=0;i<2;i++){
+   attempted.push(names[i]);const handle=await directory.getFileHandle(names[i],{create:true});
+   await writeVerifiedFile(handle,pair[i]);
+  }
+  document.getElementById('savestatus').textContent='Сохранены и проверены в папке «'+directory.name+'»: '+names.join(' · ');
+ }catch(error){console.error(error);
+  const message=attempted.length?'Не удалось сохранить и проверить оба BIN. Не используйте файлы этой попытки в папке «'+directory.name+'»: '+attempted.join(' · '):
+   'Не удалось сохранить BIN. Проверьте доступ к папке и попробуйте ещё раз.';
+  document.getElementById('savestatus').textContent=message;alert(message);
+ }finally{setSaveBusy(false)}};
+refresh();
 </script></body></html>
 '''
 
